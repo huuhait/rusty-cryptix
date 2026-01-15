@@ -336,7 +336,6 @@ mod address_store_with_cache {
         sync::Arc,
     };
 
-    use itertools::Itertools;
     use cryptix_database::prelude::{CachePolicy, DB};
     use cryptix_utils::networking::PrefixBucket;
     use itertools::Itertools;
