@@ -5,6 +5,10 @@ extern crate self as address_manager;
 use std::{collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
 
 use address_manager::port_mapping_extender::Extender;
+use cryptix_consensus_core::config::Config;
+use cryptix_core::{debug, info, task::tick::TickService, time::unix_now, warn};
+use cryptix_database::prelude::{CachePolicy, StoreResultExtensions, DB};
+use cryptix_utils::networking::IpAddress;
 use igd_next::{
     self as igd, aio::tokio::Tokio, AddAnyPortError, AddPortError, Gateway, GetExternalIpError, GetGenericPortMappingEntryError,
     SearchError,
@@ -13,10 +17,6 @@ use itertools::{
     Either::{Left, Right},
     Itertools,
 };
-use cryptix_consensus_core::config::Config;
-use cryptix_core::{debug, info, task::tick::TickService, time::unix_now, warn};
-use cryptix_database::prelude::{CachePolicy, StoreResultExtensions, DB};
-use cryptix_utils::networking::IpAddress;
 use local_ip_address::list_afinet_netifas;
 use parking_lot::Mutex;
 use stores::banned_address_store::{BannedAddressesStore, BannedAddressesStoreReader, ConnectionBanTimestamp, DbBannedAddressesStore};
@@ -252,7 +252,7 @@ impl AddressManager {
     }
 
     pub fn add_address(&mut self, address: NetAddress) {
-        if address.ip.is_loopback() || address.ip.is_unspecified() {
+        if address.ip.is_loopback() || address.ip.is_unspecified() || !address.ip.is_publicly_routable() {
             debug!("[Address manager] skipping local address {}", address.ip);
             return;
         }
@@ -339,6 +339,7 @@ mod address_store_with_cache {
     use itertools::Itertools;
     use cryptix_database::prelude::{CachePolicy, DB};
     use cryptix_utils::networking::PrefixBucket;
+    use itertools::Itertools;
     use rand::{
         distributions::{WeightedError, WeightedIndex},
         prelude::Distribution,

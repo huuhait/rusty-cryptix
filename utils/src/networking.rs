@@ -102,6 +102,9 @@ impl IpAddress {
 
         // Based on values from network.go
         let unroutable_nets = [
+            "10.0.0.0/8",      // RFC 1918
+            "172.16.0.0/12",   // RFC 1918
+            "192.168.0.0/16",  // RFC 1918
             "198.18.0.0/15",   // RFC 2544
             "2001:DB8::/32",   // RFC 3849
             "2002::/16",       // RFC 3964
