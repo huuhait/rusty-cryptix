@@ -5,7 +5,7 @@ use crate::{
 };
 use cryptix_consensus_core::{api::BlockValidationFutures, block::Block, blockstatus::BlockStatus, errors::block::RuleError};
 use cryptix_consensusmanager::{BlockProcessingBatch, ConsensusProxy};
-use cryptix_core::debug;
+use cryptix_core::{debug, warn};
 use cryptix_hashes::Hash;
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -74,6 +74,19 @@ impl Flow for HandleRelayInvsFlow {
     async fn start(&mut self) -> Result<(), ProtocolError> {
         self.start_impl().await
     }
+
+    async fn on_error(&self, err: &ProtocolError) {
+        let reason = match err {
+            ProtocolError::MisbehavingPeer(reason) => Some(reason.to_owned()),
+            ProtocolError::UnexpectedMessage(_, _) | ProtocolError::ConversionError(_) | ProtocolError::RuleError(_) => {
+                Some(err.to_string())
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.ctx.report_misbehaving_peer(&self.router, &reason).await;
+        }
+    }
 }
 
 impl HandleRelayInvsFlow {
@@ -97,7 +110,7 @@ impl HandleRelayInvsFlow {
                 None | Some(BlockStatus::StatusHeaderOnly) => {} // Continue processing this missing inv
                 Some(BlockStatus::StatusInvalid) => {
                     // Report a protocol error
-                    return Err(ProtocolError::OtherOwned(format!("sent inv of an invalid block {}", inv.hash)));
+                    return Err(ProtocolError::MisbehavingPeer(format!("sent inv of an invalid block {}", inv.hash)));
                 }
                 _ => {
                     // Block is already known, skip to next inv
@@ -116,11 +129,26 @@ impl HandleRelayInvsFlow {
                 }
             }
 
-            if self.ctx.is_ibd_running() && !session.async_is_nearly_synced().await {
+            let is_nearly_synced = session.async_is_nearly_synced().await;
+            if self.ctx.is_ibd_running() && !is_nearly_synced {
                 // Note: If the node is considered nearly synced we continue processing relay blocks even though an IBD is in progress.
                 // For instance this means that downloading a side-chain from a delayed node does not interop the normal flow of live blocks.
                 debug!("Got relay block {} while in IBD and the node is out of sync, continuing...", inv.hash);
                 continue;
+            }
+
+            let has_valid_claim = if is_nearly_synced {
+                self.ctx.wait_for_valid_block_producer_claim(inv.hash).await
+            } else {
+                self.ctx.has_valid_block_producer_claim(inv.hash)
+            };
+            if !has_valid_claim {
+                // Strong-node claims are an overlay/gossip signal. Missing or delayed claim gossip must not partition
+                // otherwise valid post-HF blocks; consensus validation remains the source of truth for block acceptance.
+                debug!(
+                    "Relay block {} has no strong-node block producer claim yet; requesting block and deferring to consensus validation",
+                    inv.hash
+                );
             }
 
             // We keep the request scope alive until consensus processes the block
@@ -131,7 +159,7 @@ impl HandleRelayInvsFlow {
             request_scope.report_obtained();
 
             if block.is_header_only() {
-                return Err(ProtocolError::OtherOwned(format!("sent header of {} where expected block with body", block.hash())));
+                return Err(ProtocolError::MisbehavingPeer(format!("sent header of {} where expected block with body", block.hash())));
             }
 
             let blue_work_threshold = session.async_get_virtual_merge_depth_blue_work_threshold().await;
@@ -188,29 +216,54 @@ impl HandleRelayInvsFlow {
                 Err(rule_error) => return Err(rule_error.into()),
             };
 
-            // As a policy, we only relay blocks who stand a chance to enter past(virtual).
-            // The only mining rule which permanently excludes a block is the merge depth bound
-            // (as opposed to "max parents" and "mergeset size limit" rules)
-            if broadcast {
-                let msgs = ancestor_batch
-                    .blocks
-                    .iter()
-                    .map(|b| make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(b.hash().into()) }))
-                    .collect();
-                self.ctx.hub().broadcast_many(msgs).await;
-
-                self.ctx
-                    .hub()
-                    .broadcast(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(inv.hash.into()) }))
-                    .await;
-            }
+            let ancestor_hashes = ancestor_batch.blocks.iter().map(|block| block.hash()).collect::<Vec<_>>();
 
             // We spawn post-processing as a separate task so that this loop
             // can continue processing the following relay blocks
             let ctx = self.ctx.clone();
+            let relay_hash = inv.hash;
+            let should_broadcast = broadcast;
             tokio::spawn(async move {
                 ctx.on_new_block(&session, ancestor_batch, block, virtual_state_task).await;
-                ctx.log_block_event(BlockLogEvent::Relay(inv.hash));
+
+                if should_broadcast {
+                    for hash in ancestor_hashes {
+                        if matches!(
+                            session.async_get_block_status(hash).await,
+                            Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                        ) {
+                            warn!("Not relaying block {} because it was disqualified by virtual UTXO/Atomic validation", hash);
+                            continue;
+                        }
+                        ctx.broadcast_block_producer_claims_for_hash(hash).await;
+                        ctx.broadcast_to_unrestricted_peers(make_message!(
+                            Payload::InvRelayBlock,
+                            InvRelayBlockMessage { hash: Some(hash.into()) }
+                        ))
+                        .await;
+                    }
+
+                    if matches!(
+                        session.async_get_block_status(relay_hash).await,
+                        Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                    ) {
+                        warn!("Not relaying block {} because it was disqualified by virtual UTXO/Atomic validation", relay_hash);
+                        return;
+                    }
+                    ctx.broadcast_block_producer_claims_for_hash(relay_hash).await;
+                    ctx.broadcast_to_unrestricted_peers(make_message!(
+                        Payload::InvRelayBlock,
+                        InvRelayBlockMessage { hash: Some(relay_hash.into()) }
+                    ))
+                    .await;
+                }
+
+                if !matches!(
+                    session.async_get_block_status(relay_hash).await,
+                    Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                ) {
+                    ctx.log_block_event(BlockLogEvent::Relay(relay_hash));
+                }
             });
         }
     }
@@ -238,7 +291,7 @@ impl HandleRelayInvsFlow {
         let msg = dequeue_with_timeout!(self.msg_route, Payload::Block)?;
         let block: Block = msg.try_into()?;
         if block.hash() != requested_hash {
-            Err(ProtocolError::OtherOwned(format!("requested block hash {} but got block {}", requested_hash, block.hash())))
+            Err(ProtocolError::MisbehavingPeer(format!("requested block hash {} but got block {}", requested_hash, block.hash())))
         } else {
             Ok(Some((block, request_scope)))
         }

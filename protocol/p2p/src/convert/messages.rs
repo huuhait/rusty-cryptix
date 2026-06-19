@@ -9,13 +9,15 @@ use super::{
 use crate::pb as protowire;
 use cryptix_consensus_core::{
     header::Header,
-    pruning::{PruningPointProof, PruningPointsList},
+    pruning::{PruningPointAtomicState, PruningPointProof, PruningPointsList},
     tx::{TransactionId, TransactionOutpoint, UtxoEntry},
 };
 use cryptix_hashes::Hash;
 use cryptix_utils::networking::{IpAddress, PeerId};
 
 use std::sync::Arc;
+
+const PQ_MLKEM1024_PUBLIC_KEY_SIZE: usize = 1568;
 
 // ----------------------------------------------------------------------------
 // consensus_core to protowire
@@ -33,6 +35,11 @@ impl From<Version> for protowire::VersionMessage {
             disable_relay_tx: item.disable_relay_tx,
             subnetwork_id: item.subnetwork_id.map(|x| x.into()),
             network: item.network.clone(),
+            anti_fraud_hashes: item.anti_fraud_hashes.into_iter().map(|v| v.to_vec()).collect(),
+            node_pubkey_xonly: item.node_pubkey_xonly.map(|value| value.to_vec()).unwrap_or_default(),
+            node_pow_nonce: item.node_pow_nonce,
+            node_challenge_nonce: item.node_challenge_nonce,
+            pq_ml_kem1024_pubkey: item.pq_ml_kem1024_pubkey.unwrap_or_default(),
         }
     }
 }
@@ -54,8 +61,38 @@ impl TryFrom<protowire::VersionMessage> for Version {
             disable_relay_tx: msg.disable_relay_tx,
             subnetwork_id: if msg.subnetwork_id.is_none() { None } else { Some(msg.subnetwork_id.unwrap().try_into()?) },
             network: msg.network.clone(),
+            anti_fraud_hashes: parse_anti_fraud_hashes(msg.anti_fraud_hashes)?,
+            node_pubkey_xonly: parse_optional_32_bytes(msg.node_pubkey_xonly)?,
+            node_pow_nonce: msg.node_pow_nonce,
+            node_challenge_nonce: msg.node_challenge_nonce,
+            pq_ml_kem1024_pubkey: parse_optional_mlkem1024_pubkey(msg.pq_ml_kem1024_pubkey)?,
         })
     }
+}
+
+fn parse_anti_fraud_hashes(raw: Vec<Vec<u8>>) -> Result<Vec<[u8; 32]>, ConversionError> {
+    if raw.len() > 3 {
+        return Err(ConversionError::General);
+    }
+    raw.into_iter().map(|entry| entry.as_slice().try_into().map_err(|_| ConversionError::General)).collect()
+}
+
+fn parse_optional_32_bytes(raw: Vec<u8>) -> Result<Option<[u8; 32]>, ConversionError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let value: [u8; 32] = raw.as_slice().try_into().map_err(|_| ConversionError::General)?;
+    Ok(Some(value))
+}
+
+fn parse_optional_mlkem1024_pubkey(raw: Vec<u8>) -> Result<Option<Vec<u8>>, ConversionError> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    if raw.len() != PQ_MLKEM1024_PUBLIC_KEY_SIZE {
+        return Err(ConversionError::General);
+    }
+    Ok(Some(raw))
 }
 
 impl TryFrom<protowire::RequestHeadersMessage> for (Hash, Hash) {
@@ -99,10 +136,40 @@ impl TryFrom<protowire::PruningPointsMessage> for PruningPointsList {
 impl TryFrom<protowire::TrustedDataMessage> for TrustedDataPackage {
     type Error = ConversionError;
     fn try_from(msg: protowire::TrustedDataMessage) -> Result<Self, Self::Error> {
-        Ok(Self::new(
-            msg.daa_window.into_iter().map(|x| x.try_into()).collect::<Result<Vec<_>, Self::Error>>()?,
-            msg.ghostdag_data.into_iter().map(|x| x.try_into()).collect::<Result<Vec<_>, Self::Error>>()?,
-        ))
+        let daa_window = msg.daa_window.into_iter().map(|x| x.try_into()).collect::<Result<Vec<_>, Self::Error>>()?;
+        let ghostdag_data = msg.ghostdag_data.into_iter().map(|x| x.try_into()).collect::<Result<Vec<_>, Self::Error>>()?;
+        match (
+            msg.atomic_consensus_state.is_empty(),
+            msg.atomic_consensus_state_hash.is_empty(),
+            msg.atomic_consensus_state_byte_length,
+            msg.atomic_consensus_state_chunk_count,
+        ) {
+            (true, true, 0, 0) => Ok(Self::new(daa_window, ghostdag_data, None)),
+            (true, false, 0, 0) => Ok(Self::new(
+                daa_window,
+                ghostdag_data,
+                Some(PruningPointAtomicState {
+                    state_hash: msg.atomic_consensus_state_hash.as_slice().try_into()?,
+                    state_bytes: None,
+                }),
+            )),
+            (false, false, 0, 0) => Ok(Self::new(
+                daa_window,
+                ghostdag_data,
+                Some(PruningPointAtomicState {
+                    state_hash: msg.atomic_consensus_state_hash.as_slice().try_into()?,
+                    state_bytes: Some(msg.atomic_consensus_state),
+                }),
+            )),
+            (true, false, byte_length, chunk_count) if byte_length > 0 && chunk_count > 0 => {
+                let mut package = Self::new(daa_window, ghostdag_data, None);
+                package.atomic_state_hash = Some(msg.atomic_consensus_state_hash.as_slice().try_into()?);
+                package.atomic_state_byte_length = byte_length;
+                package.atomic_state_chunk_count = chunk_count;
+                Ok(package)
+            }
+            _ => Err(ConversionError::General),
+        }
     }
 }
 
@@ -218,5 +285,81 @@ impl TryFrom<protowire::RequestAntipastMessage> for (Hash, Hash) {
     type Error = ConversionError;
     fn try_from(msg: protowire::RequestAntipastMessage) -> Result<Self, Self::Error> {
         Ok((msg.block_hash.try_into_ex()?, msg.context_hash.try_into_ex()?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trusted_data_message_accepts_atomic_root_metadata() {
+        let state_hash = [7u8; 32];
+        let msg = protowire::TrustedDataMessage {
+            daa_window: Vec::new(),
+            ghostdag_data: Vec::new(),
+            atomic_consensus_state: Vec::new(),
+            atomic_consensus_state_hash: state_hash.to_vec(),
+            atomic_consensus_state_byte_length: 0,
+            atomic_consensus_state_chunk_count: 0,
+        };
+
+        let package = TrustedDataPackage::try_from(msg).expect("root metadata should convert");
+        assert_eq!(package.atomic_state.as_ref().map(|state| state.state_hash), Some(state_hash));
+        assert_eq!(package.atomic_state_hash, Some(state_hash));
+        assert_eq!(package.atomic_state_byte_length, 0);
+        assert_eq!(package.atomic_state_chunk_count, 0);
+    }
+
+    #[test]
+    fn trusted_data_message_rejects_partial_atomic_state_metadata() {
+        let msg = protowire::TrustedDataMessage {
+            daa_window: Vec::new(),
+            ghostdag_data: Vec::new(),
+            atomic_consensus_state: Vec::new(),
+            atomic_consensus_state_hash: vec![7u8; 32],
+            atomic_consensus_state_byte_length: 5,
+            atomic_consensus_state_chunk_count: 0,
+        };
+
+        assert!(TrustedDataPackage::try_from(msg).is_err());
+    }
+
+    #[test]
+    fn trusted_data_message_accepts_inline_atomic_state() {
+        let state_hash = [7u8; 32];
+        let state_bytes = vec![1, 2, 3];
+        let msg = protowire::TrustedDataMessage {
+            daa_window: Vec::new(),
+            ghostdag_data: Vec::new(),
+            atomic_consensus_state: state_bytes.clone(),
+            atomic_consensus_state_hash: state_hash.to_vec(),
+            atomic_consensus_state_byte_length: 0,
+            atomic_consensus_state_chunk_count: 0,
+        };
+
+        let package = TrustedDataPackage::try_from(msg).expect("inline state should convert");
+        let state = package.atomic_state.expect("inline state should be present");
+        assert_eq!(state.state_hash, state_hash);
+        assert_eq!(state.state_bytes, Some(state_bytes));
+    }
+
+    #[test]
+    fn trusted_data_message_accepts_chunked_atomic_state_metadata() {
+        let state_hash = [7u8; 32];
+        let msg = protowire::TrustedDataMessage {
+            daa_window: Vec::new(),
+            ghostdag_data: Vec::new(),
+            atomic_consensus_state: Vec::new(),
+            atomic_consensus_state_hash: state_hash.to_vec(),
+            atomic_consensus_state_byte_length: 5,
+            atomic_consensus_state_chunk_count: 1,
+        };
+
+        let package = TrustedDataPackage::try_from(msg).expect("chunked metadata should convert");
+        assert!(package.atomic_state.is_none());
+        assert_eq!(package.atomic_state_hash, Some(state_hash));
+        assert_eq!(package.atomic_state_byte_length, 5);
+        assert_eq!(package.atomic_state_chunk_count, 1);
     }
 }

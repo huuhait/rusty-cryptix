@@ -39,6 +39,7 @@ pub mod stop;
 pub mod sweep;
 // pub mod test;
 pub mod theme;
+pub mod token;
 pub mod track;
 pub mod transfer;
 pub mod wallet;
@@ -49,7 +50,6 @@ pub mod metrics;
 
 // TODO
 // broadcast
-// create-unsigned-tx
 // sign
 
 pub fn register_handlers(cli: &Arc<CryptixCli>) -> Result<()> {
@@ -57,9 +57,40 @@ pub fn register_handlers(cli: &Arc<CryptixCli>) -> Result<()> {
         cli,
         cli.handlers(),
         [
-            account, address, close, connect, details, disconnect, estimate, exit, export, guide, help, history, rpc, list, miner,
-            message, monitor, mute, network, node, open, ping, pskb, reload, select, send, server, settings, sweep, track, transfer,
+            account,
+            address,
+            close,
+            connect,
+            details,
+            disconnect,
+            estimate,
+            exit,
+            export,
+            guide,
+            help,
+            history,
+            rpc,
+            list,
+            miner,
+            message,
+            monitor,
+            mute,
+            network,
+            node,
+            open,
+            ping,
+            pskb,
+            reload,
+            select,
+            send,
+            server,
+            settings,
+            sweep,
+            token,
+            track,
+            transfer,
             wallet,
+            create_unsigned_tx,
             // halt,
             // theme,  start, stop
         ]

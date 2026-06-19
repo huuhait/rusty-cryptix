@@ -83,7 +83,9 @@ impl From<CryptixdMessagePayloadType> for IncomingRouteOverflowPolicy {
     fn from(msg_type: CryptixdMessagePayloadType) -> Self {
         match msg_type {
             // Inv messages are unique in the sense that no harm is done if some of them are dropped
-            CryptixdMessagePayloadType::InvTransactions | CryptixdMessagePayloadType::InvRelayBlock => IncomingRouteOverflowPolicy::Drop,
+            CryptixdMessagePayloadType::InvTransactions
+            | CryptixdMessagePayloadType::InvRelayBlock
+            | CryptixdMessagePayloadType::BlockProducerClaimV1 => IncomingRouteOverflowPolicy::Drop,
             _ => IncomingRouteOverflowPolicy::Disconnect,
         }
     }
@@ -172,6 +174,15 @@ fn message_summary(msg: &CryptixdMessage) -> impl Debug {
     msg.payload.as_ref().map(std::convert::Into::<CryptixdMessagePayloadType>::into)
 }
 
+fn pruning_point_proof_message_summary(msg: &CryptixdMessage) -> Option<(usize, usize, u32, u32)> {
+    match msg.payload.as_ref()? {
+        CryptixdMessagePayload::PruningPointProof(proof) => {
+            Some((proof.headers.len(), proof.headers.iter().map(|level| level.headers.len()).sum(), msg.response_id, msg.request_id))
+        }
+        _ => None,
+    }
+}
+
 impl Router {
     pub(crate) async fn new(
         net_address: SocketAddr,
@@ -212,8 +223,22 @@ impl Router {
                     res = incoming_stream.message() => match res {
                         Ok(Some(msg)) => {
                             trace!("P2P msg: {:?}, router-id: {}, peer: {}", message_summary(&msg), router.identity(), router);
+                            let pruning_point_proof_summary = pruning_point_proof_message_summary(&msg);
+                            if let Some((levels, headers, response_id, request_id)) = pruning_point_proof_summary {
+                                info!(
+                                    "P2P decoded pruning point proof from peer {}: levels={} headers={} response_id={} request_id={}; routing",
+                                    router, levels, headers, response_id, request_id
+                                );
+                            }
                             match router.route_to_flow(msg) {
-                                Ok(()) => {},
+                                Ok(()) => {
+                                    if let Some((levels, headers, response_id, request_id)) = pruning_point_proof_summary {
+                                        info!(
+                                            "P2P routed pruning point proof from peer {}: levels={} headers={} response_id={} request_id={}",
+                                            router, levels, headers, response_id, request_id
+                                        );
+                                    }
+                                },
                                 Err(e) => {
                                     match e {
                                         ProtocolError::IgnorableReject(reason) => debug!("P2P, got reject message: {} from peer: {}", reason, router),
@@ -361,6 +386,38 @@ impl Router {
         incoming_route
     }
 
+    /// Subscribe only by response id, without claiming a global message type.
+    ///
+    /// This is used by request/response helpers that may query many peers from outside
+    /// a long-lived flow. The caller should unsubscribe the route id when done.
+    pub fn subscribe_response_only(&self) -> IncomingRoute {
+        let (sender, receiver) = mpsc_channel(Self::incoming_flow_baseline_channel_size());
+        let incoming_route = IncomingRoute::new(receiver);
+        let mut map_by_id = self.routing_map_by_id.write();
+        match map_by_id.insert(incoming_route.id, sender) {
+            Some(_) => {
+                error!(
+                    "P2P, Router::subscribe_response_only overrides an existing route id: {:?}, router-id: {}",
+                    incoming_route.id,
+                    self.identity()
+                );
+                panic!("P2P, Tried to subscribe to an existing response route");
+            }
+            None => {
+                trace!(
+                    "P2P, Router::subscribe_response_only - route id: {:?} route is registered, router-id:{:?}",
+                    incoming_route.id,
+                    self.identity()
+                );
+            }
+        }
+        incoming_route
+    }
+
+    pub fn unsubscribe_route_id(&self, route_id: u32) {
+        self.routing_map_by_id.write().remove(&route_id);
+    }
+
     /// Routes a message coming from the network to the corresponding registered flow
     pub fn route_to_flow(&self, msg: CryptixdMessage) -> Result<(), ProtocolError> {
         if msg.payload.is_none() {
@@ -375,7 +432,18 @@ impl Router {
         }
 
         let op = if msg.response_id != BLANK_ROUTE_ID {
-            self.routing_map_by_id.read().get(&msg.response_id).cloned()
+            let route = self.routing_map_by_id.read().get(&msg.response_id).cloned();
+            if route.is_none() {
+                trace!(
+                    "P2P, dropping late or unmatched response {:?} with response_id={}, request_id={}, peer: {}",
+                    msg_type,
+                    msg.response_id,
+                    msg.request_id,
+                    self
+                );
+                return Ok(());
+            }
+            route
         } else {
             self.routing_map_by_type.read().get(&msg_type).cloned()
         };
@@ -395,7 +463,7 @@ impl Router {
                 }
             }
         } else {
-            Err(ProtocolError::NoRouteForMessageType(msg_type))
+            Err(ProtocolError::NoRouteForMessageType(msg_type, msg.response_id, msg.request_id))
         }
     }
 
@@ -414,7 +482,8 @@ impl Router {
         if err.can_send_outgoing_message() {
             // Send an explicit reject message for easier tracing of logical bugs causing protocol errors.
             // No need to handle errors since we are closing anyway
-            let _ = self.enqueue(make_message!(CryptixdMessagePayload::Reject, RejectMessage { reason: err.to_reject_message() })).await;
+            let _ =
+                self.enqueue(make_message!(CryptixdMessagePayload::Reject, RejectMessage { reason: err.to_reject_message() })).await;
         }
     }
 

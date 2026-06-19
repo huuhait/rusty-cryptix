@@ -1,5 +1,4 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use itertools::Itertools;
 use cryptix_addressmanager::NetAddress;
 use cryptix_p2p_lib::{
     common::ProtocolError,
@@ -8,7 +7,9 @@ use cryptix_p2p_lib::{
     IncomingRoute, Router,
 };
 use cryptix_utils::networking::IpAddress;
+use itertools::Itertools;
 use rand::seq::SliceRandom;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 /// The maximum number of addresses that are sent in a single cryptix Addresses message.
@@ -17,6 +18,9 @@ const MAX_ADDRESSES_SEND: usize = 1000;
 /// The maximum number of addresses that can be received in a single cryptix Addresses response.
 /// If a peer exceeds this value we consider it a protocol error.
 const MAX_ADDRESSES_RECEIVE: usize = 2500;
+
+/// The maximum number of unique addresses we accept from a single peer response.
+const MAX_UNIQUE_ADDRESSES_ACCEPTED: usize = 1024;
 
 pub struct ReceiveAddressesFlow {
     ctx: FlowContext,
@@ -41,6 +45,12 @@ impl ReceiveAddressesFlow {
     }
 
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
+        if self.ctx.is_payload_hf_active() && self.router.properties().unified_node_id.is_none() {
+            return Err(ProtocolError::OtherOwned(
+                "received addresses from peer without verified unified node ID after hardfork".to_string(),
+            ));
+        }
+
         self.router
             .enqueue(make_message!(
                 Payload::RequestAddresses,
@@ -53,9 +63,21 @@ impl ReceiveAddressesFlow {
         if address_list.len() > MAX_ADDRESSES_RECEIVE {
             return Err(ProtocolError::OtherOwned(format!("address count {} exceeded {}", address_list.len(), MAX_ADDRESSES_RECEIVE)));
         }
+        let mut unique = HashSet::with_capacity(address_list.len());
         let mut amgr_lock = self.ctx.address_manager.lock();
         for (ip, port) in address_list {
-            amgr_lock.add_address(NetAddress::new(ip, port))
+            let net_address = NetAddress::new(ip, port);
+            if !unique.insert(net_address) {
+                continue;
+            }
+            if unique.len() > MAX_UNIQUE_ADDRESSES_ACCEPTED {
+                return Err(ProtocolError::OtherOwned(format!(
+                    "unique address count {} exceeded {}",
+                    unique.len(),
+                    MAX_UNIQUE_ADDRESSES_ACCEPTED
+                )));
+            }
+            amgr_lock.add_address(net_address)
         }
 
         Ok(())
@@ -87,7 +109,17 @@ impl SendAddressesFlow {
     async fn start_impl(&mut self) -> Result<(), ProtocolError> {
         loop {
             dequeue!(self.incoming_route, Payload::RequestAddresses)?;
-            let addresses = self.ctx.address_manager.lock().iterate_addresses().collect_vec();
+            let anti_fraud_runtime_enabled =
+                self.ctx.connection_manager().map(|cm| cm.is_antifraud_runtime_enabled()).unwrap_or(false);
+            let require_verified = self.ctx.is_payload_hf_active() && anti_fraud_runtime_enabled;
+            let addresses = {
+                let amgr = self.ctx.address_manager.lock();
+                if require_verified {
+                    amgr.iterate_verified_addresses().collect_vec()
+                } else {
+                    amgr.iterate_addresses().collect_vec()
+                }
+            };
             let address_list = addresses
                 .choose_multiple(&mut rand::thread_rng(), MAX_ADDRESSES_SEND)
                 .map(|addr| (addr.ip, addr.port).into())

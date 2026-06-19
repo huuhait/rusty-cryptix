@@ -17,6 +17,24 @@ pub enum ConfigError {
     #[error("Configuration: --max-tracked-addresses cannot be set above {0}")]
     MaxTrackedAddressesTooHigh(usize),
 
+    #[error("Configuration: --hfa-cpu must be within (0.0, 1.0], got {0}")]
+    HfaCpuOutOfRange(f64),
+
+    #[error("Configuration: --hfa-drift-ms must be within [100, 600000], got {0}")]
+    HfaDriftOutOfRange(u64),
+
+    #[error("Configuration: --hfa-microblock-interval-ms-normal must be greater than 0, got {0}")]
+    HfaMicroblockIntervalMsNormalOutOfRange(u64),
+
+    #[error("Configuration: --tx-relay-broadcast-interval-ms must be greater than 0, got {0}")]
+    TxRelayBroadcastIntervalMsOutOfRange(u64),
+
+    #[error("Configuration: --atomic-bootstrap-peer-quorum-min-sources must be greater than 0")]
+    AtomicBootstrapPeerQuorumMinSourcesOutOfRange,
+
+    #[error("Configuration: --atomic-health-audit-interval-minutes must be greater than 0")]
+    AtomicHealthAuditIntervalMinutesOutOfRange,
+
     #[cfg(feature = "devnet-prealloc")]
     #[error("Cannot preallocate UTXOs on any network except devnet")]
     PreallocUtxosOnNonDevnet,

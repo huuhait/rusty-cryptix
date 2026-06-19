@@ -27,7 +27,12 @@ use std::{collections::HashMap, sync::Arc};
 pub(crate) struct ConsensusMock {
     transactions: RwLock<HashMap<TransactionId, Arc<Transaction>>>,
     statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
+    single_validation_statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
+    transient_statuses: RwLock<HashMap<TransactionId, TxResult<()>>>,
     utxos: RwLock<UtxoCollection>,
+    virtual_daa_score: RwLock<u64>,
+    virtual_daa_score_after_next_template_build: RwLock<Option<u64>>,
+    block_template_builds: RwLock<u64>,
 }
 
 impl ConsensusMock {
@@ -35,12 +40,41 @@ impl ConsensusMock {
         Self {
             transactions: RwLock::new(HashMap::default()),
             statuses: RwLock::new(HashMap::default()),
+            single_validation_statuses: RwLock::new(HashMap::default()),
+            transient_statuses: RwLock::new(HashMap::default()),
             utxos: RwLock::new(HashMap::default()),
+            virtual_daa_score: RwLock::new(0),
+            virtual_daa_score_after_next_template_build: RwLock::new(None),
+            block_template_builds: RwLock::new(0),
         }
     }
 
     pub(crate) fn set_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
         self.statuses.write().insert(transaction_id, status);
+    }
+
+    pub(crate) fn set_single_validation_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
+        self.single_validation_statuses.write().insert(transaction_id, status);
+    }
+
+    pub(crate) fn set_transient_status(&self, transaction_id: TransactionId, status: TxResult<()>) {
+        self.transient_statuses.write().insert(transaction_id, status);
+    }
+
+    pub(crate) fn set_virtual_daa_score(&self, virtual_daa_score: u64) {
+        *self.virtual_daa_score.write() = virtual_daa_score;
+    }
+
+    pub(crate) fn set_virtual_daa_score_after_next_template_build(&self, virtual_daa_score: u64) {
+        *self.virtual_daa_score_after_next_template_build.write() = Some(virtual_daa_score);
+    }
+
+    pub(crate) fn block_template_builds(&self) -> u64 {
+        *self.block_template_builds.read()
+    }
+
+    pub(crate) fn add_utxo(&self, outpoint: TransactionOutpoint, entry: UtxoEntry) {
+        self.utxos.write().insert(outpoint, entry);
     }
 
     pub(crate) fn add_transaction(&self, transaction: Transaction, block_daa_score: u64) {
@@ -72,45 +106,23 @@ impl ConsensusMock {
         }
         true
     }
-}
-
-impl ConsensusApi for ConsensusMock {
-    fn build_block_template(
-        &self,
-        miner_data: MinerData,
-        mut tx_selector: Box<dyn TemplateTransactionSelector>,
-        _build_mode: TemplateBuildMode,
-    ) -> Result<BlockTemplate, RuleError> {
-        let mut txs = tx_selector.select_transactions();
-        let coinbase_manager = CoinbaseManagerMock::new();
-        let coinbase = coinbase_manager.expected_coinbase_transaction(miner_data.clone());
-        txs.insert(0, coinbase.tx);
-        let now = unix_now();
-        let hash_merkle_root = self.calc_transaction_hash_merkle_root(&txs, 0);
-        let header = Header::new_finalized(
-            BLOCK_VERSION,
-            vec![],
-            hash_merkle_root,
-            ZERO_HASH,
-            ZERO_HASH,
-            now,
-            123456789u32,
-            0,
-            0,
-            0.into(),
-            0,
-            ZERO_HASH,
-        );
-        let mutable_block = MutableBlock::new(header, txs);
-
-        Ok(BlockTemplate::new(mutable_block, miner_data, coinbase.has_red_reward, now, 0, ZERO_HASH, vec![]))
-    }
-
-    fn validate_mempool_transaction(&self, mutable_tx: &mut MutableTransaction, _: &TransactionValidationArgs) -> TxResult<()> {
+    fn validate_mempool_transaction_inner(&self, mutable_tx: &mut MutableTransaction, include_single_status: bool) -> TxResult<()> {
+        if include_single_status {
+            if let Some(status) = self.single_validation_statuses.read().get(&mutable_tx.id()) {
+                if status.is_err() {
+                    return status.clone();
+                }
+            }
+        }
         // If a predefined status was registered to simulate an error, return it right away
         if let Some(status) = self.statuses.read().get(&mutable_tx.id()) {
             if status.is_err() {
                 return status.clone();
+            }
+        }
+        if let Some(status) = self.transient_statuses.write().remove(&mutable_tx.id()) {
+            if status.is_err() {
+                return status;
             }
         }
         let utxos = self.utxos.read();
@@ -143,13 +155,62 @@ impl ConsensusApi for ConsensusMock {
         }
         Ok(())
     }
+}
+
+impl ConsensusApi for ConsensusMock {
+    fn build_block_template(
+        &self,
+        miner_data: MinerData,
+        mut tx_selector: Box<dyn TemplateTransactionSelector>,
+        _build_mode: TemplateBuildMode,
+    ) -> Result<BlockTemplate, RuleError> {
+        *self.block_template_builds.write() += 1;
+        let virtual_daa_score = self.get_virtual_daa_score();
+        let mut txs = tx_selector.select_transactions();
+        txs.sort_by(|a, b| a.subnetwork_id.cmp(&b.subnetwork_id));
+        let coinbase_manager = CoinbaseManagerMock::new();
+        let coinbase = coinbase_manager.expected_coinbase_transaction(miner_data.clone());
+        txs.insert(0, coinbase.tx);
+        let now = unix_now();
+        let hash_merkle_root = self.calc_transaction_hash_merkle_root(&txs, 0);
+        let header = Header::new_finalized(
+            BLOCK_VERSION,
+            vec![],
+            hash_merkle_root,
+            ZERO_HASH,
+            ZERO_HASH,
+            now,
+            123456789u32,
+            0,
+            0,
+            0.into(),
+            0,
+            ZERO_HASH,
+        );
+        let mutable_block = MutableBlock::new(header, txs);
+
+        let virtual_state_approx_id =
+            VirtualStateApproxId::new(virtual_daa_score, 0.into(), ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH);
+        let template =
+            BlockTemplate::new(mutable_block, miner_data, coinbase.has_red_reward, now, 0, ZERO_HASH, virtual_state_approx_id, vec![]);
+
+        if let Some(next_virtual_daa_score) = self.virtual_daa_score_after_next_template_build.write().take() {
+            self.set_virtual_daa_score(next_virtual_daa_score);
+        }
+
+        Ok(template)
+    }
+
+    fn validate_mempool_transaction(&self, mutable_tx: &mut MutableTransaction, _: &TransactionValidationArgs) -> TxResult<()> {
+        self.validate_mempool_transaction_inner(mutable_tx, true)
+    }
 
     fn validate_mempool_transactions_in_parallel(
         &self,
         transactions: &mut [MutableTransaction],
         _: &TransactionValidationBatchArgs,
     ) -> Vec<TxResult<()>> {
-        transactions.iter_mut().map(|x| self.validate_mempool_transaction(x, &Default::default())).collect()
+        transactions.iter_mut().map(|x| self.validate_mempool_transaction_inner(x, false)).collect()
     }
 
     fn populate_mempool_transactions_in_parallel(&self, transactions: &mut [MutableTransaction]) -> Vec<TxResult<()>> {
@@ -169,11 +230,11 @@ impl ConsensusApi for ConsensusMock {
     }
 
     fn get_virtual_daa_score(&self) -> u64 {
-        0
+        *self.virtual_daa_score.read()
     }
 
     fn get_virtual_state_approx_id(&self) -> VirtualStateApproxId {
-        VirtualStateApproxId::new(self.get_virtual_daa_score(), 0.into(), ZERO_HASH)
+        VirtualStateApproxId::new(self.get_virtual_daa_score(), 0.into(), ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH, ZERO_HASH)
     }
 
     fn modify_coinbase_payload(&self, payload: Vec<u8>, miner_data: &MinerData) -> CoinbaseResult<Vec<u8>> {

@@ -16,6 +16,8 @@ use crate::NetAddress;
 pub struct Entry {
     pub connection_failed_count: u64,
     pub address: NetAddress,
+    #[serde(default)]
+    pub verified: bool,
 }
 
 impl MemSizeEstimator for Entry {}
@@ -83,6 +85,10 @@ impl DbAddressesStore {
         Self { db: Arc::clone(&db), access: CachedDbAccess::new(db, cache_policy, DatabaseStorePrefixes::Addresses.into()) }
     }
 
+    pub fn delete_all(&self) -> StoreResult<()> {
+        self.access.delete_all(DirectDbWriter::new(&self.db))
+    }
+
     pub fn iterator(&self) -> impl Iterator<Item = Result<(AddressKey, Entry), Box<dyn Error>>> + '_ {
         self.access.iterator().map(|iter_result| match iter_result {
             Ok((key_bytes, connection_failed_count)) => match <[u8; ADDRESS_KEY_SIZE]>::try_from(&key_bytes[..]) {
@@ -115,6 +121,6 @@ impl AddressesStore for DbAddressesStore {
 
     fn set_failed_count(&mut self, key: AddressKey, connection_failed_count: u64) -> StoreResult<()> {
         let entry = self.get(key)?;
-        self.set(key, Entry { connection_failed_count, address: entry.address })
+        self.set(key, Entry { connection_failed_count, address: entry.address, verified: entry.verified })
     }
 }

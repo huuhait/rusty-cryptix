@@ -13,6 +13,7 @@ use cryptix_consensus_core::{
     pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
+    utxo::utxo_diff::UtxoDiff,
     BlockHashSet, BlueWorkType, ChainPath, Hash,
 };
 use cryptix_utils::sync::rwlock::*;
@@ -353,6 +354,18 @@ impl ConsensusSessionOwned {
         self.clone().spawn_blocking(|c| c.get_pruning_point_anticone_and_trusted_data()).await
     }
 
+    pub async fn async_get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        self.clone().spawn_blocking(move |c| c.get_atomic_state_hash(block_hash)).await
+    }
+
+    pub async fn async_get_atomic_state_bytes(&self, block_hash: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        self.clone().spawn_blocking(move |c| c.get_atomic_state_bytes(block_hash)).await
+    }
+
+    pub async fn async_get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        self.clone().spawn_blocking(move |c| c.get_atomic_p2p_token_audit_hash(block_hash)).await
+    }
+
     pub async fn async_get_block(&self, hash: Hash) -> ConsensusResult<Block> {
         self.clone().spawn_blocking(move |c| c.get_block(hash)).await
     }
@@ -379,6 +392,10 @@ impl ConsensusSessionOwned {
 
     pub async fn async_get_block_acceptance_data(&self, hash: Hash) -> ConsensusResult<Arc<AcceptanceData>> {
         self.clone().spawn_blocking(move |c| c.get_block_acceptance_data(hash)).await
+    }
+
+    pub async fn async_get_block_utxo_diff(&self, hash: Hash) -> ConsensusResult<Arc<UtxoDiff>> {
+        self.clone().spawn_blocking(move |c| c.get_block_utxo_diff(hash)).await
     }
 
     /// Returns acceptance data for a set of blocks belonging to the selected parent chain.

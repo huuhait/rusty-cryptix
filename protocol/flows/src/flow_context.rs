@@ -3,62 +3,128 @@ use crate::flowcontext::{
     process_queue::ProcessQueue,
     transactions::TransactionsSpread,
 };
+use crate::hfa::{FastIntentP2pData, FastMicroblockP2pData, HfaP2pBridge, HFA_P2P_SERVICE_BIT};
+use crate::node_identity::{
+    compute_node_id, is_valid_pow_nonce, load_or_create_identity, network_code_from_name, sign_node_auth_proof,
+    verify_node_auth_proof, UnifiedNodeIdentity,
+};
+use crate::pq_handshake::{
+    compute_pq_handshake_proof, decapsulate_mlkem1024, encapsulate_mlkem1024, generate_mlkem1024_keypair, PQ_HANDSHAKE_PROOF_SIZE,
+    PQ_MLKEM1024_CIPHERTEXT_SIZE, PQ_MLKEM1024_PUBLIC_KEY_SIZE,
+};
+use crate::strong_node_claims::{
+    ClaimIngestOutcome, StrongNodeClaimsEngine, StrongNodeClaimsRuntimeSnapshot, STRONG_NODE_CLAIMS_P2P_SERVICE_BIT,
+};
 use crate::{v5, v6};
 use async_trait::async_trait;
-use futures::future::join_all;
 use cryptix_addressmanager::AddressManager;
 use cryptix_connectionmanager::ConnectionManager;
 use cryptix_consensus_core::api::{BlockValidationFuture, BlockValidationFutures};
 use cryptix_consensus_core::block::Block;
-use cryptix_consensus_core::config::Config;
+use cryptix_consensus_core::blockstatus::BlockStatus;
+use cryptix_consensus_core::config::{params::Params, Config};
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::tx::{Transaction, TransactionId};
+use cryptix_consensus_core::ChainPath;
 use cryptix_consensus_notify::{
     notification::{Notification, PruningPointUtxoSetOverrideNotification},
     root::ConsensusNotificationRoot,
 };
 use cryptix_consensusmanager::{BlockProcessingBatch, ConsensusInstance, ConsensusManager, ConsensusProxy};
 use cryptix_core::{
-    debug, info,
     cryptixd_env::{name, version},
+    debug, info,
     task::tick::TickService,
 };
 use cryptix_core::{time::unix_now, warn};
 use cryptix_hashes::Hash;
 use cryptix_mining::mempool::tx::{Orphan, Priority};
-use cryptix_mining::{manager::MiningManagerProxy, mempool::tx::RbfPolicy};
+use cryptix_mining::{manager::MiningManagerProxy, mempool::tx::RbfPolicy, model::tx_query::TransactionQuery};
 use cryptix_notify::notifier::Notify;
 use cryptix_p2p_lib::{
     common::ProtocolError,
     convert::model::version::Version,
     make_message,
-    pb::{cryptixd_message::Payload, InvRelayBlockMessage},
-    ConnectionInitializer, Hub, CryptixdHandshake, PeerKey, PeerProperties, Router,
+    pb::{
+        cryptixd_message::Payload, BlockProducerClaimV1Message, CryptixdMessage, FastIntentMessage, FastMicroblockMessage,
+        InvRelayBlockMessage,
+    },
+    ConnectionInitializer, CryptixdHandshake, Hub, PeerKey, PeerProperties, Router, P2P_SERVICE_BIT_ARCHIVAL, P2P_SERVICE_BIT_ATOMIC,
+    P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK,
 };
 use cryptix_utils::iter::IterExtensions;
 use cryptix_utils::networking::PeerId;
+use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::Instant;
 use std::{collections::hash_map::Entry, fmt::Display};
 use std::{
     iter::once,
     ops::Deref,
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Weak,
     },
     time::Duration,
 };
 use tokio::sync::{
     mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
-    RwLock as AsyncRwLock,
+    Mutex as AsyncMutex, RwLock as AsyncRwLock,
 };
 use tokio_stream::{wrappers::UnboundedReceiverStream, StreamExt};
 use uuid::Uuid;
 
 /// The P2P protocol version. Currently the only one supported.
-const PROTOCOL_VERSION: u32 = 6;
+const PROTOCOL_VERSION: u32 = 18;
+const MAX_TRANSACTION_RELAY_ANCESTORS: usize = 64;
+const PRE_PERMANENT_TOKEN_DEFINITION_STATE_PROTOCOL_VERSION: u32 = 17;
+const PRE_PRUNING_STABLE_TOKEN_ROOT_PROTOCOL_VERSION: u32 = 16;
+const PRE_TOKEN_ROOT_REBUILD_PROTOCOL_VERSION: u32 = 15;
+const PRE_TOKEN_ROOT_INCLUDED_INDEX_CACHE_PROTOCOL_VERSION: u32 = 14;
+const PRE_ATOMIC_STORE_ROOT_REVALIDATION_PROTOCOL_VERSION: u32 = 13;
+const PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION: u32 = 12;
+const PRE_EXPLICIT_ATOMIC_REVALIDATION_PROTOCOL_VERSION: u32 = 11;
+const PRE_RETAINED_CHECKPOINT_P2P_AUDIT_PROTOCOL_VERSION: u32 = 10;
+const PRE_ATOMIC_P2P_AUDIT_PROTOCOL_VERSION: u32 = 9;
+const PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 8;
+const LEGACY_PROTOCOL_VERSION: u32 = 7;
+const OLDER_LEGACY_PROTOCOL_VERSION: u32 = 6;
+const MIN_PRE_HARD_FORK_PROTOCOL_VERSION: u32 = 5;
+const QUANTUM_HANDSHAKE_STATE_UNKNOWN: u8 = 0;
+const QUANTUM_HANDSHAKE_STATE_LEGACY: u8 = 1;
+const QUANTUM_HANDSHAKE_STATE_ENFORCED: u8 = 2;
+const BLOCK_PRODUCER_CLAIM_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+const BLOCK_PRODUCER_CLAIM_WAIT_INTERVAL: Duration = Duration::from_millis(50);
+
+fn is_transport_payload_hf_active(params: &Params, virtual_daa_score: u64) -> bool {
+    let canonical_network_params = Params::from(params.net);
+    virtual_daa_score >= canonical_network_params.payload_hf_activation_daa_score
+}
+
+#[async_trait]
+pub trait AtomicStateQuorumVerifier: Send + Sync {
+    async fn verify_consensus_atomic_state_hash(&self, block_hash: Hash, state_hash: [u8; 32]) -> Result<(), String>;
+
+    async fn verify_consensus_atomic_state_hash_at_daa(
+        &self,
+        block_hash: Hash,
+        state_hash: [u8; 32],
+        _anchor_daa_score: u64,
+    ) -> Result<(), String> {
+        self.verify_consensus_atomic_state_hash(block_hash, state_hash).await
+    }
+
+    async fn local_atomic_token_state_hash_for_peer(&self, _block_hash: Hash) -> Result<Option<[u8; 32]>, String> {
+        Ok(None)
+    }
+
+    async fn repair_atomic_index_once(&self) -> Result<bool, String> {
+        Ok(false)
+    }
+}
 
 /// See `check_orphan_resolution_range`
 const BASELINE_ORPHAN_RESOLUTION_RANGE: u32 = 5;
@@ -68,6 +134,44 @@ const MAX_ORPHANS_UPPER_BOUND: usize = 1024;
 
 /// The min time to wait before allowing another parallel request
 const REQUEST_SCOPE_WAIT_TIME: Duration = Duration::from_secs(1);
+
+/// How many misbehavior strikes are required before banning a peer.
+const MISBEHAVIOR_BAN_SCORE: u32 = 5;
+
+/// Every full interval without additional misbehavior reduces the strike score by one.
+const MISBEHAVIOR_DECAY_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Forget stale peer scores to keep the tracker bounded over time.
+const MISBEHAVIOR_FORGET_AFTER: Duration = Duration::from_secs(60 * 60);
+
+/// Soft memory cap for tracked peers in the misbehavior map.
+const MISBEHAVIOR_MAX_TRACKED_PEERS: usize = 4096;
+
+/// Soft inbound connection rate-limit window and threshold per IP.
+const INBOUND_CONNECTION_RATE_LIMIT_WINDOW: Duration = Duration::from_secs(60);
+const INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS: usize = 20;
+const STRONG_NODES_TICK_INTERVAL: Duration = Duration::from_secs(30);
+const STRONG_NODE_CLAIMS_GOSSIP_FANOUT: usize = 8;
+
+/// Maximum frequency in which rate-limit breaches can add strikes.
+const INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Soft memory cap for tracked peer IPs in the inbound connection limiter map.
+const INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS: usize = 4096;
+
+fn short_hex_for_log(data: &[u8]) -> String {
+    if data.is_empty() {
+        return "<empty>".to_string();
+    }
+    if data.len() <= 8 {
+        return hex::encode(data);
+    }
+    format!("{}...{}", hex::encode(&data[..4]), hex::encode(&data[data.len() - 4..]))
+}
+
+fn is_compatible_peer_network(local_network: &str, remote_network: &str) -> bool {
+    local_network == remote_network
+}
 
 /// Represents a block event to be logged
 #[derive(Debug, PartialEq)]
@@ -184,12 +288,12 @@ impl BlockEventLogger {
 
                 match (summary.submit_count, summary.relay_count) {
                     (0, 0) => {}
-                    (1, 0) => info!("Accepted block {} via submit block", summary.submit()),
-                    (n, 0) => info!("Accepted {} blocks ...{} via submit block", n, summary.submit()),
-                    (0, 1) => info!("Accepted block {} via relay", summary.relay()),
-                    (0, m) => info!("Accepted {} blocks ...{} via relay", m, summary.relay()),
+                    (1, 0) => info!("Submit block {} via LOCAL", summary.submit()),
+                    (n, 0) => info!("Submit {} blocks ...{} via LOCAL", n, summary.submit()),
+                    (0, 1) => info!("Submit block {} via RELAY", summary.relay()),
+                    (0, m) => info!("Submit {} blocks ...{} via RELAY", m, summary.relay()),
                     (n, m) => {
-                        info!("Accepted {} blocks ...{}, {} via relay and {} via submit block", n + m, summary.submit(), m, n)
+                        info!("Submit {} blocks ...{} ({} via RELAY, {} via LOCAL)", n + m, summary.submit(), m, n)
                     }
                 }
 
@@ -210,6 +314,7 @@ impl BlockEventLogger {
 
 pub struct FlowContextInner {
     pub node_id: PeerId,
+    pub unified_node_identity: Arc<UnifiedNodeIdentity>,
     pub consensus_manager: Arc<ConsensusManager>,
     pub config: Arc<Config>,
     hub: Hub,
@@ -217,13 +322,23 @@ pub struct FlowContextInner {
     shared_block_requests: Arc<Mutex<HashMap<Hash, RequestScopeMetadata>>>,
     transactions_spread: AsyncRwLock<TransactionsSpread>,
     shared_transaction_requests: Arc<Mutex<HashMap<TransactionId, RequestScopeMetadata>>>,
+    mempool_virtual_sink: AsyncMutex<Option<Hash>>,
     is_ibd_running: Arc<AtomicBool>,
     ibd_metadata: Arc<RwLock<Option<IbdMetadata>>>,
     pub address_manager: Arc<Mutex<AddressManager>>,
     connection_manager: RwLock<Option<Arc<ConnectionManager>>>,
+    autoban_enabled: bool,
+    misbehaving_peer_scores: Mutex<HashMap<MisbehaviorIdentity, MisbehaviorRecord>>,
+    inbound_connection_rate_limit: Mutex<HashMap<IpAddr, InboundConnectionRateLimitRecord>>,
+    hfa_bridge: RwLock<Option<Arc<dyn HfaP2pBridge>>>,
+    atomic_state_quorum_verifier: RwLock<Option<Weak<dyn AtomicStateQuorumVerifier>>>,
+    strong_node_claims_engine: Arc<StrongNodeClaimsEngine>,
     mining_manager: MiningManagerProxy,
     pub(crate) tick_service: Arc<TickService>,
     notification_root: Arc<ConsensusNotificationRoot>,
+    quantum_handshake_mode_state: AtomicU8,
+    quantum_handshake_start_logged: AtomicBool,
+    quantum_handshake_key_sample_logged: AtomicBool,
 
     // Special sampling logger used only for high-bps networks where logs must be throttled
     block_event_logger: Option<BlockEventLogger>,
@@ -255,6 +370,32 @@ struct IbdMetadata {
     peer: PeerKey,
     /// The DAA score of the relay block which triggered the current IBD
     daa_score: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MisbehaviorRecord {
+    score: u32,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+enum MisbehaviorIdentity {
+    Ip(IpAddr),
+    UnifiedNodeId([u8; 32]),
+}
+
+#[derive(Debug, Clone)]
+struct InboundConnectionRateLimitRecord {
+    attempts: VecDeque<Instant>,
+    last_penalty: Option<Instant>,
+    last_seen: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InboundConnectionRateLimitVerdict {
+    allowed: bool,
+    attempts_in_window: usize,
+    should_penalize: bool,
 }
 
 pub struct RequestScopeMetadata {
@@ -303,36 +444,55 @@ impl FlowContext {
         mining_manager: MiningManagerProxy,
         tick_service: Arc<TickService>,
         notification_root: Arc<ConsensusNotificationRoot>,
-    ) -> Self {
+        autoban_enabled: bool,
+        app_data_dir: PathBuf,
+    ) -> Result<Self, String> {
         let hub = Hub::new();
+        let strong_node_claims_engine = Arc::new(StrongNodeClaimsEngine::new(true, &config.network_name(), &app_data_dir));
+        let unified_node_identity = load_or_create_identity(&app_data_dir, &config.network_name())
+            .map_err(|err| format!("failed loading persistent unified node identity: {err}"))?;
 
         let orphan_resolution_range = BASELINE_ORPHAN_RESOLUTION_RANGE + (config.bps() as f64).log2().ceil() as u32;
 
         // The maximum amount of orphans allowed in the orphans pool. This number is an approximation
         // of how many orphans there can possibly be on average bounded by an upper bound.
         let max_orphans = (2u64.pow(orphan_resolution_range) as usize * config.ghostdag_k as usize).min(MAX_ORPHANS_UPPER_BOUND);
-        Self {
+        Ok(Self {
             inner: Arc::new(FlowContextInner {
                 node_id: Uuid::new_v4().into(),
+                unified_node_identity: Arc::new(unified_node_identity),
                 consensus_manager,
                 orphans_pool: AsyncRwLock::new(OrphanBlocksPool::new(max_orphans)),
                 shared_block_requests: Arc::new(Mutex::new(HashMap::new())),
-                transactions_spread: AsyncRwLock::new(TransactionsSpread::new(hub.clone())),
+                transactions_spread: AsyncRwLock::new(TransactionsSpread::new(
+                    hub.clone(),
+                    Duration::from_millis(config.tx_relay_broadcast_interval_ms),
+                )),
                 shared_transaction_requests: Arc::new(Mutex::new(HashMap::new())),
+                mempool_virtual_sink: AsyncMutex::new(None),
                 is_ibd_running: Default::default(),
                 ibd_metadata: Default::default(),
                 hub,
                 address_manager,
                 connection_manager: Default::default(),
+                autoban_enabled,
+                misbehaving_peer_scores: Default::default(),
+                inbound_connection_rate_limit: Default::default(),
+                hfa_bridge: Default::default(),
+                atomic_state_quorum_verifier: Default::default(),
+                strong_node_claims_engine,
                 mining_manager,
                 tick_service,
                 notification_root,
+                quantum_handshake_mode_state: AtomicU8::new(QUANTUM_HANDSHAKE_STATE_UNKNOWN),
+                quantum_handshake_start_logged: AtomicBool::new(false),
+                quantum_handshake_key_sample_logged: AtomicBool::new(false),
                 block_event_logger: if config.bps() > 1 { Some(BlockEventLogger::new(config.bps() as usize)) } else { None },
                 orphan_resolution_range,
                 max_orphans,
                 config,
             }),
-        }
+        })
     }
 
     pub fn block_invs_channel_size(&self) -> usize {
@@ -348,9 +508,20 @@ impl FlowContext {
     }
 
     pub fn start_async_services(&self) {
+        info!("Quantum-safe ML-KEM-1024 handshake support enabled (ephemeral per-connection keys; no static startup key loaded)");
         if let Some(logger) = self.block_event_logger.as_ref() {
             logger.start();
         }
+        let ctx = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match ctx.tick_service.tick(STRONG_NODES_TICK_INTERVAL).await {
+                    cryptix_core::task::tick::TickReason::Wakeup => ctx.run_strong_node_claims_tick_once().await,
+                    cryptix_core::task::tick::TickReason::Shutdown => break,
+                }
+            }
+            ctx.strong_node_claims_engine.best_effort_flush();
+        });
     }
 
     pub fn set_connection_manager(&self, connection_manager: Arc<ConnectionManager>) {
@@ -358,11 +529,329 @@ impl FlowContext {
     }
 
     pub fn drop_connection_manager(&self) {
+        self.strong_node_claims_engine.best_effort_flush();
         self.connection_manager.write().take();
     }
 
     pub fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
         self.connection_manager.read().clone()
+    }
+
+    fn register_inbound_connection_attempt(&self, ip: IpAddr) -> InboundConnectionRateLimitVerdict {
+        let now = Instant::now();
+        let mut rate_limit = self.inbound_connection_rate_limit.lock();
+
+        // Keep this table bounded over time and by size.
+        rate_limit.retain(|_, record| now.saturating_duration_since(record.last_seen) <= MISBEHAVIOR_FORGET_AFTER);
+
+        let record = rate_limit.entry(ip).or_insert_with(|| InboundConnectionRateLimitRecord {
+            attempts: VecDeque::new(),
+            last_penalty: None,
+            last_seen: now,
+        });
+
+        while let Some(front) = record.attempts.front().copied() {
+            if now.saturating_duration_since(front) > INBOUND_CONNECTION_RATE_LIMIT_WINDOW {
+                record.attempts.pop_front();
+            } else {
+                break;
+            }
+        }
+        record.attempts.push_back(now);
+        record.last_seen = now;
+
+        let attempts_in_window = record.attempts.len();
+        let allowed = attempts_in_window <= INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS;
+        let should_penalize = if allowed {
+            false
+        } else {
+            let can_penalize = record
+                .last_penalty
+                .is_none_or(|last| now.saturating_duration_since(last) >= INBOUND_CONNECTION_RATE_LIMIT_STRIKE_COOLDOWN);
+            if can_penalize {
+                record.last_penalty = Some(now);
+            }
+            can_penalize
+        };
+
+        if rate_limit.len() > INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS {
+            let overflow = rate_limit.len() - INBOUND_CONNECTION_RATE_LIMIT_MAX_TRACKED_IPS;
+            let mut by_age = rate_limit.iter().map(|(tracked_ip, rec)| (*tracked_ip, rec.last_seen)).collect::<Vec<_>>();
+            by_age.sort_by_key(|(_, last_seen)| *last_seen);
+            for (old_ip, _) in by_age.into_iter().take(overflow) {
+                rate_limit.remove(&old_ip);
+            }
+        }
+
+        InboundConnectionRateLimitVerdict { allowed, attempts_in_window, should_penalize }
+    }
+
+    async fn enforce_inbound_connection_rate_limit(&self, router: &Arc<Router>) -> Result<(), ProtocolError> {
+        if !self.autoban_enabled || router.is_outbound() {
+            return Ok(());
+        }
+
+        let ip = router.net_address().ip();
+        let verdict = self.register_inbound_connection_attempt(ip);
+        if verdict.allowed {
+            return Ok(());
+        }
+
+        let reason = format!(
+            "inbound connection rate limit exceeded for {} ({} attempts in {}s, max {})",
+            ip,
+            verdict.attempts_in_window,
+            INBOUND_CONNECTION_RATE_LIMIT_WINDOW.as_secs(),
+            INBOUND_CONNECTION_RATE_LIMIT_MAX_ATTEMPTS
+        );
+        if verdict.should_penalize {
+            self.report_misbehaving_peer(router, &reason).await;
+        }
+
+        Err(ProtocolError::OtherOwned(reason))
+    }
+
+    pub async fn report_misbehaving_peer(&self, router: &Arc<Router>, reason: &str) {
+        if !self.autoban_enabled {
+            warn!("Auto-ban disabled: misbehaving peer {} ({})", router.net_address(), reason);
+            return;
+        }
+
+        let ip = router.net_address().ip();
+        let identity = self.misbehavior_identity_for_router(router);
+        let now = Instant::now();
+
+        let (score, should_ban) = {
+            let mut scores = self.misbehaving_peer_scores.lock();
+            scores.retain(|_, record| now.saturating_duration_since(record.last_seen) <= MISBEHAVIOR_FORGET_AFTER);
+
+            let record = scores.entry(identity).or_insert(MisbehaviorRecord { score: 0, last_seen: now });
+            let elapsed = now.saturating_duration_since(record.last_seen);
+            let decay_steps = (elapsed.as_secs() / MISBEHAVIOR_DECAY_INTERVAL.as_secs()) as u32;
+            record.score = record.score.saturating_sub(decay_steps).saturating_add(1);
+            record.last_seen = now;
+
+            let score = record.score;
+            let should_ban = score >= MISBEHAVIOR_BAN_SCORE;
+
+            if should_ban {
+                scores.remove(&identity);
+            } else if scores.len() > MISBEHAVIOR_MAX_TRACKED_PEERS {
+                let overflow = scores.len() - MISBEHAVIOR_MAX_TRACKED_PEERS;
+                let mut by_age = scores.iter().map(|(identity, record)| (*identity, record.last_seen)).collect::<Vec<_>>();
+                by_age.sort_by_key(|(_, last_seen)| *last_seen);
+                for (old_identity, _) in by_age.into_iter().take(overflow) {
+                    scores.remove(&old_identity);
+                }
+            }
+
+            (score, should_ban)
+        };
+
+        if should_ban {
+            if let Some(connection_manager) = self.connection_manager() {
+                match identity {
+                    MisbehaviorIdentity::UnifiedNodeId(node_id) => {
+                        if connection_manager.ban_unified_node_id(node_id).await {
+                            warn!(
+                                "Auto-ban: banning unified node ID {} after {}/{} strikes ({})",
+                                ConnectionManager::encode_node_id_hex(&node_id),
+                                score,
+                                MISBEHAVIOR_BAN_SCORE,
+                                reason
+                            );
+                        } else {
+                            warn!(
+                                "Auto-ban: refusing to ban unified node ID {} after {}/{} strikes because a matching permanent peer is configured ({})",
+                                ConnectionManager::encode_node_id_hex(&node_id),
+                                score,
+                                MISBEHAVIOR_BAN_SCORE,
+                                reason
+                            );
+                        }
+                    }
+                    MisbehaviorIdentity::Ip(_) => {
+                        warn!(
+                            "Auto-ban: banning peer {} after {}/{} strikes ({})",
+                            router.net_address(),
+                            score,
+                            MISBEHAVIOR_BAN_SCORE,
+                            reason
+                        );
+                        connection_manager.ban(ip).await;
+                    }
+                }
+            } else {
+                warn!(
+                    "Auto-ban: peer {} reached {}/{} strikes ({}), but no connection manager is available",
+                    router.net_address(),
+                    score,
+                    MISBEHAVIOR_BAN_SCORE,
+                    reason
+                );
+            }
+        } else {
+            warn!("Auto-ban: peer {} strike {}/{} ({})", router.net_address(), score, MISBEHAVIOR_BAN_SCORE, reason);
+        }
+    }
+
+    fn misbehavior_identity_for_router(&self, router: &Router) -> MisbehaviorIdentity {
+        if let Some(node_id) = router.properties().unified_node_id {
+            return MisbehaviorIdentity::UnifiedNodeId(node_id);
+        }
+        MisbehaviorIdentity::Ip(router.net_address().ip())
+    }
+
+    pub fn set_hfa_bridge(&self, bridge: Arc<dyn HfaP2pBridge>) {
+        self.hfa_bridge.write().replace(bridge);
+    }
+
+    pub fn hfa_bridge(&self) -> Option<Arc<dyn HfaP2pBridge>> {
+        self.hfa_bridge.read().clone()
+    }
+
+    pub fn set_atomic_state_quorum_verifier(&self, verifier: Arc<dyn AtomicStateQuorumVerifier>) {
+        self.atomic_state_quorum_verifier.write().replace(Arc::downgrade(&verifier));
+    }
+
+    pub async fn verify_consensus_atomic_state_hash_quorum(&self, block_hash: Hash, state_hash: [u8; 32]) -> Result<(), String> {
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
+        match verifier {
+            Some(verifier) => verifier.verify_consensus_atomic_state_hash(block_hash, state_hash).await,
+            None if self.config.net.is_mainnet() => {
+                Err("atomic consensus state quorum verifier is not configured; refusing mainnet pruning-point atomic state import"
+                    .to_string())
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub async fn verify_consensus_atomic_state_hash_quorum_at_daa(
+        &self,
+        block_hash: Hash,
+        state_hash: [u8; 32],
+        anchor_daa_score: u64,
+    ) -> Result<(), String> {
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
+        match verifier {
+            Some(verifier) => verifier.verify_consensus_atomic_state_hash_at_daa(block_hash, state_hash, anchor_daa_score).await,
+            None if self.config.net.is_mainnet() => {
+                Err("atomic consensus state quorum verifier is not configured; refusing mainnet pruning-point atomic state import"
+                    .to_string())
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub async fn local_atomic_token_state_hash_for_peer(&self, block_hash: Hash) -> Result<Option<[u8; 32]>, String> {
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
+        match verifier {
+            Some(verifier) => verifier.local_atomic_token_state_hash_for_peer(block_hash).await,
+            None => Ok(None),
+        }
+    }
+
+    pub async fn repair_atomic_index_once(&self) -> Result<bool, String> {
+        let verifier = self.atomic_state_quorum_verifier.read().as_ref().and_then(|verifier| verifier.upgrade());
+        match verifier {
+            Some(verifier) => verifier.repair_atomic_index_once().await,
+            None => Ok(false),
+        }
+    }
+
+    pub fn is_hfa_p2p_enabled(&self) -> bool {
+        self.hfa_bridge().map(|bridge| bridge.hfa_enabled()).unwrap_or(false)
+    }
+
+    pub fn strong_node_claims_snapshot(&self) -> StrongNodeClaimsRuntimeSnapshot {
+        self.strong_node_claims_engine.snapshot(self.is_payload_hf_active())
+    }
+
+    pub fn is_payload_hf_active(&self) -> bool {
+        let virtual_daa_score = self.consensus().unguarded_session().get_virtual_daa_score();
+        is_transport_payload_hf_active(&self.config.params, virtual_daa_score)
+    }
+
+    fn log_quantum_handshake_mode_transition(&self, enforce_quantum_handshake: bool) {
+        let next_state = if enforce_quantum_handshake { QUANTUM_HANDSHAKE_STATE_ENFORCED } else { QUANTUM_HANDSHAKE_STATE_LEGACY };
+        let previous_state = self.quantum_handshake_mode_state.swap(next_state, Ordering::SeqCst);
+        if previous_state == next_state {
+            return;
+        }
+
+        if next_state == QUANTUM_HANDSHAKE_STATE_ENFORCED {
+            info!("Hardfork reached: switching to post-HF hybrid handshake policy (ML-KEM-1024 with negotiated fallback)");
+            return;
+        }
+
+        if previous_state == QUANTUM_HANDSHAKE_STATE_ENFORCED {
+            warn!("Post-HF hybrid handshake policy disabled; returning to legacy-compatible handshake mode");
+        } else {
+            info!("Handshake mode initialized: legacy-compatible");
+        }
+    }
+
+    fn log_quantum_handshake_startup_once(&self, enforce_quantum_handshake: bool) {
+        if self.quantum_handshake_start_logged.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if enforce_quantum_handshake {
+            info!("Peer handshake started: running in quantum-safe mode (ML-KEM-1024 enforced)");
+        } else {
+            info!("Peer handshake started: running in legacy-compatible mode");
+        }
+    }
+
+    fn log_quantum_handshake_key_sample_once(&self, public_key: &[u8]) {
+        if self.quantum_handshake_key_sample_logged.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let sample = short_hex_for_log(public_key);
+        info!("Quantum-safe ML-KEM-1024 handshake key policy: using ephemeral per-connection keys ({})", sample);
+    }
+
+    pub fn is_strong_node_claims_p2p_enabled(&self) -> bool {
+        self.strong_node_claims_engine.runtime_available(self.is_payload_hf_active())
+    }
+
+    pub fn should_advertise_strong_node_claims_service_bit(&self) -> bool {
+        self.strong_node_claims_engine.should_advertise_service_bit()
+    }
+
+    pub fn has_valid_block_producer_claim(&self, block_hash: Hash) -> bool {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return true;
+        }
+        self.strong_node_claims_engine.claim_node_ids_for_block(block_hash).into_iter().next().is_some()
+    }
+
+    pub async fn wait_for_valid_block_producer_claim(&self, block_hash: Hash) -> bool {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return true;
+        }
+        let start = Instant::now();
+        loop {
+            if self.has_valid_block_producer_claim(block_hash) {
+                return true;
+            }
+            if start.elapsed() >= BLOCK_PRODUCER_CLAIM_WAIT_TIMEOUT {
+                return false;
+            }
+            tokio::time::sleep(BLOCK_PRODUCER_CLAIM_WAIT_INTERVAL).await;
+        }
+    }
+
+    pub fn block_producer_claims_for_hash(&self, block_hash: Hash) -> Vec<BlockProducerClaimV1Message> {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return Vec::new();
+        }
+        self.strong_node_claims_engine.claim_messages_for_block(block_hash)
+    }
+
+    pub async fn broadcast_block_producer_claims_for_hash(&self, block_hash: Hash) {
+        for message in self.block_producer_claims_for_hash(block_hash) {
+            self.broadcast_block_producer_claim(message, None).await;
+        }
     }
 
     pub fn consensus(&self) -> ConsensusInstance {
@@ -371,6 +860,32 @@ impl FlowContext {
 
     pub fn hub(&self) -> &Hub {
         &self.hub
+    }
+
+    pub fn active_peer_routers(&self) -> Vec<Arc<Router>> {
+        self.hub.active_routers()
+    }
+
+    fn unrestricted_peer_keys(&self) -> Vec<PeerKey> {
+        self.hub.active_peers().into_iter().map(|peer| peer.key()).collect()
+    }
+
+    pub async fn broadcast_to_unrestricted_peers(&self, msg: CryptixdMessage) {
+        for target in self.unrestricted_peer_keys() {
+            let _ = self.hub.send(target, msg.clone()).await;
+        }
+    }
+
+    pub async fn broadcast_many_to_unrestricted_peers(&self, msgs: Vec<CryptixdMessage>) {
+        if msgs.is_empty() {
+            return;
+        }
+        let targets = self.unrestricted_peer_keys();
+        for target in targets {
+            for msg in msgs.iter().cloned() {
+                let _ = self.hub.send(target, msg).await;
+            }
+        }
     }
 
     pub fn mining_manager(&self) -> &MiningManagerProxy {
@@ -492,10 +1007,24 @@ impl FlowContext {
             warn!("Validation failed for block {}: {}", hash, err);
             return Err(err)?;
         }
-        // Broadcast as soon as the block has been validated and inserted into the DAG
-        self.hub.broadcast(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(hash.into()) })).await;
-
         self.on_new_block(consensus, Default::default(), block, virtual_state_task).await;
+
+        if matches!(
+            consensus.async_get_block_status(hash).await,
+            Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+        ) {
+            let reason = format!(
+                "RPC submitted block {} was disqualified by virtual UTXO/Atomic validation; refusing to relay it to peers",
+                hash
+            );
+            warn!("{}", reason);
+            return Err(ProtocolError::OtherOwned(reason));
+        }
+
+        // Advertise the local claim before the block inv so post-HF peers can verify a valid node-ID sponsor first.
+        self.broadcast_local_block_producer_claim(hash).await;
+        self.broadcast_to_unrestricted_peers(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(hash.into()) }))
+            .await;
         self.log_block_event(BlockLogEvent::Submit(hash));
 
         Ok(())
@@ -506,8 +1035,8 @@ impl FlowContext {
             logger.log(event)
         } else {
             match event {
-                BlockLogEvent::Relay(hash) => info!("Accepted block {} via relay", hash),
-                BlockLogEvent::Submit(hash) => info!("Accepted block {} via submit block", hash),
+                BlockLogEvent::Relay(hash) => info!("Submit block {} via RELAY", hash),
+                BlockLogEvent::Submit(hash) => info!("Submit block {} via LOCAL", hash),
                 BlockLogEvent::Orphaned(orphan, roots_count) => {
                     info!("Received a block with {} missing ancestors, adding to orphan pool: {}", roots_count, orphan)
                 }
@@ -529,39 +1058,34 @@ impl FlowContext {
     ) {
         let hash = block.hash();
         let mut blocks = self.unorphan_blocks(consensus, hash).await;
-
-        // Broadcast unorphaned blocks
-        let msgs = blocks
-            .iter()
-            .map(|(b, _)| make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(b.hash().into()) }))
-            .collect();
-        self.hub.broadcast_many(msgs).await;
+        let unorphaned_hashes = blocks.iter().map(|(block, _)| block.hash()).collect::<Vec<_>>();
 
         // Process blocks in topological order
         blocks.sort_by(|a, b| a.0.header.blue_work.partial_cmp(&b.0.header.blue_work).unwrap());
-        // Use a ProcessQueue so we get rid of duplicates
-        let mut transactions_to_broadcast = ProcessQueue::new();
-        for (block, virtual_state_task) in ancestor_batch.zip().chain(once((block, virtual_state_task))).chain(blocks.into_iter()) {
+        for (_, virtual_state_task) in ancestor_batch.zip().chain(once((block, virtual_state_task))).chain(blocks.into_iter()) {
             // We only care about waiting for virtual to process the block at this point, before proceeding with post-processing
             // actions such as updating the mempool. We know this will not err since `block_task` already completed w/o error
             let _ = virtual_state_task.await;
-            if let Ok(txs) = self
-                .mining_manager()
-                .clone()
-                .handle_new_block_transactions(consensus, block.header.daa_score, block.transactions.clone())
-                .await
-            {
-                transactions_to_broadcast.enqueue_chunk(txs.into_iter().map(|x| x.id()));
+        }
+        self.mining_manager().clone().clear_block_template().await;
+
+        // Broadcast unorphaned blocks only after virtual validation had a chance to disqualify invalid branches.
+        let mut msgs = Vec::with_capacity(unorphaned_hashes.len());
+        for hash in unorphaned_hashes {
+            if matches!(
+                consensus.async_get_block_status(hash).await,
+                Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+            ) {
+                warn!("Not relaying unorphaned block {} because it was disqualified by virtual UTXO/Atomic validation", hash);
+                continue;
             }
+            msgs.push(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(hash.into()) }));
         }
+        self.broadcast_many_to_unrestricted_peers(msgs).await;
 
-        // Transaction relay is disabled if the node is out of sync and thus not mining
-        if !consensus.async_is_nearly_synced().await {
-            return;
-        }
+        let transactions_to_broadcast = self.process_mempool_virtual_acceptance(consensus).await;
 
-        // TODO: Throttle these transactions as well if needed
-        self.broadcast_transactions(transactions_to_broadcast, false).await;
+        let is_nearly_synced = consensus.async_is_nearly_synced().await;
 
         if self.should_run_mempool_scanning_task().await {
             // Spawn a task executing the removal of expired low priority transactions and, if time has come too,
@@ -572,10 +1096,11 @@ impl FlowContext {
             let mining_manager = self.mining_manager().clone();
             let consensus_clone = consensus.clone();
             let context = self.clone();
+            let can_rebroadcast = is_nearly_synced;
             debug!("<> Starting mempool scanning task #{}...", self.mempool_scanning_job_count().await);
             tokio::spawn(async move {
                 mining_manager.clone().expire_low_priority_transactions(&consensus_clone).await;
-                if context.should_rebroadcast().await {
+                if can_rebroadcast && context.should_rebroadcast().await {
                     let (tx, mut rx) = unbounded_channel();
                     tokio::spawn(async move {
                         mining_manager.revalidate_high_priority_transactions(&consensus_clone, tx).await;
@@ -593,6 +1118,125 @@ impl FlowContext {
                 debug!("<> Mempool scanning task is done");
             });
         }
+
+        // Transaction relay is disabled if the node is out of sync.
+        if !is_nearly_synced {
+            self.refresh_strong_node_claims_window(consensus).await;
+            return;
+        }
+
+        // TODO: Throttle these transactions as well if needed
+        self.broadcast_transactions(transactions_to_broadcast, false).await;
+        self.refresh_strong_node_claims_window(consensus).await;
+    }
+
+    async fn process_mempool_virtual_acceptance(&self, consensus: &ConsensusProxy) -> ProcessQueue<TransactionId> {
+        let mut transactions_to_broadcast = ProcessQueue::new();
+        let mut last_sink_guard = self.mempool_virtual_sink.lock().await;
+        let sink = consensus.async_get_sink().await;
+        let Some(previous_sink) = *last_sink_guard else {
+            *last_sink_guard = Some(sink);
+            return transactions_to_broadcast;
+        };
+        if previous_sink == sink {
+            return transactions_to_broadcast;
+        }
+
+        let chain_path = match consensus.async_get_virtual_chain_from_block(previous_sink, None).await {
+            Ok(chain_path) => chain_path,
+            Err(err) => {
+                warn!(
+                    "Skipping mempool virtual acceptance update: failed reading virtual chain path from {} to {}: {}",
+                    previous_sink, sink, err
+                );
+                return transactions_to_broadcast;
+            }
+        };
+        if chain_path.added.is_empty() {
+            *last_sink_guard = Some(sink);
+            return transactions_to_broadcast;
+        }
+
+        let acceptance_data = match consensus.async_get_blocks_acceptance_data(chain_path.added.clone(), None).await {
+            Ok(acceptance_data) => acceptance_data,
+            Err(err) => {
+                warn!(
+                    "Skipping mempool virtual acceptance update: failed reading acceptance data for {} selected-chain block(s): {}",
+                    chain_path.added.len(),
+                    err
+                );
+                return transactions_to_broadcast;
+            }
+        };
+
+        let mut accepted_tx_count = 0usize;
+        for (accepting_block_hash, acceptance_data) in chain_path.added.iter().copied().zip(acceptance_data.iter()) {
+            let accepting_block_daa_score = match consensus.async_get_header(accepting_block_hash).await {
+                Ok(header) => header.daa_score,
+                Err(err) => {
+                    warn!(
+                        "Skipping mempool virtual acceptance update for accepting block {}: failed reading header: {}",
+                        accepting_block_hash, err
+                    );
+                    continue;
+                }
+            };
+
+            let mut accepted_transactions = Vec::new();
+            for block_acceptance in acceptance_data.iter() {
+                let accepted_block = match consensus.async_get_block(block_acceptance.block_hash).await {
+                    Ok(block) => block,
+                    Err(err) => {
+                        warn!(
+                            "Skipping accepted transaction entries for block {} while updating mempool from virtual acceptance data: {}",
+                            block_acceptance.block_hash, err
+                        );
+                        continue;
+                    }
+                };
+                for accepted_tx in block_acceptance.accepted_transactions.iter() {
+                    if accepted_tx.index_within_block == 0 {
+                        continue;
+                    }
+                    let Some(transaction) = accepted_block.transactions.get(accepted_tx.index_within_block as usize) else {
+                        warn!(
+                            "Skipping malformed acceptance entry for block {}: tx_index={} out of range (txs={})",
+                            block_acceptance.block_hash,
+                            accepted_tx.index_within_block,
+                            accepted_block.transactions.len()
+                        );
+                        continue;
+                    };
+                    accepted_transactions.push(transaction.clone());
+                }
+            }
+
+            if accepted_transactions.is_empty() {
+                continue;
+            }
+            accepted_tx_count += accepted_transactions.len();
+            match self
+                .mining_manager()
+                .clone()
+                .handle_accepted_transactions(consensus, accepting_block_daa_score, Arc::new(accepted_transactions))
+                .await
+            {
+                Ok(txs) => transactions_to_broadcast.enqueue_chunk(txs.into_iter().map(|x| x.id())),
+                Err(err) => {
+                    warn!("Failed updating mempool from virtual acceptance data at accepting block {}: {}", accepting_block_hash, err)
+                }
+            }
+        }
+
+        debug!(
+            "Mempool virtual acceptance update: previous_sink={}, sink={}, selected_added={}, accepted_non_coinbase_txs={}",
+            previous_sink,
+            sink,
+            chain_path.added.len(),
+            accepted_tx_count
+        );
+        *last_sink_guard = Some(sink);
+        transactions_to_broadcast
     }
 
     /// Notifies that the UTXO set was reset due to pruning point change via IBD.
@@ -678,19 +1322,245 @@ impl FlowContext {
         self.transactions_spread.write().await.mempool_scanning_is_done()
     }
 
-    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to all peers
+    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to peers
     /// within transaction Inv messages.
     ///
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
     /// after a predefined interval or when the queue length is larger than the Inv message capacity.
     pub async fn broadcast_transactions<I: IntoIterator<Item = TransactionId>>(&self, transaction_ids: I, should_throttle: bool) {
+        let transaction_ids = self.expand_transaction_ids_with_mempool_ancestors(transaction_ids).await;
         self.transactions_spread.write().await.broadcast_transactions(transaction_ids, should_throttle).await
+    }
+
+    async fn expand_transaction_ids_with_mempool_ancestors<I: IntoIterator<Item = TransactionId>>(
+        &self,
+        transaction_ids: I,
+    ) -> Vec<TransactionId> {
+        let roots = transaction_ids.into_iter().collect::<Vec<_>>();
+        if roots.is_empty() {
+            return roots;
+        }
+
+        let mining_manager = self.mining_manager().clone();
+        let mut expanded = Vec::with_capacity(roots.len());
+        let mut seen = HashSet::with_capacity(roots.len());
+
+        for root in roots.iter().copied() {
+            let mut stack = vec![(root, false)];
+            let mut ancestor_walks = 0usize;
+
+            while let Some((transaction_id, emit)) = stack.pop() {
+                if emit {
+                    if seen.insert(transaction_id) {
+                        expanded.push(transaction_id);
+                    }
+                    continue;
+                }
+                if seen.contains(&transaction_id) {
+                    continue;
+                }
+
+                stack.push((transaction_id, true));
+                if ancestor_walks >= MAX_TRANSACTION_RELAY_ANCESTORS {
+                    continue;
+                }
+
+                let Some(transaction) =
+                    mining_manager.clone().get_transaction(transaction_id, TransactionQuery::TransactionsOnly).await
+                else {
+                    continue;
+                };
+
+                for input in transaction.tx.inputs.iter().rev() {
+                    let parent_id = input.previous_outpoint.transaction_id;
+                    if seen.contains(&parent_id) {
+                        continue;
+                    }
+                    if mining_manager.clone().has_transaction(parent_id, TransactionQuery::TransactionsOnly).await {
+                        ancestor_walks += 1;
+                        if ancestor_walks > MAX_TRANSACTION_RELAY_ANCESTORS {
+                            break;
+                        }
+                        stack.push((parent_id, false));
+                    }
+                }
+            }
+        }
+
+        if expanded.len() > roots.len() {
+            let added_ancestors = expanded.len() - roots.len();
+            debug!("Transaction propagation added {} mempool ancestor transaction ids before child announcements", added_ancestors);
+        }
+        expanded
+    }
+
+    pub async fn broadcast_fast_intent(&self, intent: &FastIntentP2pData) {
+        if !self.is_hfa_p2p_enabled() {
+            return;
+        }
+
+        let msg = make_message!(
+            Payload::FastIntent,
+            FastIntentMessage {
+                intent_id: Some(intent.intent_id.into()),
+                base_transaction: Some((&intent.base_tx).into()),
+                intent_nonce: intent.intent_nonce,
+                client_created_at_ms: intent.client_created_at_ms,
+                max_fee: intent.max_fee,
+            }
+        );
+        for peer in self.hub.active_peers() {
+            if (peer.properties().services & HFA_P2P_SERVICE_BIT) == 0 {
+                continue;
+            }
+            let _ = self.hub.send(peer.key(), msg.clone()).await;
+        }
+    }
+
+    pub async fn broadcast_fast_microblock(&self, microblock: FastMicroblockP2pData) {
+        if !self.is_hfa_p2p_enabled() {
+            return;
+        }
+
+        let msg = make_message!(
+            Payload::FastMicroblock,
+            FastMicroblockMessage {
+                microblock_time_ms: microblock.microblock_time_ms,
+                intent_ids: microblock.intent_ids.iter().map(Into::into).collect(),
+            }
+        );
+        for peer in self.hub.active_peers() {
+            if (peer.properties().services & HFA_P2P_SERVICE_BIT) == 0 {
+                continue;
+            }
+            let _ = self.hub.send(peer.key(), msg.clone()).await;
+        }
+    }
+
+    pub async fn broadcast_outbound_fast_microblocks(&self) {
+        let Some(bridge) = self.hfa_bridge() else {
+            return;
+        };
+        if !bridge.hfa_enabled() {
+            return;
+        }
+        for microblock in bridge.take_outbound_fast_microblocks() {
+            self.broadcast_fast_microblock(microblock).await;
+        }
+    }
+
+    async fn run_strong_node_claims_tick_once(&self) {
+        self.strong_node_claims_engine.maybe_flush();
+    }
+
+    pub async fn handle_block_producer_claim(&self, router: &Arc<Router>, message: BlockProducerClaimV1Message) {
+        let peer_unified_node_id = router.properties().unified_node_id;
+        if self.is_payload_hf_active() && peer_unified_node_id.is_none() {
+            self.report_misbehaving_peer(router, "block producer claim peer has no verified unified node ID").await;
+            return;
+        }
+        let outcome = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
+        match outcome {
+            ClaimIngestOutcome::Accepted { pending: _ } => {
+                self.strong_node_claims_engine.maybe_flush();
+            }
+            ClaimIngestOutcome::Strike { reason, node_id: _ } => {
+                self.report_misbehaving_peer(router, &reason).await;
+            }
+            ClaimIngestOutcome::Ignored | ClaimIngestOutcome::Dropped => {}
+        }
+    }
+
+    pub async fn broadcast_block_producer_claim(&self, message: BlockProducerClaimV1Message, exclude_peer: Option<PeerKey>) {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return;
+        }
+
+        let mut targets = self
+            .hub
+            .active_peers()
+            .into_iter()
+            .filter_map(|peer| {
+                if (peer.properties().services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) == 0 {
+                    return None;
+                }
+                if exclude_peer.is_some_and(|excluded| excluded == peer.key()) {
+                    return None;
+                }
+                Some(peer.key())
+            })
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return;
+        }
+        let target_len = targets.len();
+        if target_len > STRONG_NODE_CLAIMS_GOSSIP_FANOUT {
+            let base = (unix_now() as usize) % target_len;
+            targets = (0..STRONG_NODE_CLAIMS_GOSSIP_FANOUT).map(|offset| targets[(base + offset) % target_len]).collect();
+        }
+        let msg = make_message!(Payload::BlockProducerClaimV1, message);
+        for target in targets {
+            let _ = self.hub.send(target, msg.clone()).await;
+        }
+    }
+
+    async fn broadcast_local_block_producer_claim(&self, block_hash: Hash) {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return;
+        }
+        if let Some(message) = self.local_block_producer_claim_for_hash(block_hash) {
+            self.broadcast_block_producer_claim(message, None).await;
+        }
+    }
+
+    fn local_block_producer_claim_for_hash(&self, block_hash: Hash) -> Option<BlockProducerClaimV1Message> {
+        match self.strong_node_claims_engine.build_local_claim(block_hash, self.unified_node_identity.as_ref()) {
+            Ok(message) => {
+                let _ = self.strong_node_claims_engine.ingest_claim(&message, self.is_payload_hf_active());
+                Some(message)
+            }
+            Err(err) => {
+                warn!("failed building local block producer claim for {}: {}", block_hash, err);
+                None
+            }
+        }
+    }
+
+    async fn refresh_strong_node_claims_window(&self, consensus: &ConsensusProxy) {
+        if !self.is_strong_node_claims_p2p_enabled() {
+            return;
+        }
+        let session = consensus.clone();
+        let sink = session.async_get_sink().await;
+        let previous = self.strong_node_claims_engine.last_sink();
+        match previous {
+            Some(prev) if prev != sink => {
+                if let Ok(chain_path) = session.async_get_virtual_chain_from_block(prev, None).await {
+                    self.strong_node_claims_engine.apply_chain_path_update(chain_path, sink, self.is_payload_hf_active());
+                    self.strong_node_claims_engine.maybe_flush();
+                }
+            }
+            None => {
+                let mut path = ChainPath::default();
+                path.added.push(sink);
+                self.strong_node_claims_engine.apply_chain_path_update(path, sink, self.is_payload_hf_active());
+                self.strong_node_claims_engine.maybe_flush();
+            }
+            _ => {}
+        }
     }
 }
 
 #[async_trait]
 impl ConnectionInitializer for FlowContext {
     async fn initialize_connection(&self, router: Arc<Router>) -> Result<(), ProtocolError> {
+        if let Some(connection_manager) = self.connection_manager() {
+            if connection_manager.is_banned(&router.net_address()).await {
+                return Err(ProtocolError::OtherOwned(format!("peer {} is banned", router.net_address().ip())));
+            }
+        }
+        self.enforce_inbound_connection_rate_limit(&router).await?;
+
         // Build the handshake object and subscribe to handshake messages
         let mut handshake = CryptixdHandshake::new(&router);
 
@@ -705,6 +1575,31 @@ impl ConnectionInitializer for FlowContext {
         // Subnets are not currently supported
         let mut self_version_message = Version::new(local_address, self.node_id, network_name.clone(), None, PROTOCOL_VERSION);
         self_version_message.add_user_agent(name(), version(), &self.config.user_agent_comments);
+        let local_anti_fraud_hash_window = self.connection_manager().map(|cm| cm.anti_fraud_hash_window()).unwrap_or([[0u8; 32]; 3]);
+        self_version_message.anti_fraud_hashes = local_anti_fraud_hash_window.to_vec();
+        self_version_message.node_pubkey_xonly = Some(self.unified_node_identity.pubkey_xonly);
+        self_version_message.node_pow_nonce = Some(self.unified_node_identity.pow_nonce);
+        let local_node_challenge_nonce = rand::random::<u64>();
+        self_version_message.node_challenge_nonce = Some(local_node_challenge_nonce);
+        let (local_pq_ml_kem1024_public_key, local_pq_ml_kem1024_private_key) = generate_mlkem1024_keypair();
+        if local_pq_ml_kem1024_public_key.len() != PQ_MLKEM1024_PUBLIC_KEY_SIZE {
+            return Err(ProtocolError::OtherOwned(format!(
+                "local ML-KEM-1024 public key must be exactly {PQ_MLKEM1024_PUBLIC_KEY_SIZE} bytes"
+            )));
+        }
+        self.log_quantum_handshake_key_sample_once(local_pq_ml_kem1024_public_key.as_slice());
+        self_version_message.pq_ml_kem1024_pubkey = Some(local_pq_ml_kem1024_public_key);
+        self_version_message.services |= P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK;
+        if self.is_hfa_p2p_enabled() {
+            self_version_message.services |= HFA_P2P_SERVICE_BIT;
+        }
+        if self.should_advertise_strong_node_claims_service_bit() {
+            self_version_message.services |= STRONG_NODE_CLAIMS_P2P_SERVICE_BIT;
+        }
+        self_version_message.services |= P2P_SERVICE_BIT_ATOMIC;
+        if self.config.is_archival {
+            self_version_message.services |= P2P_SERVICE_BIT_ARCHIVAL;
+        }
         // TODO: get number of live services
         // TODO: disable_relay_tx from config/cmd
 
@@ -714,42 +1609,377 @@ impl ConnectionInitializer for FlowContext {
         let time_offset = unix_now() as i64 - peer_version_message.timestamp;
 
         let peer_version: Version = peer_version_message.try_into()?;
+        let network_code = network_code_from_name(&network_name)
+            .ok_or_else(|| ProtocolError::OtherOwned(format!("unsupported network for node identity `{network_name}`")))?;
+        let (peer_unified_node_id, peer_pubkey_xonly) = match (peer_version.node_pubkey_xonly, peer_version.node_pow_nonce) {
+            (Some(pubkey), Some(pow_nonce)) => {
+                if !is_valid_pow_nonce(network_code, &pubkey, pow_nonce) {
+                    return Err(ProtocolError::OtherOwned("peer sent invalid node identity proof-of-work".to_string()));
+                }
+                (Some(compute_node_id(&pubkey)), Some(pubkey))
+            }
+            (None, None) => (None, None),
+            _ => return Err(ProtocolError::OtherOwned("peer sent incomplete node identity handshake fields".to_string())),
+        };
+        let peer_node_challenge_nonce = peer_version.node_challenge_nonce;
+        let peer_pq_ml_kem1024_public_key = peer_version.pq_ml_kem1024_pubkey.clone();
+        if peer_unified_node_id.is_none() && peer_node_challenge_nonce.is_some() {
+            return Err(ProtocolError::OtherOwned("peer sent node challenge nonce without node identity fields".to_string()));
+        }
         router.set_identity(peer_version.id);
         // Avoid duplicate connections
         if self.hub.has_peer(router.key()) {
             return Err(ProtocolError::PeerAlreadyExists(router.key()));
         }
-        // And loopback connections...
-        if self.node_id == router.identity() {
-            return Err(ProtocolError::LoopbackConnection(router.key()));
+        if !is_compatible_peer_network(&network_name, &peer_version.network) {
+            return Err(ProtocolError::WrongNetwork(network_name, peer_version.network));
         }
 
-        if peer_version.network != network_name {
-            return Err(ProtocolError::WrongNetwork(network_name, peer_version.network));
+        let payload_hf_active = self.is_payload_hf_active();
+        let enforce_hardfork_core = payload_hf_active;
+        let peer_supports_quantum_fallback = (peer_version.services & P2P_SERVICE_BIT_QUANTUM_HANDSHAKE_FALLBACK) != 0;
+        let require_quantum_ready = enforce_hardfork_core && !peer_supports_quantum_fallback;
+        self.log_quantum_handshake_mode_transition(enforce_hardfork_core);
+        self.log_quantum_handshake_startup_once(enforce_hardfork_core);
+        debug!(
+            "Starting handshake with peer {} in {} mode",
+            router,
+            if enforce_hardfork_core {
+                if require_quantum_ready {
+                    "quantum-safe (ML-KEM-1024 required)"
+                } else {
+                    "quantum-hybrid (ML-KEM-1024 with negotiated fallback)"
+                }
+            } else {
+                "legacy-compatible"
+            }
+        );
+        if enforce_hardfork_core && !require_quantum_ready {
+            debug!("Peer {} supports post-HF quantum-safe handshake fallback negotiation", router);
+        }
+
+        if enforce_hardfork_core && peer_unified_node_id.is_none() {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory unified node identity after hardfork".to_string()));
+        }
+        if enforce_hardfork_core && peer_node_challenge_nonce.is_none() {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory node challenge nonce after hardfork".to_string()));
+        }
+        if require_quantum_ready && peer_pq_ml_kem1024_public_key.is_none() {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()));
+        }
+        if let Some(peer_node_id) = peer_unified_node_id {
+            if peer_node_id == self.unified_node_identity.node_id {
+                return Err(ProtocolError::LoopbackConnection(router.key()));
+            }
+            if let Some(connection_manager) = self.connection_manager() {
+                if connection_manager.is_unified_node_id_banned(&peer_node_id) {
+                    return Err(ProtocolError::OtherOwned("peer unified node identity is banned".to_string()));
+                }
+            }
+        } else if self.node_id == router.identity() {
+            // Legacy pre-HF fallback.
+            return Err(ProtocolError::LoopbackConnection(router.key()));
         }
 
         debug!("protocol versions - self: {}, peer: {}", PROTOCOL_VERSION, peer_version.protocol_version);
 
         // Register all flows according to version
+        let local_hfa_enabled = self.is_hfa_p2p_enabled();
+        let peer_hfa_enabled = (peer_version.services & HFA_P2P_SERVICE_BIT) != 0;
+        let hfa_capable = local_hfa_enabled && peer_hfa_enabled;
+        let local_atomic_enabled = true;
+        let peer_atomic_enabled = (peer_version.services & P2P_SERVICE_BIT_ATOMIC) != 0;
+        let local_archival_enabled = self.config.is_archival;
+        let peer_archival_enabled = (peer_version.services & P2P_SERVICE_BIT_ARCHIVAL) != 0;
+        let local_strong_node_claims_enabled = self.should_advertise_strong_node_claims_service_bit();
+        let peer_strong_node_claims_enabled = (peer_version.services & STRONG_NODE_CLAIMS_P2P_SERVICE_BIT) != 0;
+        if enforce_hardfork_core && !peer_atomic_enabled {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory atomic service bit after hardfork".to_string()));
+        }
+        if enforce_hardfork_core && !peer_strong_node_claims_enabled {
+            return Err(ProtocolError::OtherOwned("peer missing mandatory strong-node-claims service bit after hardfork".to_string()));
+        }
+        let strong_node_claims_capable = local_strong_node_claims_enabled && peer_strong_node_claims_enabled;
+        debug!(
+            "HFA P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
+            router, local_hfa_enabled, peer_hfa_enabled, peer_version.services, hfa_capable
+        );
+        debug!(
+            "Strong-Node-Claims P2P capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x} capable={}",
+            router,
+            local_strong_node_claims_enabled,
+            peer_strong_node_claims_enabled,
+            peer_version.services,
+            strong_node_claims_capable
+        );
+        debug!(
+            "Cryptix Atomic capability for peer {}: local_enabled={} peer_enabled={} peer_services=0x{:x}",
+            router, local_atomic_enabled, peer_atomic_enabled, peer_version.services
+        );
+        debug!(
+            "Archival capability for peer {}: local_archival={} peer_archival={} peer_services=0x{:x}",
+            router, local_archival_enabled, peer_archival_enabled, peer_version.services
+        );
+        if !enforce_hardfork_core {
+            debug!(
+                "Capability bits are running in legacy-compatible pre-HF mode for peer {} (informational only, no enforcement)",
+                router
+            );
+        }
+
+        let minimum_protocol_version = if enforce_hardfork_core { PROTOCOL_VERSION } else { MIN_PRE_HARD_FORK_PROTOCOL_VERSION };
         let (flows, applied_protocol_version) = match peer_version.protocol_version {
-            v if v >= PROTOCOL_VERSION => (v6::register(self.clone(), router.clone()), PROTOCOL_VERSION),
-            5 => (v5::register(self.clone(), router.clone()), 5),
-            v => return Err(ProtocolError::VersionMismatch(PROTOCOL_VERSION, v)),
+            // New protocol line.
+            v if v >= PROTOCOL_VERSION => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PROTOCOL_VERSION)
+            }
+            // Pre-HF compatibility lines.
+            PRE_PERMANENT_TOKEN_DEFINITION_STATE_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_PERMANENT_TOKEN_DEFINITION_STATE_PROTOCOL_VERSION,
+            ),
+            PRE_PRUNING_STABLE_TOKEN_ROOT_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_PRUNING_STABLE_TOKEN_ROOT_PROTOCOL_VERSION,
+            ),
+            PRE_TOKEN_ROOT_REBUILD_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_TOKEN_ROOT_REBUILD_PROTOCOL_VERSION,
+            ),
+            PRE_TOKEN_ROOT_INCLUDED_INDEX_CACHE_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_TOKEN_ROOT_INCLUDED_INDEX_CACHE_PROTOCOL_VERSION,
+            ),
+            PRE_ATOMIC_STORE_ROOT_REVALIDATION_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_ATOMIC_STORE_ROOT_REVALIDATION_PROTOCOL_VERSION,
+            ),
+            PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_CANONICAL_ATOMIC_TOKEN_ORDER_PROTOCOL_VERSION,
+            ),
+            PRE_EXPLICIT_ATOMIC_REVALIDATION_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_EXPLICIT_ATOMIC_REVALIDATION_PROTOCOL_VERSION,
+            ),
+            PRE_RETAINED_CHECKPOINT_P2P_AUDIT_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_RETAINED_CHECKPOINT_P2P_AUDIT_PROTOCOL_VERSION,
+            ),
+            PRE_ATOMIC_P2P_AUDIT_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                PRE_ATOMIC_P2P_AUDIT_PROTOCOL_VERSION,
+            ),
+            PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_hardfork_core => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), PRE_HARD_FORK_PROTOCOL_VERSION)
+            }
+            LEGACY_PROTOCOL_VERSION if !enforce_hardfork_core => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), LEGACY_PROTOCOL_VERSION)
+            }
+            OLDER_LEGACY_PROTOCOL_VERSION if !enforce_hardfork_core => {
+                (v6::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable), OLDER_LEGACY_PROTOCOL_VERSION)
+            }
+            MIN_PRE_HARD_FORK_PROTOCOL_VERSION if !enforce_hardfork_core => (
+                v5::register(self.clone(), router.clone(), hfa_capable, strong_node_claims_capable),
+                MIN_PRE_HARD_FORK_PROTOCOL_VERSION,
+            ),
+            v => return Err(ProtocolError::VersionMismatch(minimum_protocol_version, v)),
         };
 
         // Build and register the peer properties
         let peer_properties = Arc::new(PeerProperties {
             user_agent: peer_version.user_agent.to_owned(),
+            services: peer_version.services,
             advertised_protocol_version: peer_version.protocol_version,
             protocol_version: applied_protocol_version,
             disable_relay_tx: peer_version.disable_relay_tx,
             subnetwork_id: peer_version.subnetwork_id.to_owned(),
             time_offset,
+            anti_fraud_hashes: peer_version.anti_fraud_hashes.clone(),
+            unified_node_id: peer_unified_node_id,
+            hfa_enabled: peer_hfa_enabled,
+            atomic_enabled: peer_atomic_enabled,
+            strong_node_claims_enabled: peer_strong_node_claims_enabled,
+            archival_node: peer_archival_enabled,
         });
         router.set_properties(peer_properties);
 
+        let local_ready_signature = match (peer_unified_node_id, peer_node_challenge_nonce) {
+            (Some(peer_node_id), Some(peer_nonce)) => Some(
+                sign_node_auth_proof(
+                    self.unified_node_identity.as_ref(),
+                    network_code,
+                    &peer_node_id,
+                    local_node_challenge_nonce,
+                    peer_nonce,
+                )
+                .map_err(|err| ProtocolError::OtherOwned(format!("failed creating ready auth signature: {err}")))?,
+            ),
+            _ => None,
+        };
+        let local_ready_pq_payload = match (peer_unified_node_id, peer_node_challenge_nonce, peer_pq_ml_kem1024_public_key.as_deref())
+        {
+            (Some(peer_node_id), Some(peer_nonce), Some(peer_public_key)) => match encapsulate_mlkem1024(peer_public_key) {
+                Ok((ciphertext, shared_secret)) => {
+                    let proof = compute_pq_handshake_proof(
+                        network_code,
+                        &self.unified_node_identity.node_id,
+                        &peer_node_id,
+                        local_node_challenge_nonce,
+                        peer_nonce,
+                        &shared_secret,
+                    );
+                    Some((ciphertext, proof.to_vec()))
+                }
+                Err(err) if require_quantum_ready => {
+                    return Err(ProtocolError::OtherOwned(format!("failed encapsulating ML-KEM-1024 payload: {err}")));
+                }
+                Err(err) => {
+                    warn!(
+                            "Peer {} PQ fallback: failed encapsulating ML-KEM-1024 payload ({}); continuing with classical ready-auth only",
+                            router, err
+                        );
+                    None
+                }
+            },
+            (Some(_), Some(_), None) if require_quantum_ready => {
+                return Err(ProtocolError::OtherOwned("peer missing mandatory ML-KEM-1024 public key after hardfork".to_string()))
+            }
+            (Some(_), Some(_), None) if enforce_hardfork_core => {
+                warn!(
+                    "Peer {} PQ fallback: peer omitted ML-KEM-1024 public key after hardfork; continuing with classical ready-auth only",
+                    router
+                );
+                None
+            }
+            _ => None,
+        };
+        let (local_ready_pq_ciphertext, local_ready_pq_proof) = local_ready_pq_payload.unwrap_or_else(|| (Vec::new(), Vec::new()));
+
         // Send and receive the ready signal
-        handshake.exchange_ready_messages().await?;
+        let received_ready_message = handshake
+            .exchange_ready_messages(cryptix_p2p_lib::pb::ReadyMessage {
+                node_auth_signature: local_ready_signature.map(|value| value.to_vec()).unwrap_or_default(),
+                pq_ml_kem1024_ciphertext: local_ready_pq_ciphertext,
+                pq_handshake_proof: local_ready_pq_proof,
+            })
+            .await?;
+
+        if let (Some(peer_node_id), Some(peer_pubkey), Some(peer_nonce)) =
+            (peer_unified_node_id, peer_pubkey_xonly, peer_node_challenge_nonce)
+        {
+            if received_ready_message.node_auth_signature.is_empty() {
+                if enforce_hardfork_core {
+                    return Err(ProtocolError::OtherOwned("peer missing mandatory ready auth signature after hardfork".to_string()));
+                }
+            } else {
+                let peer_signature: [u8; 64] = received_ready_message
+                    .node_auth_signature
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| ProtocolError::OtherOwned("peer ready auth signature must be exactly 64 bytes".to_string()))?;
+                if !verify_node_auth_proof(
+                    network_code,
+                    &peer_pubkey,
+                    &peer_node_id,
+                    &self.unified_node_identity.node_id,
+                    peer_nonce,
+                    local_node_challenge_nonce,
+                    &peer_signature,
+                ) {
+                    return Err(ProtocolError::OtherOwned("peer ready auth signature verification failed".to_string()));
+                }
+            }
+
+            let peer_has_pq_ready_payload =
+                !received_ready_message.pq_ml_kem1024_ciphertext.is_empty() || !received_ready_message.pq_handshake_proof.is_empty();
+            if !peer_has_pq_ready_payload {
+                if require_quantum_ready {
+                    return Err(ProtocolError::OtherOwned(
+                        "peer missing mandatory quantum-safe ready payload after hardfork".to_string(),
+                    ));
+                }
+                if enforce_hardfork_core {
+                    warn!(
+                        "Peer {} PQ fallback: peer omitted quantum-safe ready payload after hardfork; accepting classical ready-auth only",
+                        router
+                    );
+                }
+            } else {
+                if received_ready_message.pq_ml_kem1024_ciphertext.len() != PQ_MLKEM1024_CIPHERTEXT_SIZE {
+                    if require_quantum_ready {
+                        return Err(ProtocolError::OtherOwned(format!(
+                            "peer ML-KEM-1024 ciphertext must be exactly {PQ_MLKEM1024_CIPHERTEXT_SIZE} bytes"
+                        )));
+                    }
+                    warn!(
+                        "Peer {} PQ fallback: invalid ML-KEM-1024 ciphertext length {}; accepting classical ready-auth only",
+                        router,
+                        received_ready_message.pq_ml_kem1024_ciphertext.len()
+                    );
+                }
+                if received_ready_message.pq_ml_kem1024_ciphertext.len() == PQ_MLKEM1024_CIPHERTEXT_SIZE
+                    && received_ready_message.pq_handshake_proof.len() != PQ_HANDSHAKE_PROOF_SIZE
+                {
+                    if require_quantum_ready {
+                        return Err(ProtocolError::OtherOwned(format!(
+                            "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
+                        )));
+                    }
+                    warn!(
+                        "Peer {} PQ fallback: invalid quantum-safe handshake proof length {}; accepting classical ready-auth only",
+                        router,
+                        received_ready_message.pq_handshake_proof.len()
+                    );
+                }
+
+                if received_ready_message.pq_ml_kem1024_ciphertext.len() == PQ_MLKEM1024_CIPHERTEXT_SIZE
+                    && received_ready_message.pq_handshake_proof.len() == PQ_HANDSHAKE_PROOF_SIZE
+                {
+                    match decapsulate_mlkem1024(
+                        &local_pq_ml_kem1024_private_key,
+                        received_ready_message.pq_ml_kem1024_ciphertext.as_slice(),
+                    ) {
+                        Ok(peer_shared_secret) => {
+                            let expected_peer_proof = compute_pq_handshake_proof(
+                                network_code,
+                                &peer_node_id,
+                                &self.unified_node_identity.node_id,
+                                peer_nonce,
+                                local_node_challenge_nonce,
+                                &peer_shared_secret,
+                            );
+                            let peer_proof: [u8; PQ_HANDSHAKE_PROOF_SIZE] =
+                                received_ready_message.pq_handshake_proof.as_slice().try_into().map_err(|_| {
+                                    ProtocolError::OtherOwned(format!(
+                                        "peer quantum-safe handshake proof must be exactly {PQ_HANDSHAKE_PROOF_SIZE} bytes"
+                                    ))
+                                })?;
+                            if peer_proof != expected_peer_proof {
+                                if require_quantum_ready {
+                                    return Err(ProtocolError::OtherOwned(
+                                        "peer quantum-safe handshake proof verification failed".to_string(),
+                                    ));
+                                }
+                                warn!(
+                                    "Peer {} PQ fallback: quantum-safe handshake proof verification failed; accepting classical ready-auth only",
+                                    router
+                                );
+                            }
+                        }
+                        Err(err) if require_quantum_ready => {
+                            return Err(ProtocolError::OtherOwned(format!("failed decapsulating peer ML-KEM-1024 payload: {err}")));
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Peer {} PQ fallback: failed decapsulating peer ML-KEM-1024 payload ({}); accepting classical ready-auth only",
+                                router, err
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         info!("Registering p2p flows for peer {} for protocol version {}", router, applied_protocol_version);
 
@@ -758,16 +1988,18 @@ impl ConnectionInitializer for FlowContext {
             flow.launch();
         }
 
-        if router.is_outbound() || peer_version.address.is_some() {
-            let mut address_manager = self.address_manager.lock();
+        let mut address_manager = self.address_manager.lock();
 
-            if router.is_outbound() {
-                address_manager.add_address(router.net_address().into());
-            }
+        if router.is_outbound() {
+            address_manager.add_verified_address(router.net_address().into());
+        }
+        address_manager.set_observed_services(router.net_address().into(), peer_version.services);
 
-            if let Some(peer_ip_address) = peer_version.address {
-                address_manager.add_address(peer_ip_address);
-            }
+        if let Some(peer_ip_address) = peer_version.address {
+            // Peer-advertised addresses are unauthenticated handshake hints and must not
+            // be promoted to verified without an actual successful connection.
+            address_manager.add_address(peer_ip_address);
+            address_manager.set_observed_services(peer_ip_address, peer_version.services);
         }
 
         // Note: we deliberately do not hold the handshake in memory so at this point receivers for handshake subscriptions
@@ -775,5 +2007,41 @@ impl ConnectionInitializer for FlowContext {
         // it is considered a protocol error and the connection will disconnect
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_compatible_peer_network, is_transport_payload_hf_active};
+    use cryptix_consensus_core::config::params::MAINNET_PARAMS;
+
+    #[test]
+    fn test_network_compatibility() {
+        assert!(is_compatible_peer_network("cryptix-mainnet", "cryptix-mainnet"));
+        assert!(is_compatible_peer_network("cryptix-testnet", "cryptix-testnet"));
+        assert!(!is_compatible_peer_network("cryptix-testnet", "cryptix-testnet-isolated"));
+        assert!(!is_compatible_peer_network("cryptix-testnet-isolated", "cryptix-testnet"));
+        assert!(!is_compatible_peer_network("cryptix-mainnet", "cryptix-testnet"));
+    }
+
+    #[test]
+    fn transport_hf_ignores_local_activation_override_before_network_hf() {
+        let canonical_activation = MAINNET_PARAMS.payload_hf_activation_daa_score;
+        assert!(canonical_activation > 0);
+
+        let mut params = MAINNET_PARAMS;
+        params.payload_hf_activation_daa_score = canonical_activation - 1;
+
+        assert!(!is_transport_payload_hf_active(&params, canonical_activation - 1));
+    }
+
+    #[test]
+    fn transport_hf_uses_canonical_network_activation_score() {
+        let canonical_activation = MAINNET_PARAMS.payload_hf_activation_daa_score;
+        let mut params = MAINNET_PARAMS;
+        params.payload_hf_activation_daa_score = u64::MAX;
+
+        assert!(!is_transport_payload_hf_active(&params, canonical_activation - 1));
+        assert!(is_transport_payload_hf_active(&params, canonical_activation));
     }
 }

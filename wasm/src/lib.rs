@@ -104,11 +104,11 @@ let {RpcClient,Encoding,initConsolePanicHook} = require('./cryptix-rpc');
 // initBrowserPanicHook();
 
 // if port is not specified, it will use the default port for the specified network
-const rpc = new RpcClient("127.0.0.1", Encoding.Borsh, "testnet-10");
+const rpc = new RpcClient("127.0.0.1", Encoding.Borsh, "testnet");
 const rpc = new RpcClient({
     url : "127.0.0.1",
     encoding : Encoding.Borsh,
-    networkId : "testnet-10"
+    networkId : "testnet"
 });
 
 
@@ -133,7 +133,9 @@ For more details, please follow the [**integrating with Cryptix**](https://crypt
     any(feature = "wasm32-sdk", feature = "wasm32-rpc", feature = "wasm32-core", feature = "wasm32-keygen"),
     not(target_arch = "wasm32")
 ))]
-compile_error!("`cryptix-wasm` crate for WASM32 target must be built with `--features wasm32-sdk|wasm32-rpc|wasm32-core|wasm32-keygen`");
+compile_error!(
+    "`cryptix-wasm` crate for WASM32 target must be built with `--features wasm32-sdk|wasm32-rpc|wasm32-core|wasm32-keygen`"
+);
 
 mod version;
 pub use version::*;

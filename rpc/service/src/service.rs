@@ -1,19 +1,43 @@
 //! Core server implementation for ClientAPI
 
 use super::collector::{CollectorFromConsensus, CollectorFromIndex};
+use crate::block_scan_cache::{RpcBlockScanCache, RpcBlockScanCacheActivity, RpcBlockScanCacheConfig};
 use crate::converter::feerate_estimate::{FeeEstimateConverter, FeeEstimateVerboseConverter};
 use crate::converter::{consensus::ConsensusConverter, index::IndexConverter, protocol::ProtocolConverter};
+use crate::hfa::{FastIngressSource, HfaEngine, HfaRuntimeConfig};
 use crate::service::NetworkType::{Mainnet, Testnet};
 use async_trait::async_trait;
+use blake2b_simd::Params as Blake2bParams;
+use cryptix_addresses::{Address, Version as AddressVersion};
+use cryptix_atomicindex::{
+    liquidity_math::{
+        calculate_trade_fee, cpmm_buy, cpmm_sell, initial_virtual_cpay_reserves_sompi_for_curve,
+        initial_virtual_token_reserves_for_curve, liquidity_curve_mode_label, max_buy_in_sompi, max_tokens_out,
+        min_gross_input_for_token_out, validate_liquidity_curve_mode, validate_liquidity_curve_parameters, LiquidityMathError,
+        INITIAL_REAL_CPAY_RESERVES_SOMPI, LIQUIDITY_MIN_PAYOUT_SOMPI, LIQUIDITY_TOKEN_DECIMALS, MAX_LIQUIDITY_SUPPLY_RAW,
+        MIN_CPAY_RESERVE_SOMPI, MIN_LIQUIDITY_SEED_RESERVE_SOMPI, MIN_LIQUIDITY_SUPPLY_RAW,
+    },
+    payload::{
+        parse_atomic_token_payload, BuyLiquidityExactInOp, CreateAssetWithMintOp, CreateLiquidityAssetOp, NoopReason,
+        SellLiquidityExactInOp, SupplyMode, TokenOp,
+    },
+    service::{AtomicTokenService, ScBootstrapSource, ScSnapshotChunk, ScSnapshotManifestSignature},
+    state::{
+        nonce_key_for_op, AtomicTokenHealth, AtomicTokenReadContext, AtomicTokenReadView, AtomicTokenRuntimeState,
+        LiquidityFeeRecipientState, LiquidityPoolState, NonceKey, ProcessedOp, TokenAsset, TokenAssetClass, TokenEvent,
+        TokenHolderEntry, TokenOwnerBalanceEntry,
+    },
+};
 use cryptix_consensus_core::api::counters::ProcessingCounters;
 use cryptix_consensus_core::errors::block::RuleError;
 use cryptix_consensus_core::{
     block::Block,
+    blockhash::BlockHashExtensions,
     coinbase::MinerData,
     config::Config,
     constants::MAX_SOMPI,
     network::NetworkType,
-    tx::{Transaction, COINBASE_TRANSACTION_INDEX},
+    tx::{ScriptPublicKey, Transaction, TransactionId, TransactionOutpoint, UtxoEntry, COINBASE_TRANSACTION_INDEX},
 };
 use cryptix_consensus_notify::{
     notifier::ConsensusNotifier,
@@ -23,13 +47,14 @@ use cryptix_consensusmanager::ConsensusManager;
 use cryptix_core::time::unix_now;
 use cryptix_core::{
     core::Core,
-    debug,
     cryptixd_env::version,
+    debug, info,
     signals::Shutdown,
     task::service::{AsyncService, AsyncServiceError, AsyncServiceFuture},
     task::tick::TickService,
     trace, warn,
 };
+use cryptix_hashes::Hash as BlockHash;
 use cryptix_index_core::indexed_utxos::BalanceByScriptPublicKey;
 use cryptix_index_core::{
     connection::IndexChannelConnection, indexed_utxos::UtxoSetByScriptPublicKey, notification::Notification as IndexNotification,
@@ -46,11 +71,12 @@ use cryptix_notify::{
     connection::ChannelType,
     events::{EventSwitches, EventType, EVENT_TYPE_ARRAY},
     listener::ListenerId,
-    notifier::Notifier,
+    notifier::{Notifier, Notify},
     scope::Scope,
     subscriber::{Subscriber, SubscriptionManager},
 };
 use cryptix_p2p_flows::flow_context::FlowContext;
+use cryptix_p2p_flows::hfa::FastIntentP2pData;
 use cryptix_p2p_lib::common::ProtocolError;
 use cryptix_perf_monitor::{counters::CountersSnapshot, Monitor as PerfMonitor};
 use cryptix_rpc_core::{
@@ -63,20 +89,24 @@ use cryptix_rpc_core::{
     notify::connection::ChannelConnection,
     Notification, RpcError, RpcResult,
 };
-use cryptix_txscript::{extract_script_pub_key_address, pay_to_address_script};
+use cryptix_txscript::{extract_script_pub_key_address, pay_to_address_script, script_class::ScriptClass};
 use cryptix_utils::expiring_cache::ExpiringCache;
+use cryptix_utils::hex::{FromHex, ToHex};
 use cryptix_utils::sysinfo::SystemInfo;
 use cryptix_utils::{channel::Channel, triggers::SingleTrigger};
 use cryptix_utils_tower::counters::TowerConnectionCounters;
 use cryptix_utxoindex::api::UtxoIndexProxy;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     iter::once,
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Mutex},
     vec,
 };
-use tokio::join;
+use tokio::{
+    join, select,
+    time::{interval, sleep, MissedTickBehavior},
+};
 use workflow_rpc::server::WebSocketCounters as WrpcServerCounters;
 
 /// A service implementing the Rpc API at cryptix_rpc_core level.
@@ -102,6 +132,7 @@ pub struct RpcCoreService {
     mining_manager: MiningManagerProxy,
     flow_context: Arc<FlowContext>,
     utxoindex: Option<UtxoIndexProxy>,
+    atomic_token_service: Arc<AtomicTokenService>,
     config: Arc<Config>,
     consensus_converter: Arc<ConsensusConverter>,
     index_converter: Arc<IndexConverter>,
@@ -118,12 +149,271 @@ pub struct RpcCoreService {
     system_info: SystemInfo,
     fee_estimate_cache: ExpiringCache<RpcFeeEstimate>,
     fee_estimate_verbose_cache: ExpiringCache<cryptix_mining::errors::MiningManagerResult<GetFeeEstimateExperimentalResponse>>,
+    hfa_engine: Arc<HfaEngine>,
+    get_block_template_unsynced_last_log: Mutex<Option<Instant>>,
+    rpc_diagnostics: RpcDiagnostics,
+    block_scan_cache: RpcBlockScanCache,
 }
 
 const RPC_CORE: &str = "rpc-core";
+const NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT: &str = "normal_policy_reject_fast_lock_conflict";
+const HFA_MAINTENANCE_INTERVAL: Duration = Duration::from_millis(100);
+const TOKEN_EVENTS_NOTIFY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const GET_BLOCK_TEMPLATE_UNSYNCED_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const TOKEN_EVENTS_LIMIT_MAX: usize = 4096;
+const TOKEN_ASSETS_LIMIT_MAX: usize = 2048;
+const TOKEN_OWNER_BALANCES_LIMIT_MAX: usize = 4096;
+const TOKEN_HOLDERS_LIMIT_MAX: usize = 4096;
+const TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX: usize = 4096;
+const LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS: usize = 6;
+const LIQUIDITY_SUBMIT_READY_RECHECK_DELAY: Duration = Duration::from_millis(150);
+const RPC_DIAGNOSTICS_SLOW_THRESHOLD: Duration = Duration::from_millis(500);
+const RPC_DIAGNOSTICS_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
+const RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL: Duration = Duration::from_secs(10);
+const RPC_BLOCK_SCAN_CACHE_ACTIVITY_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const RPC_BLOCK_SCAN_CACHE_WARM_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+const RPC_BLOCK_SCAN_CACHE_STARTUP_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RPC_BLOCK_SCAN_CACHE_STARTUP_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(30);
+const RPC_BLOCK_SCAN_CACHE_WARM_YIELD_EVERY: usize = 32;
+const RPC_BLOCK_SCAN_CACHE_WARM_CACHED_STOP: usize = 64;
+const TX_LOOKUP_MAX_IDS: usize = 512;
+const TX_LOOKUP_LOOKBACK_MARGIN_DAA: u64 = 64;
+const TX_LOOKUP_LOOKBACK_MIN_HEADERS: usize = 256;
+const TX_LOOKUP_ARCHIVAL_LOOKBACK_MAX_HEADERS: u64 = 1_000_000;
+const TX_LOOKUP_DAA_WINDOW: u64 = 16;
+const TX_LOOKUP_MAX_CANDIDATE_BLOCKS: usize = 512;
+const TX_LOOKUP_MAX_SCANNED_BLOCKS: usize = 4096;
+const CAT_OWNER_DOMAIN: &[u8] = b"CAT_OWNER_V2";
+const OWNER_AUTH_SCHEME_PUBKEY: u8 = 0;
+const OWNER_AUTH_SCHEME_PUBKEY_ECDSA: u8 = 1;
+const OWNER_AUTH_SCHEME_SCRIPT_HASH: u8 = 2;
+const LIQUIDITY_QUOTE_SIDE_BUY: u32 = 0;
+const LIQUIDITY_QUOTE_SIDE_SELL: u32 = 1;
+const CAT_ERR_HISTORICAL_STATE_UNAVAILABLE: &str = "CAT_ERR_HISTORICAL_STATE_UNAVAILABLE";
+const CAT_ERR_MIN_OUT_VIOLATION: &str = "CAT_ERR_MIN_OUT_VIOLATION";
+const CAT_ERR_ZERO_OUTPUT: &str = "CAT_ERR_ZERO_OUTPUT";
+const CAT_ERR_RECIPIENT_ENCODING_INVALID: &str = "CAT_ERR_RECIPIENT_ENCODING_INVALID";
+const CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID: &str = "CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID";
+
+#[derive(Clone, Default)]
+struct RpcEndpointDiagnostics {
+    requests: u64,
+    errors: u64,
+    slow: u64,
+    total_ms: u64,
+    max_ms: u64,
+}
+
+struct RpcDiagnosticsState {
+    window_started: Instant,
+    endpoints: HashMap<String, RpcEndpointDiagnostics>,
+    total_requests: u64,
+    total_errors: u64,
+    total_slow: u64,
+}
+
+struct RpcBlockScanCacheStartupReadiness {
+    ready: bool,
+    wait_reason: &'static str,
+    peer_ready: bool,
+    node_nearly_synced: bool,
+    virtual_daa_score: u64,
+    activation_daa_score: u64,
+    atomic_required: bool,
+    atomic_ready: bool,
+    atomic_not_ready_reason: Option<&'static str>,
+    atomic_runtime: &'static str,
+    atomic_degraded: bool,
+    atomic_bootstrap: bool,
+    atomic_live_correct: bool,
+    atomic_last_applied: Option<BlockHash>,
+}
+
+impl RpcDiagnosticsState {
+    fn new_at(now: Instant) -> Self {
+        Self { window_started: now, endpoints: HashMap::new(), total_requests: 0, total_errors: 0, total_slow: 0 }
+    }
+}
+
+impl Default for RpcDiagnosticsState {
+    fn default() -> Self {
+        Self::new_at(Instant::now())
+    }
+}
+
+struct RpcDiagnosticsSummary {
+    elapsed: Duration,
+    total_requests: u64,
+    total_errors: u64,
+    total_slow: u64,
+    endpoints: Vec<(String, RpcEndpointDiagnostics)>,
+}
+
+struct RpcDiagnostics {
+    state: Mutex<RpcDiagnosticsState>,
+}
+
+impl Default for RpcDiagnostics {
+    fn default() -> Self {
+        Self { state: Mutex::new(RpcDiagnosticsState::default()) }
+    }
+}
 
 impl RpcCoreService {
     pub const IDENT: &'static str = "rpc-core-service";
+
+    fn annotate_transaction_fast_path(&self, transaction: &mut RpcTransaction) {
+        let tx_id = transaction
+            .verbose_data
+            .as_ref()
+            .map(|verbose| verbose.transaction_id)
+            .or_else(|| Transaction::try_from(transaction.clone()).ok().map(|tx| tx.id()));
+
+        if let Some(tx_id) = tx_id {
+            if self.hfa_engine.is_fast_tx_route(tx_id) {
+                transaction.fast_path = Some(true);
+            }
+        }
+    }
+
+    fn annotate_block_fast_paths(&self, block: &mut RpcBlock) {
+        for transaction in &mut block.transactions {
+            self.annotate_transaction_fast_path(transaction);
+        }
+    }
+
+    fn annotate_mempool_entry_fast_path(&self, entry: &mut RpcMempoolEntry) {
+        self.annotate_transaction_fast_path(&mut entry.transaction);
+    }
+
+    pub fn rpc_diagnostics_enabled(&self) -> bool {
+        self.config.rpc_diagnostics
+    }
+
+    pub async fn record_rpc_diagnostics(&self, endpoint: &str, started: Option<Instant>, success: bool, detail: Option<&str>) {
+        let Some(started) = started else {
+            return;
+        };
+        if !self.config.rpc_diagnostics {
+            return;
+        }
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(started);
+        let elapsed_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
+        let is_slow = elapsed >= RPC_DIAGNOSTICS_SLOW_THRESHOLD;
+        let endpoint = endpoint.to_string();
+
+        let summary = {
+            let mut state = self.rpc_diagnostics.state.lock().expect("RPC diagnostics mutex poisoned");
+            let entry = state.endpoints.entry(endpoint.clone()).or_default();
+            entry.requests = entry.requests.saturating_add(1);
+            entry.total_ms = entry.total_ms.saturating_add(elapsed_ms);
+            entry.max_ms = entry.max_ms.max(elapsed_ms);
+            if !success {
+                entry.errors = entry.errors.saturating_add(1);
+            }
+            if is_slow {
+                entry.slow = entry.slow.saturating_add(1);
+            }
+
+            state.total_requests = state.total_requests.saturating_add(1);
+            if !success {
+                state.total_errors = state.total_errors.saturating_add(1);
+            }
+            if is_slow {
+                state.total_slow = state.total_slow.saturating_add(1);
+            }
+
+            if now.duration_since(state.window_started) >= RPC_DIAGNOSTICS_SUMMARY_INTERVAL {
+                let summary = RpcDiagnosticsSummary {
+                    elapsed: now.duration_since(state.window_started),
+                    total_requests: state.total_requests,
+                    total_errors: state.total_errors,
+                    total_slow: state.total_slow,
+                    endpoints: state.endpoints.iter().map(|(endpoint, stats)| (endpoint.clone(), stats.clone())).collect(),
+                };
+                *state = RpcDiagnosticsState::new_at(now);
+                Some(summary)
+            } else {
+                None
+            }
+        };
+
+        if is_slow {
+            self.log_slow_rpc_runtime_state(endpoint.as_str(), elapsed, if success { "ok" } else { "error" }, detail).await;
+        }
+        if let Some(summary) = summary {
+            self.log_rpc_diagnostics_summary(summary).await;
+        }
+    }
+
+    async fn log_slow_rpc_runtime_state(&self, endpoint: &str, elapsed: Duration, outcome: &str, detail: Option<&str>) {
+        let mempool = self.mining_manager.snapshot();
+        let atomic_health = self.atomic_token_service.get_local_health().await;
+        warn!(
+            "slow RPC diagnostics: endpoint={endpoint} elapsed_ms={} outcome={} detail={} borsh_live={} json_live={} mempool_ready={} mempool_txs={} mempool_orphans={} mempool_accepted_cache={} mempool_high_priority_total={} mempool_low_priority_total={} mempool_evicted_total={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_event_seq={}",
+            elapsed.as_millis(),
+            outcome,
+            detail.unwrap_or(""),
+            self.wrpc_borsh_counters.active_connections.load(Ordering::Relaxed),
+            self.wrpc_json_counters.active_connections.load(Ordering::Relaxed),
+            mempool.ready_txs_sample,
+            mempool.txs_sample,
+            mempool.orphans_sample,
+            mempool.accepted_sample,
+            mempool.high_priority_tx_counts,
+            mempool.low_priority_tx_counts,
+            mempool.tx_evicted_counts,
+            atomic_health.runtime_state.as_str(),
+            atomic_health.is_degraded,
+            atomic_health.bootstrap_in_progress,
+            atomic_health.live_correct,
+            atomic_health.last_sequence,
+        );
+    }
+
+    async fn log_rpc_diagnostics_summary(&self, mut summary: RpcDiagnosticsSummary) {
+        summary.endpoints.sort_by(|(left_name, left), (right_name, right)| {
+            right.requests.cmp(&left.requests).then_with(|| left_name.cmp(right_name))
+        });
+        let endpoint_summary = summary
+            .endpoints
+            .iter()
+            .map(|(endpoint, stats)| {
+                let avg_ms = if stats.requests == 0 { 0.0 } else { stats.total_ms as f64 / stats.requests as f64 };
+                format!(
+                    "{endpoint}:count={},err={},slow={},avg_ms={avg_ms:.1},max_ms={}",
+                    stats.requests, stats.errors, stats.slow, stats.max_ms
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        let mempool = self.mining_manager.snapshot();
+        let atomic_health = self.atomic_token_service.get_local_health().await;
+        let elapsed_secs = summary.elapsed.as_secs_f64().max(0.001);
+        info!(
+            "RPC diagnostics window: elapsed_ms={} total_requests={} rps={:.1} errors={} slow_ge_500ms={} borsh_live={} json_live={} mempool_ready={} mempool_txs={} mempool_orphans={} mempool_accepted_cache={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_event_seq={} endpoints=[{}]",
+            summary.elapsed.as_millis(),
+            summary.total_requests,
+            summary.total_requests as f64 / elapsed_secs,
+            summary.total_errors,
+            summary.total_slow,
+            self.wrpc_borsh_counters.active_connections.load(Ordering::Relaxed),
+            self.wrpc_json_counters.active_connections.load(Ordering::Relaxed),
+            mempool.ready_txs_sample,
+            mempool.txs_sample,
+            mempool.orphans_sample,
+            mempool.accepted_sample,
+            atomic_health.runtime_state.as_str(),
+            atomic_health.is_degraded,
+            atomic_health.bootstrap_in_progress,
+            atomic_health.live_correct,
+            atomic_health.last_sequence,
+            endpoint_summary,
+        );
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -134,6 +424,7 @@ impl RpcCoreService {
         flow_context: Arc<FlowContext>,
         subscription_context: SubscriptionContext,
         utxoindex: Option<UtxoIndexProxy>,
+        atomic_token_service: Arc<AtomicTokenService>,
         config: Arc<Config>,
         core: Arc<Core>,
         processing_counters: Arc<ProcessingCounters>,
@@ -143,6 +434,7 @@ impl RpcCoreService {
         p2p_tower_counters: Arc<TowerConnectionCounters>,
         grpc_tower_counters: Arc<TowerConnectionCounters>,
         system_info: SystemInfo,
+        hfa_config: HfaRuntimeConfig,
     ) -> Self {
         // This notifier UTXOs subscription granularity to index-processor or consensus notifier
         let policies = match index_notifier {
@@ -182,7 +474,8 @@ impl RpcCoreService {
                 ListenerLifespan::Static(policies),
             );
 
-            let index_events: EventSwitches = [EventType::UtxosChanged, EventType::PruningPointUtxoSetOverride].as_ref().into();
+            let index_event_types: &[EventType] = &[EventType::UtxosChanged, EventType::PruningPointUtxoSetOverride];
+            let index_events: EventSwitches = index_event_types.into();
             let index_collector =
                 Arc::new(CollectorFromIndex::new("rpc-core <= index", index_notify_channel.receiver(), index_converter.clone()));
             let index_subscriber =
@@ -199,12 +492,30 @@ impl RpcCoreService {
         let notifier =
             Arc::new(Notifier::new(RPC_CORE, EVENT_TYPE_ARRAY[..].into(), collectors, subscribers, subscription_context, 1, policies));
 
+        let hfa_engine = Arc::new(HfaEngine::new(hfa_config));
+        flow_context.set_hfa_bridge(hfa_engine.clone());
+        let block_scan_cache = RpcBlockScanCache::new(RpcBlockScanCacheConfig::new(
+            config.rpc_block_scan_cache,
+            config.rpc_block_scan_cache_days,
+            config.rpc_block_scan_cache_max_bytes,
+        ));
+        if block_scan_cache.enabled() {
+            info!(
+                "RPC block scan cache enabled: days={:.2}, max_mb={}, startup_warm=after_node_and_atomic_ready, serve_after_startup_complete=true, refresh_interval_sec={}, activity_log_interval_sec={}, atomic_data_used=false, fallback=storage_on_miss",
+                block_scan_cache.days(),
+                block_scan_cache.max_bytes() / (1024 * 1024),
+                RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL.as_secs(),
+                RPC_BLOCK_SCAN_CACHE_ACTIVITY_LOG_INTERVAL.as_secs()
+            );
+        }
+
         Self {
             consensus_manager,
             notifier,
             mining_manager,
             flow_context,
             utxoindex,
+            atomic_token_service,
             config,
             consensus_converter,
             index_converter,
@@ -221,11 +532,456 @@ impl RpcCoreService {
             system_info,
             fee_estimate_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
             fee_estimate_verbose_cache: ExpiringCache::new(Duration::from_millis(500), Duration::from_millis(1000)),
+            hfa_engine,
+            get_block_template_unsynced_last_log: Mutex::new(None),
+            rpc_diagnostics: RpcDiagnostics::default(),
+            block_scan_cache,
         }
     }
 
-    pub fn start_impl(&self) {
+    fn should_log_get_block_template_unsynced(&self) -> bool {
+        let now = Instant::now();
+        let mut last_log = self.get_block_template_unsynced_last_log.lock().expect("getBlockTemplate log throttle mutex poisoned");
+        let should_log = match *last_log {
+            Some(last) => now.duration_since(last) >= GET_BLOCK_TEMPLATE_UNSYNCED_LOG_INTERVAL,
+            None => true,
+        };
+        if should_log {
+            *last_log = Some(now);
+            return true;
+        }
+        false
+    }
+
+    pub fn start_impl(self: &Arc<Self>) {
         self.notifier().start();
+
+        let token_shutdown_listener = self.shutdown.listener.clone();
+        let atomic_token_service = self.atomic_token_service.clone();
+        let notifier = self.notifier.clone();
+        tokio::spawn(async move {
+            let mut tick = interval(TOKEN_EVENTS_NOTIFY_POLL_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+            let shutdown = token_shutdown_listener;
+            tokio::pin!(shutdown);
+
+            let mut last_sequence = atomic_token_service.get_health().await.last_sequence;
+            loop {
+                select! {
+                    _ = &mut shutdown => break,
+                    _ = tick.tick() => {
+                        let current_sequence = atomic_token_service.get_health().await.last_sequence;
+                        if current_sequence > last_sequence {
+                            let from_sequence = last_sequence.saturating_add(1);
+                            let to_sequence = current_sequence;
+                            let delta = current_sequence.saturating_sub(last_sequence);
+                            let event_count = delta.min(u64::from(u32::MAX)) as u32;
+
+                            if let Err(err) = notifier.notify(Notification::TokenEventsChanged(TokenEventsChangedNotification {
+                                from_sequence,
+                                to_sequence,
+                                event_count,
+                            })) {
+                                warn!("failed broadcasting token-events-changed notification: {err}");
+                            }
+                        }
+                        last_sequence = current_sequence;
+                    }
+                }
+            }
+        });
+
+        self.clone().start_rpc_block_scan_cache_warmer();
+
+        if !self.hfa_engine.is_enabled() {
+            return;
+        }
+
+        let shutdown_listener = self.shutdown.listener.clone();
+        let hfa_engine = self.hfa_engine.clone();
+        let flow_context = self.flow_context.clone();
+        let consensus_manager = self.consensus_manager.clone();
+        let perf_monitor = self.perf_monitor.clone();
+
+        tokio::spawn(async move {
+            let mut tick = interval(HFA_MAINTENANCE_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let shutdown = shutdown_listener;
+            tokio::pin!(shutdown);
+
+            loop {
+                select! {
+                    _ = &mut shutdown => break,
+                    _ = tick.tick() => {
+                        let session = consensus_manager.consensus().unguarded_session();
+                        let has_sufficient_peer_connectivity =
+                            !matches!(flow_context.config.net.network_type, Mainnet | Testnet) || flow_context.hub().has_peers();
+                        let is_synced = has_sufficient_peer_connectivity && session.async_is_nearly_synced().await;
+                        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+                        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+                        let cpu_ratio = (perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+
+                        hfa_engine.revalidate_active_budgeted(session, is_synced, cpu_ratio, basechain_block_latency_ms).await;
+                        flow_context.broadcast_outbound_fast_microblocks().await;
+                    }
+                }
+            }
+        });
+    }
+
+    fn start_rpc_block_scan_cache_warmer(self: Arc<Self>) {
+        if !self.block_scan_cache.enabled() {
+            return;
+        }
+
+        let shutdown_listener = self.shutdown.listener.clone();
+        tokio::spawn(async move {
+            let shutdown = shutdown_listener;
+            tokio::pin!(shutdown);
+
+            let mut readiness_tick = interval(RPC_BLOCK_SCAN_CACHE_STARTUP_READY_POLL_INTERVAL);
+            readiness_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            readiness_tick.tick().await;
+            let mut last_wait_log: Option<Instant> = None;
+
+            loop {
+                let readiness = self.rpc_block_scan_cache_startup_readiness().await;
+                if readiness.ready {
+                    info!(
+                        "RPC block scan cache startup warm gate passed: peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}",
+                        readiness.peer_ready,
+                        readiness.node_nearly_synced,
+                        readiness.virtual_daa_score,
+                        readiness.activation_daa_score,
+                        readiness.atomic_required,
+                        readiness.atomic_ready,
+                        readiness.atomic_runtime,
+                        readiness.atomic_degraded,
+                        readiness.atomic_bootstrap,
+                        readiness.atomic_live_correct,
+                        readiness.atomic_last_applied
+                    );
+                    break;
+                }
+
+                if last_wait_log.map_or(true, |last| last.elapsed() >= RPC_BLOCK_SCAN_CACHE_STARTUP_WAIT_LOG_INTERVAL) {
+                    if readiness.wait_reason == "waiting_for_node_sync" && readiness.virtual_daa_score == 0 {
+                        debug!(
+                            "RPC block scan cache startup warm waiting: reason={} peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_reason={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}; cache_serving=false fallback=storage_on_miss",
+                            readiness.wait_reason,
+                            readiness.peer_ready,
+                            readiness.node_nearly_synced,
+                            readiness.virtual_daa_score,
+                            readiness.activation_daa_score,
+                            readiness.atomic_required,
+                            readiness.atomic_ready,
+                            readiness.atomic_not_ready_reason.unwrap_or("none"),
+                            readiness.atomic_runtime,
+                            readiness.atomic_degraded,
+                            readiness.atomic_bootstrap,
+                            readiness.atomic_live_correct,
+                            readiness.atomic_last_applied
+                        );
+                    } else {
+                        info!(
+                            "RPC block scan cache startup warm waiting: reason={} peer_ready={} node_nearly_synced={} virtual_daa={} activation_daa={} atomic_required={} atomic_ready={} atomic_reason={} atomic_runtime={} atomic_degraded={} atomic_bootstrap={} atomic_live_correct={} atomic_last_applied={:?}; cache_serving=false fallback=storage_on_miss",
+                            readiness.wait_reason,
+                            readiness.peer_ready,
+                            readiness.node_nearly_synced,
+                            readiness.virtual_daa_score,
+                            readiness.activation_daa_score,
+                            readiness.atomic_required,
+                            readiness.atomic_ready,
+                            readiness.atomic_not_ready_reason.unwrap_or("none"),
+                            readiness.atomic_runtime,
+                            readiness.atomic_degraded,
+                            readiness.atomic_bootstrap,
+                            readiness.atomic_live_correct,
+                            readiness.atomic_last_applied
+                        );
+                    }
+                    last_wait_log = Some(Instant::now());
+                }
+
+                select! {
+                    _ = &mut shutdown => return,
+                    _ = readiness_tick.tick() => {}
+                }
+            }
+
+            loop {
+                if self.warm_rpc_block_scan_cache_once("startup", None).await {
+                    self.block_scan_cache.mark_ready_to_serve();
+                    let stats = self.block_scan_cache.stats();
+                    info!(
+                        "RPC block scan cache is now serving: cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} fallback=storage_on_miss",
+                        stats.headers,
+                        stats.blocks,
+                        stats.selected_parent_links,
+                        stats.current_bytes / (1024 * 1024),
+                        stats.max_bytes / (1024 * 1024)
+                    );
+                    break;
+                }
+
+                warn!(
+                    "RPC block scan cache startup warm did not complete cleanly; cache_serving=false and startup warm will retry in {} seconds",
+                    RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL.as_secs()
+                );
+                select! {
+                    _ = &mut shutdown => return,
+                    _ = sleep(RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL) => {}
+                }
+            }
+
+            let mut tick = interval(RPC_BLOCK_SCAN_CACHE_WARM_INTERVAL);
+            tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut activity_tick = interval(RPC_BLOCK_SCAN_CACHE_ACTIVITY_LOG_INTERVAL);
+            activity_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            let mut last_activity = self.block_scan_cache.activity_snapshot();
+            activity_tick.tick().await;
+            loop {
+                select! {
+                    _ = &mut shutdown => break,
+                    _ = tick.tick() => {
+                        self.warm_rpc_block_scan_cache_once("refresh", Some(RPC_BLOCK_SCAN_CACHE_WARM_CACHED_STOP)).await;
+                    },
+                    _ = activity_tick.tick() => {
+                        last_activity = self.log_rpc_block_scan_cache_activity(last_activity);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn rpc_block_scan_cache_startup_readiness(&self) -> RpcBlockScanCacheStartupReadiness {
+        let peer_ready = self.has_sufficient_peer_connectivity();
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.get_virtual_daa_score();
+        let activation_daa_score = self.config.params.payload_hf_activation_daa_score;
+        let node_nearly_synced = peer_ready && session.async_is_nearly_synced().await;
+        let atomic_required = virtual_daa_score >= activation_daa_score;
+        let atomic_health = if atomic_required { Some(self.atomic_token_service.get_health().await) } else { None };
+        let atomic_not_ready_reason = atomic_health.as_ref().and_then(Self::atomic_token_mining_not_ready_reason);
+        let atomic_ready = !atomic_required || atomic_not_ready_reason.is_none();
+        let ready = peer_ready && node_nearly_synced && atomic_ready;
+        let wait_reason = if !peer_ready {
+            "waiting_for_peer_connectivity"
+        } else if !node_nearly_synced {
+            "waiting_for_node_sync"
+        } else if !atomic_ready {
+            "waiting_for_atomic_sync"
+        } else {
+            "ready"
+        };
+        let atomic_runtime = atomic_health.as_ref().map(|health| health.runtime_state.as_str()).unwrap_or("not_required");
+        let atomic_degraded = atomic_health.as_ref().map_or(false, |health| health.is_degraded);
+        let atomic_bootstrap = atomic_health.as_ref().map_or(false, |health| health.bootstrap_in_progress);
+        let atomic_live_correct = atomic_health.as_ref().map_or(true, |health| health.live_correct);
+        let atomic_last_applied = atomic_health.as_ref().and_then(|health| health.last_applied_block);
+
+        RpcBlockScanCacheStartupReadiness {
+            ready,
+            wait_reason,
+            peer_ready,
+            node_nearly_synced,
+            virtual_daa_score,
+            activation_daa_score,
+            atomic_required,
+            atomic_ready,
+            atomic_not_ready_reason,
+            atomic_runtime,
+            atomic_degraded,
+            atomic_bootstrap,
+            atomic_live_correct,
+            atomic_last_applied,
+        }
+    }
+
+    fn log_rpc_block_scan_cache_activity(&self, previous: RpcBlockScanCacheActivity) -> RpcBlockScanCacheActivity {
+        let current = self.block_scan_cache.activity_snapshot();
+        let delta = current.saturating_sub(previous);
+        let stats = self.block_scan_cache.stats();
+        info!(
+            "RPC block scan cache activity last_60s: added_headers={} added_blocks={} added_parent_links={} removed_headers={} removed_blocks={} removed_parent_links={} added_mb={} removed_mb={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} cache_serving={}",
+            delta.added_headers,
+            delta.added_blocks,
+            delta.added_selected_parent_links,
+            delta.removed_headers,
+            delta.removed_blocks,
+            delta.removed_selected_parent_links,
+            delta.added_bytes / (1024 * 1024),
+            delta.removed_bytes / (1024 * 1024),
+            stats.headers,
+            stats.blocks,
+            stats.selected_parent_links,
+            stats.current_bytes / (1024 * 1024),
+            stats.max_bytes / (1024 * 1024),
+            stats.serving,
+        );
+        current
+    }
+
+    async fn warm_rpc_block_scan_cache_once(&self, reason: &'static str, stop_after_cached_run: Option<usize>) -> bool {
+        if !self.block_scan_cache.enabled() {
+            return false;
+        }
+
+        let session = self.consensus_manager.consensus().session().await;
+        let mut current = session.async_get_sink().await;
+        let started = Instant::now();
+        let start_now_ms = unix_now();
+        let max_age_ms = self.block_scan_cache.max_age_ms();
+        let mut scanned = 0usize;
+        let mut warmed_headers = 0usize;
+        let mut warmed_blocks = 0usize;
+        let mut cached_run = 0usize;
+        let stop_reason;
+        let mut last_progress_log = Instant::now();
+
+        if reason == "startup" {
+            let stats = self.block_scan_cache.stats();
+            info!(
+                "RPC block scan cache startup warm started: target_days={:.2} max_mb={} start_hash={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={} cache_serving={}",
+                self.block_scan_cache.days(),
+                stats.max_bytes / (1024 * 1024),
+                current,
+                stats.headers,
+                stats.blocks,
+                stats.selected_parent_links,
+                stats.current_bytes / (1024 * 1024),
+                stats.serving,
+            );
+        }
+
+        loop {
+            let now_ms = unix_now();
+            let rpc_header = if let Some(header) = self.block_scan_cache.get_header(current, now_ms) {
+                header
+            } else {
+                let header = match session.async_get_header(current).await {
+                    Ok(header) => header,
+                    Err(err) => {
+                        warn!("RPC block scan cache warm {reason}: failed reading header {current}: {err}");
+                        stop_reason = "header_read_failed";
+                        break;
+                    }
+                };
+                let rpc_header: RpcHeader = (&*header).into();
+                self.block_scan_cache.insert_header(rpc_header.clone(), now_ms);
+                warmed_headers = warmed_headers.saturating_add(1);
+                rpc_header
+            };
+
+            if start_now_ms.saturating_sub(rpc_header.timestamp) > max_age_ms {
+                stop_reason = "age_limit_reached";
+                break;
+            }
+
+            if self.block_scan_cache.contains_block(current, true, now_ms) {
+                cached_run = cached_run.saturating_add(1);
+                if stop_after_cached_run.is_some_and(|limit| cached_run >= limit) {
+                    stop_reason = "recent_cached_region_reached";
+                    break;
+                }
+            } else {
+                cached_run = 0;
+
+                let block = match session.async_get_block_even_if_header_only(current).await {
+                    Ok(block) => block,
+                    Err(err) => {
+                        warn!("RPC block scan cache warm {reason}: failed reading block {current}: {err}");
+                        stop_reason = "block_read_failed";
+                        break;
+                    }
+                };
+                match self.consensus_converter.get_block(&session, &block, true, true).await {
+                    Ok(rpc_block) => {
+                        let retained = self.block_scan_cache.insert_block(rpc_block, true, unix_now());
+                        if retained {
+                            warmed_blocks = warmed_blocks.saturating_add(1);
+                        } else if self.block_scan_cache.is_near_full() {
+                            stop_reason = "cache_capacity_reached";
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("RPC block scan cache warm {reason}: failed converting block {current}: {err}");
+                        stop_reason = "block_convert_failed";
+                        break;
+                    }
+                }
+            }
+
+            scanned = scanned.saturating_add(1);
+            if reason == "startup" && last_progress_log.elapsed() >= RPC_BLOCK_SCAN_CACHE_WARM_PROGRESS_INTERVAL {
+                let stats = self.block_scan_cache.stats();
+                info!(
+                    "RPC block scan cache startup warm progress: scanned={} warmed_headers={} warmed_blocks={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} cache_serving={} current_hash={}",
+                    scanned,
+                    warmed_headers,
+                    warmed_blocks,
+                    stats.headers,
+                    stats.blocks,
+                    stats.selected_parent_links,
+                    stats.current_bytes / (1024 * 1024),
+                    stats.max_bytes / (1024 * 1024),
+                    stats.serving,
+                    current,
+                );
+                last_progress_log = Instant::now();
+            }
+
+            let ghostdag = match session.async_get_ghostdag_data(current).await {
+                Ok(ghostdag) => ghostdag,
+                Err(err) => {
+                    warn!("RPC block scan cache warm {reason}: failed reading ghostdag {current}: {err}");
+                    stop_reason = "ghostdag_read_failed";
+                    break;
+                }
+            };
+            self.block_scan_cache.insert_selected_parent(current, ghostdag.selected_parent, rpc_header.timestamp, unix_now());
+            if ghostdag.selected_parent.is_origin() {
+                stop_reason = "selected_parent_origin_reached";
+                break;
+            }
+            current = ghostdag.selected_parent;
+
+            if scanned % RPC_BLOCK_SCAN_CACHE_WARM_YIELD_EVERY == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        if reason == "startup" {
+            let stats = self.block_scan_cache.stats();
+            let ready_to_serve = matches!(
+                stop_reason,
+                "age_limit_reached" | "cache_capacity_reached" | "recent_cached_region_reached" | "selected_parent_origin_reached"
+            );
+            info!(
+                "RPC block scan cache startup warm complete: stop_reason={} ready_to_serve={} scanned={} warmed_headers={} warmed_blocks={} elapsed_ms={} cache_headers={} cache_blocks={} cache_parent_links={} cache_mb={}/{} cache_serving={} fallback=storage_on_miss",
+                stop_reason,
+                ready_to_serve,
+                scanned,
+                warmed_headers,
+                warmed_blocks,
+                started.elapsed().as_millis(),
+                stats.headers,
+                stats.blocks,
+                stats.selected_parent_links,
+                stats.current_bytes / (1024 * 1024),
+                stats.max_bytes / (1024 * 1024),
+                stats.serving
+            );
+            cryptix_alloc::collect_allocator(true);
+            info!("RPC block scan cache startup warm requested allocator collection after temporary warmup allocations");
+        }
+
+        matches!(
+            stop_reason,
+            "age_limit_reached" | "cache_capacity_reached" | "recent_cached_region_reached" | "selected_parent_origin_reached"
+        )
     }
 
     pub async fn join(&self) -> RpcResult<()> {
@@ -274,6 +1030,1030 @@ impl RpcCoreService {
         !matches!(self.flow_context.config.net.network_type, Mainnet | Testnet) || self.flow_context.hub().has_peers()
     }
 
+    fn atomic_service(&self) -> RpcResult<Arc<AtomicTokenService>> {
+        Ok(self.atomic_token_service.clone())
+    }
+
+    fn parse_hex_32(value: &str, field: &str) -> RpcResult<[u8; 32]> {
+        <[u8; 32]>::from_hex(value).map_err(|err| RpcError::General(format!("invalid `{field}` hex: {err}")))
+    }
+
+    fn token_state_unavailable_error(runtime_state: AtomicTokenRuntimeState) -> RpcError {
+        match runtime_state {
+            AtomicTokenRuntimeState::NotReady => RpcError::AtomicStateNotReady,
+            AtomicTokenRuntimeState::Recovering => RpcError::AtomicStateRecovering,
+            AtomicTokenRuntimeState::Degraded => RpcError::AtomicStateDegraded,
+            AtomicTokenRuntimeState::Healthy => RpcError::General("invalid token runtime state guard".to_string()),
+        }
+    }
+
+    fn ensure_token_read_ready(view: &AtomicTokenReadView) -> RpcResult<()> {
+        match view.runtime_state {
+            AtomicTokenRuntimeState::Healthy => Ok(()),
+            other => Err(Self::token_state_unavailable_error(other)),
+        }
+    }
+
+    fn ensure_token_context_read_ready(context: &AtomicTokenReadContext) -> RpcResult<()> {
+        match context.runtime_state {
+            AtomicTokenRuntimeState::Healthy => Ok(()),
+            other => Err(Self::token_state_unavailable_error(other)),
+        }
+    }
+
+    fn ensure_token_simulation_ready(view: &AtomicTokenReadView) -> RpcResult<()> {
+        Self::ensure_token_read_ready(view)
+    }
+
+    fn atomic_token_mining_not_ready_reason(health: &AtomicTokenHealth) -> Option<&'static str> {
+        if health.bootstrap_in_progress {
+            Some("Atomic bootstrap/replay is still in progress")
+        } else if health.runtime_state != AtomicTokenRuntimeState::Healthy {
+            Some("Atomic runtime is not healthy")
+        } else if health.is_degraded {
+            Some("Atomic state is degraded")
+        } else if !health.live_correct {
+            Some("Atomic live state is not correct")
+        } else if health.last_applied_block.is_none() {
+            Some("Atomic state has no applied block")
+        } else {
+            None
+        }
+    }
+
+    async fn ensure_atomic_token_mining_ready(
+        &self,
+        endpoint: &str,
+        block_daa_score: u64,
+    ) -> RpcResult<Result<(), SubmitBlockRejectReason>> {
+        if block_daa_score < self.config.params.payload_hf_activation_daa_score {
+            return Ok(Ok(()));
+        }
+
+        let health = self.atomic_token_service.get_health().await;
+        if let Some(reason) = Self::atomic_token_mining_not_ready_reason(&health) {
+            if self.should_log_get_block_template_unsynced() {
+                warn!(
+                    "Rejecting {} while Atomic token index is not mining-ready after payload HF: reason={}, block_daa_score={}, activation_daa={}, runtime={}, degraded={}, bootstrap_in_progress={}, live_correct={}, last_applied={:?}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments (warning throttled to once per 60s)",
+                    endpoint,
+                    reason,
+                    block_daa_score,
+                    self.config.params.payload_hf_activation_daa_score,
+                    health.runtime_state.as_str(),
+                    health.is_degraded,
+                    health.bootstrap_in_progress,
+                    health.live_correct,
+                    health.last_applied_block
+                );
+            }
+            return Ok(Err(SubmitBlockRejectReason::IsInIBD));
+        }
+
+        Ok(Ok(()))
+    }
+
+    fn page_token_owner_balances(
+        mut balances: Vec<TokenOwnerBalanceEntry>,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<TokenOwnerBalanceEntry>, u64) {
+        let total = balances.len() as u64;
+        if limit == 0 || offset >= balances.len() {
+            return (Vec::new(), total);
+        }
+        let end = offset.saturating_add(limit).min(balances.len());
+        balances.select_nth_unstable_by(end - 1, |a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        balances.truncate(end);
+        balances.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        (balances.into_iter().skip(offset).collect(), total)
+    }
+
+    fn page_token_holders(mut holders: Vec<TokenHolderEntry>, offset: usize, limit: usize) -> (Vec<TokenHolderEntry>, u64) {
+        let total = holders.len() as u64;
+        if limit == 0 || offset >= holders.len() {
+            return (Vec::new(), total);
+        }
+        let end = offset.saturating_add(limit).min(holders.len());
+        holders.select_nth_unstable_by(end - 1, |a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        holders.truncate(end);
+        holders.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        (holders.into_iter().skip(offset).collect(), total)
+    }
+
+    fn liquidity_read_view_unavailable_error(at_block_hash: Option<RpcHash>) -> RpcError {
+        if at_block_hash.is_some() {
+            RpcError::General(CAT_ERR_HISTORICAL_STATE_UNAVAILABLE.to_string())
+        } else {
+            RpcError::StaleContext
+        }
+    }
+
+    fn cat_error_with_detail(code: &str, detail: impl AsRef<str>) -> RpcError {
+        RpcError::General(format!("{code}: {}", detail.as_ref()))
+    }
+
+    fn liquidity_submit_read_not_ready_error(detail: impl AsRef<str>) -> RpcError {
+        RpcError::General(format!("liquidity pool state is not submit-ready: {}", detail.as_ref()))
+    }
+
+    fn should_warn_atomic_submit_read_not_ready(context: &AtomicTokenReadContext) -> bool {
+        context.is_degraded || context.runtime_state != AtomicTokenRuntimeState::Healthy
+    }
+
+    async fn consensus_atomic_state_hash(&self, block_hash: BlockHash) -> RpcResult<Option<[u8; 32]>> {
+        let session = self.consensus_manager.consensus().session().await;
+        session
+            .async_get_atomic_state_hash(block_hash)
+            .await
+            .map_err(|err| RpcError::General(format!("failed reading consensus atomic state hash: {err}")))
+    }
+
+    async fn virtual_utxo_entry_exact(&self, outpoint: TransactionOutpoint) -> Option<UtxoEntry> {
+        let session = self.consensus_manager.consensus().session().await;
+        session
+            .async_get_virtual_utxos(Some(outpoint), 1, false)
+            .await
+            .into_iter()
+            .next()
+            .and_then(|(found_outpoint, entry)| (found_outpoint == outpoint).then_some(entry))
+    }
+
+    async fn check_latest_liquidity_pool_vault_spendable(
+        &self,
+        endpoint: &str,
+        requested_at_block_hash: Option<RpcHash>,
+        asset_id: [u8; 32],
+        context: &AtomicTokenReadContext,
+        pool: &LiquidityPoolState,
+        log_failure: bool,
+    ) -> RpcResult<Result<(), String>> {
+        if requested_at_block_hash.is_some() {
+            return Ok(Ok(()));
+        }
+
+        let outpoint = pool.vault_outpoint;
+        let Some(entry) = self.virtual_utxo_entry_exact(outpoint).await else {
+            let detail =
+                "Atomic pool vault is not spendable in the current virtual UTXO; retry after Atomic/UTXO state catches up".to_string();
+            if log_failure {
+                let session = self.consensus_manager.consensus().session().await;
+                let current_sink = session.async_get_sink().await;
+                let virtual_daa = session.get_virtual_daa_score();
+                let message = format!(
+                    "{} latest liquidity pool read is not submit-ready because Atomic pool vault is not spendable in virtual UTXO: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} atomic_block={} current_sink={} virtual_daa={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
+                    endpoint,
+                    asset_id.as_slice().to_hex(),
+                    pool.pool_nonce,
+                    outpoint,
+                    pool.vault_value_sompi,
+                    context.at_block_hash,
+                    current_sink,
+                    virtual_daa,
+                    context.state_hash.as_slice().to_hex(),
+                    context.runtime_state.as_str(),
+                    context.is_degraded,
+                    context.event_sequence_cutoff
+                );
+                if Self::should_warn_atomic_submit_read_not_ready(context) {
+                    warn!("{message}");
+                } else {
+                    debug!("{message}");
+                }
+            }
+            return Ok(Err(detail));
+        };
+
+        let class = ScriptClass::from_script(&entry.script_public_key);
+        let is_liquidity_vault = matches!(&class, ScriptClass::LiquidityVault);
+        if !is_liquidity_vault || entry.amount != pool.vault_value_sompi {
+            let detail =
+                "Atomic pool vault does not match the current virtual UTXO; retry after Atomic/UTXO state catches up".to_string();
+            if log_failure {
+                let session = self.consensus_manager.consensus().session().await;
+                let current_sink = session.async_get_sink().await;
+                let virtual_daa = session.get_virtual_daa_score();
+                let message = format!(
+                    "{} latest liquidity pool read is not submit-ready because Atomic pool vault does not match virtual UTXO entry: asset_id={} pool_nonce={} pool_vault={} pool_vault_value_sompi={} utxo_amount={} utxo_script_class={:?} atomic_block={} current_sink={} virtual_daa={} atomic_state_hash={} runtime={} degraded={} event_seq={}",
+                    endpoint,
+                    asset_id.as_slice().to_hex(),
+                    pool.pool_nonce,
+                    outpoint,
+                    pool.vault_value_sompi,
+                    entry.amount,
+                    class,
+                    context.at_block_hash,
+                    current_sink,
+                    virtual_daa,
+                    context.state_hash.as_slice().to_hex(),
+                    context.runtime_state.as_str(),
+                    context.is_degraded,
+                    context.event_sequence_cutoff
+                );
+                if Self::should_warn_atomic_submit_read_not_ready(context) {
+                    warn!("{message}");
+                } else {
+                    debug!("{message}");
+                }
+            }
+            return Ok(Err(detail));
+        }
+
+        Ok(Ok(()))
+    }
+
+    async fn latest_liquidity_asset_with_submit_ready_vault(
+        &self,
+        atomic: &AtomicTokenService,
+        endpoint: &str,
+        asset_id: [u8; 32],
+        at_block_hash: Option<RpcHash>,
+    ) -> RpcResult<(AtomicTokenReadContext, Option<TokenAsset>)> {
+        let mut last_not_ready = None;
+        for attempt in 0..=LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS {
+            let (read_context, asset) = atomic
+                .get_asset_with_context(asset_id, at_block_hash)
+                .await
+                .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+            Self::ensure_token_context_read_ready(&read_context)?;
+
+            if let Some(liquidity) = asset.as_ref().and_then(|asset| asset.liquidity.as_ref()) {
+                match self
+                    .check_latest_liquidity_pool_vault_spendable(
+                        endpoint,
+                        at_block_hash,
+                        asset_id,
+                        &read_context,
+                        liquidity,
+                        attempt == LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS,
+                    )
+                    .await?
+                {
+                    Ok(()) => return Ok((read_context, asset)),
+                    Err(detail) => {
+                        last_not_ready = Some(detail);
+                    }
+                }
+            } else {
+                return Ok((read_context, asset));
+            }
+
+            if attempt < LIQUIDITY_SUBMIT_READY_RECHECK_ATTEMPTS {
+                tokio::time::sleep(LIQUIDITY_SUBMIT_READY_RECHECK_DELAY).await;
+            }
+        }
+
+        Err(Self::liquidity_submit_read_not_ready_error(
+            last_not_ready.unwrap_or_else(|| "Atomic/UTXO state did not become submit-ready in time".to_string()),
+        ))
+    }
+
+    async fn atomic_context_from_read_context(&self, context: &AtomicTokenReadContext) -> RpcResult<RpcTokenContext> {
+        let consensus = self.consensus_manager.consensus();
+        let session = consensus.session().await;
+        let at_block_hash = context.at_block_hash;
+        let at_daa_score = session
+            .async_get_header(at_block_hash)
+            .await
+            .map_err(|err| RpcError::General(format!("failed reading token context header: {err}")))?
+            .daa_score;
+        Ok(RpcTokenContext {
+            at_block_hash,
+            at_daa_score,
+            state_hash: context.state_hash.as_slice().to_hex(),
+            is_degraded: context.is_degraded,
+        })
+    }
+
+    fn map_token_asset(asset: TokenAsset) -> RpcTokenAsset {
+        let safe_name = Self::sanitize_token_display_text(&asset.name);
+        let safe_symbol = Self::sanitize_token_display_text(&asset.symbol);
+        let safe_platform_tag = Self::sanitize_token_display_text(&asset.platform_tag);
+        RpcTokenAsset {
+            asset_id: asset.asset_id.as_slice().to_hex(),
+            creator_owner_id: asset.creator_owner_id.as_slice().to_hex(),
+            token_version: u32::from(asset.token_version),
+            mint_authority_owner_id: asset.mint_authority_owner_id.as_slice().to_hex(),
+            decimals: asset.decimals as u32,
+            supply_mode: asset.supply_mode as u32,
+            max_supply: asset.max_supply.to_string(),
+            total_supply: asset.total_supply.to_string(),
+            name: safe_name,
+            symbol: safe_symbol,
+            metadata_hex: asset.metadata.to_hex(),
+            created_block_hash: asset.created_block_hash,
+            created_daa_score: asset.created_daa_score,
+            created_at: asset.created_at,
+            platform_tag: safe_platform_tag,
+        }
+    }
+
+    fn map_token_event(event: TokenEvent) -> RpcTokenEvent {
+        RpcTokenEvent {
+            event_id: event.event_id.as_slice().to_hex(),
+            sequence: event.sequence,
+            accepting_block_hash: event.accepting_block_hash,
+            txid: event.txid,
+            event_type: event.event_type as u32,
+            apply_status: event.apply_status as u32,
+            noop_reason: event.noop_reason as u32,
+            ordinal: event.ordinal,
+            reorg_of_event_id: event.reorg_of_event_id.map(|id| id.as_slice().to_hex()),
+            op_type: event.details.op_type.map(|op| op as u32),
+            asset_id: event.details.asset_id.map(|id| id.as_slice().to_hex()),
+            from_owner_id: event.details.from_owner_id.map(|id| id.as_slice().to_hex()),
+            to_owner_id: event.details.to_owner_id.map(|id| id.as_slice().to_hex()),
+            amount: event.details.amount.map(|amount| amount.to_string()),
+        }
+    }
+
+    fn map_token_owner_balance(entry: ([u8; 32], u128, Option<TokenAsset>)) -> RpcTokenOwnerBalance {
+        RpcTokenOwnerBalance {
+            asset_id: entry.0.as_slice().to_hex(),
+            balance: entry.1.to_string(),
+            asset: entry.2.map(Self::map_token_asset),
+        }
+    }
+
+    fn map_token_holder(entry: ([u8; 32], u128)) -> RpcTokenHolder {
+        RpcTokenHolder { owner_id: entry.0.as_slice().to_hex(), balance: entry.1.to_string() }
+    }
+
+    fn liquidity_address_string_from_components(
+        prefix: cryptix_addresses::Prefix,
+        address_version: u8,
+        address_payload: &[u8],
+    ) -> Option<String> {
+        let version = AddressVersion::try_from(address_version).ok()?;
+        if address_payload.len() != version.public_key_len() {
+            return None;
+        }
+        Some(Address::new(prefix, version, address_payload).to_string())
+    }
+
+    fn map_liquidity_fee_recipient(
+        recipient: &LiquidityFeeRecipientState,
+        prefix: cryptix_addresses::Prefix,
+    ) -> RpcLiquidityFeeRecipient {
+        let address =
+            Self::liquidity_address_string_from_components(prefix, recipient.address_version, recipient.address_payload.as_slice())
+                .unwrap_or_default();
+        RpcLiquidityFeeRecipient {
+            owner_id: recipient.owner_id.as_slice().to_hex(),
+            address,
+            unclaimed_sompi: recipient.unclaimed_sompi.to_string(),
+        }
+    }
+
+    fn map_liquidity_pool_state(
+        asset: &TokenAsset,
+        pool: &LiquidityPoolState,
+        prefix: cryptix_addresses::Prefix,
+    ) -> RpcLiquidityPoolState {
+        let circulating_token_supply = asset.max_supply.saturating_sub(pool.real_token_reserves);
+        let liquidity_lock_enabled = pool.unlock_target_sompi > 0;
+        let sell_locked = Self::liquidity_sell_locked(pool);
+        let max_buy_in =
+            max_buy_in_sompi(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, pool.fee_bps)
+                .unwrap_or(0);
+        let current_spot_price_sompi = min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            1,
+            pool.fee_bps,
+        )
+        .unwrap_or(0);
+        let circulating_mcap_cpay_sompi = circulating_token_supply.checked_mul(u128::from(current_spot_price_sompi)).unwrap_or(0);
+        let fdv_mcap_cpay_sompi = asset.max_supply.checked_mul(u128::from(current_spot_price_sompi)).unwrap_or(0);
+        RpcLiquidityPoolState {
+            asset_id: asset.asset_id.as_slice().to_hex(),
+            pool_nonce: pool.pool_nonce,
+            curve_version: u32::from(pool.curve_version),
+            curve_mode: u32::from(pool.curve_mode),
+            curve_mode_label: liquidity_curve_mode_label(pool.curve_mode).to_string(),
+            individual_virtual_cpay_reserves_sompi: pool.individual_virtual_cpay_reserves_sompi.to_string(),
+            individual_virtual_token_multiplier_bps: u32::from(pool.individual_virtual_token_multiplier_bps),
+            fee_bps: u32::from(pool.fee_bps),
+            max_supply: asset.max_supply.to_string(),
+            total_supply: asset.total_supply.to_string(),
+            circulating_token_supply: circulating_token_supply.to_string(),
+            real_cpay_reserves_sompi: pool.real_cpay_reserves_sompi.to_string(),
+            real_token_reserves: pool.real_token_reserves.to_string(),
+            virtual_cpay_reserves_sompi: pool.virtual_cpay_reserves_sompi.to_string(),
+            virtual_token_reserves: pool.virtual_token_reserves.to_string(),
+            max_buy_in_sompi: max_buy_in.to_string(),
+            max_tokens_out: max_tokens_out(pool.real_token_reserves).to_string(),
+            unclaimed_fee_total_sompi: pool.unclaimed_fee_total_sompi.to_string(),
+            vault_value_sompi: pool.vault_value_sompi.to_string(),
+            vault_txid: pool.vault_outpoint.transaction_id,
+            vault_output_index: pool.vault_outpoint.index,
+            fee_recipients: pool.fee_recipients.iter().map(|recipient| Self::map_liquidity_fee_recipient(recipient, prefix)).collect(),
+            liquidity_lock_enabled,
+            unlock_target_sompi: pool.unlock_target_sompi.to_string(),
+            unlocked: pool.unlocked,
+            sell_locked,
+            liquidity_cpay_sompi: pool.real_cpay_reserves_sompi.to_string(),
+            current_spot_price_sompi: current_spot_price_sompi.to_string(),
+            circulating_mcap_cpay_sompi: circulating_mcap_cpay_sompi.to_string(),
+            fdv_mcap_cpay_sompi: fdv_mcap_cpay_sompi.to_string(),
+        }
+    }
+
+    fn map_liquidity_holder(entry: ([u8; 32], u128), owner_to_address: &HashMap<[u8; 32], String>) -> RpcLiquidityHolder {
+        RpcLiquidityHolder {
+            address: owner_to_address.get(&entry.0).cloned(),
+            owner_id: entry.0.as_slice().to_hex(),
+            balance: entry.1.to_string(),
+        }
+    }
+
+    fn liquidity_sell_locked(pool: &LiquidityPoolState) -> bool {
+        pool.unlock_target_sompi > 0 && !pool.unlocked
+    }
+
+    fn liquidity_payload_submit_diagnostics(transaction: &Transaction) -> (String, Option<[u8; 32]>, Option<u64>) {
+        match parse_atomic_token_payload(transaction.payload.as_slice()) {
+            Some(Ok(parsed)) => match parsed.op {
+                TokenOp::CreateAsset(_) => ("create_asset".to_string(), None, None),
+                TokenOp::Transfer(op) => ("transfer".to_string(), Some(op.asset_id), None),
+                TokenOp::Mint(op) => ("mint".to_string(), Some(op.asset_id), None),
+                TokenOp::Burn(op) => ("burn".to_string(), Some(op.asset_id), None),
+                TokenOp::CreateAssetWithMint(_) => ("create_asset_with_mint".to_string(), None, None),
+                TokenOp::CreateLiquidityAsset(_) => ("create_liquidity_asset".to_string(), None, None),
+                TokenOp::BuyLiquidityExactIn(op) => {
+                    ("buy_liquidity_exact_in".to_string(), Some(op.asset_id), Some(op.expected_pool_nonce))
+                }
+                TokenOp::SellLiquidityExactIn(op) => {
+                    ("sell_liquidity_exact_in".to_string(), Some(op.asset_id), Some(op.expected_pool_nonce))
+                }
+                TokenOp::ClaimLiquidityFees(op) => {
+                    ("claim_liquidity_fees".to_string(), Some(op.asset_id), Some(op.expected_pool_nonce))
+                }
+            },
+            Some(Err(reason)) => (format!("cat_parse_error:{reason:?}"), None, None),
+            None => ("non_cat".to_string(), None, None),
+        }
+    }
+
+    async fn log_submit_transaction_orphan_rejection(
+        &self,
+        transaction: &Transaction,
+        requested_allow_orphan: bool,
+        effective_allow_orphan: bool,
+        error_message: &str,
+    ) {
+        let lower = error_message.to_ascii_lowercase();
+        if !lower.contains("orphan") || !lower.contains("disallowed") {
+            return;
+        }
+
+        let transaction_id = transaction.id();
+        let (op_label, asset_id, expected_pool_nonce) = Self::liquidity_payload_submit_diagnostics(transaction);
+        let asset_id_hex = asset_id.map(|id| id.as_slice().to_hex()).unwrap_or_else(|| "none".to_string());
+        let expected_pool_nonce = expected_pool_nonce.map(|nonce| nonce.to_string()).unwrap_or_else(|| "none".to_string());
+        let input_outpoints: Vec<TransactionOutpoint> = transaction.inputs.iter().map(|input| input.previous_outpoint).collect();
+        let first_inputs = input_outpoints.iter().take(12).map(|outpoint| outpoint.to_string()).collect::<Vec<_>>().join(",");
+
+        let mut atomic_context = "unavailable".to_string();
+        let mut pool_exists = false;
+        let mut pool_vault = "none".to_string();
+        let mut pool_vault_in_tx_inputs = false;
+        let mut pool_nonce = "none".to_string();
+        let mut pool_vault_value_sompi = "none".to_string();
+        let mut pool_vault_virtual_utxo = "not_checked".to_string();
+        let mut consensus_atomic_root_hash = "not_checked".to_string();
+        let mut should_warn = effective_allow_orphan;
+
+        if let Some(asset_id) = asset_id {
+            match self.atomic_service() {
+                Ok(atomic) => match atomic.get_asset_with_context(asset_id, None).await {
+                    Some((context, asset)) => {
+                        match self.consensus_atomic_state_hash(context.at_block_hash).await {
+                            Ok(Some(hash)) => {
+                                consensus_atomic_root_hash = hash.as_slice().to_hex();
+                            }
+                            Ok(None) => {
+                                consensus_atomic_root_hash = "missing".to_string();
+                            }
+                            Err(err) => {
+                                consensus_atomic_root_hash = format!("error:{err}");
+                            }
+                        }
+                        atomic_context = format!(
+                            "block={} runtime={} degraded={} state_hash={} event_seq={}",
+                            context.at_block_hash,
+                            context.runtime_state.as_str(),
+                            context.is_degraded,
+                            context.state_hash.as_slice().to_hex(),
+                            context.event_sequence_cutoff
+                        );
+                        should_warn |= Self::should_warn_atomic_submit_read_not_ready(&context);
+                        if let Some(pool) = asset.and_then(|asset| asset.liquidity) {
+                            let vault_outpoint = pool.vault_outpoint;
+                            pool_exists = true;
+                            pool_vault = vault_outpoint.to_string();
+                            pool_vault_in_tx_inputs = input_outpoints.iter().any(|input| *input == vault_outpoint);
+                            pool_nonce = pool.pool_nonce.to_string();
+                            pool_vault_value_sompi = pool.vault_value_sompi.to_string();
+                            pool_vault_virtual_utxo = match self.virtual_utxo_entry_exact(vault_outpoint).await {
+                                Some(entry) => format!(
+                                    "present amount={} script_class={:?}",
+                                    entry.amount,
+                                    ScriptClass::from_script(&entry.script_public_key)
+                                ),
+                                None => "missing".to_string(),
+                            };
+                        }
+                    }
+                    None => {
+                        atomic_context = "asset_context_unavailable".to_string();
+                    }
+                },
+                Err(err) => {
+                    atomic_context = format!("atomic_service_unavailable:{err}");
+                }
+            }
+        }
+
+        let message = format!(
+            "RPC SubmitTransaction disallowed orphan diagnostics: tx={} requested_allow_orphan={} effective_allow_orphan={} op={} asset_id={} expected_pool_nonce={} inputs={} first_inputs=[{}] atomic_context=\"{}\" consensus_atomic_root_hash={} pool_exists={} pool_nonce={} pool_vault={} pool_vault_in_tx_inputs={} pool_vault_value_sompi={} pool_vault_virtual_utxo=\"{}\" error=\"{}\"",
+            transaction_id,
+            requested_allow_orphan,
+            effective_allow_orphan,
+            op_label,
+            asset_id_hex,
+            expected_pool_nonce,
+            input_outpoints.len(),
+            first_inputs,
+            atomic_context,
+            consensus_atomic_root_hash,
+            pool_exists,
+            pool_nonce,
+            pool_vault,
+            pool_vault_in_tx_inputs,
+            pool_vault_value_sompi,
+            pool_vault_virtual_utxo,
+            error_message
+        );
+        if should_warn {
+            warn!("{message}");
+        } else {
+            debug!("{message}");
+        }
+    }
+
+    fn liquidity_claim_preview_status(pool: &LiquidityPoolState, claimable_sompi: u64) -> (bool, Option<String>) {
+        if Self::liquidity_sell_locked(pool) {
+            return (false, Some("liquidity_sell_locked".to_string()));
+        }
+        if claimable_sompi < LIQUIDITY_MIN_PAYOUT_SOMPI {
+            return (false, Some("below_min_payout".to_string()));
+        }
+        (true, None)
+    }
+
+    fn map_liquidity_math_error(err: LiquidityMathError) -> RpcError {
+        match err {
+            LiquidityMathError::Overflow => RpcError::General("liquidity math overflow".to_string()),
+            LiquidityMathError::InvalidInput => RpcError::General("liquidity math invalid input".to_string()),
+            LiquidityMathError::InvalidState => RpcError::General("liquidity math invalid curve state".to_string()),
+            LiquidityMathError::ZeroOutput => Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "liquidity math produced zero output"),
+        }
+    }
+
+    fn map_liquidity_math_noop_reason(err: LiquidityMathError) -> NoopReason {
+        match err {
+            LiquidityMathError::Overflow => NoopReason::SupplyOverflow,
+            LiquidityMathError::InvalidInput => NoopReason::InvalidAmount,
+            LiquidityMathError::InvalidState => NoopReason::InternalMalformedAcceptance,
+            LiquidityMathError::ZeroOutput => NoopReason::ZeroOutput,
+        }
+    }
+
+    fn validate_real_cpay_reserve(real_cpay_reserves_sompi: u64) -> Option<NoopReason> {
+        if real_cpay_reserves_sompi < MIN_CPAY_RESERVE_SOMPI {
+            Some(NoopReason::InternalMalformedAcceptance)
+        } else {
+            None
+        }
+    }
+
+    fn simulate_create_asset_with_mint_noop_reason(op: &CreateAssetWithMintOp) -> Option<NoopReason> {
+        if matches!(op.supply_mode, SupplyMode::Capped) && op.max_supply == 0 {
+            return Some(NoopReason::BadMaxSupply);
+        }
+        if matches!(op.supply_mode, SupplyMode::Uncapped) && op.max_supply != 0 {
+            return Some(NoopReason::BadMaxSupply);
+        }
+        if matches!(op.supply_mode, SupplyMode::Capped) && op.initial_mint_amount > op.max_supply {
+            return Some(NoopReason::SupplyCapExceeded);
+        }
+        None
+    }
+
+    fn simulate_create_liquidity_noop_reason(op: &CreateLiquidityAssetOp) -> Option<NoopReason> {
+        if op.decimals != LIQUIDITY_TOKEN_DECIMALS {
+            return Some(NoopReason::BadDecimals);
+        }
+        if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&op.max_supply) {
+            return Some(NoopReason::BadMaxSupply);
+        }
+        if op.seed_reserve_sompi != MIN_LIQUIDITY_SEED_RESERVE_SOMPI {
+            return Some(NoopReason::InvalidAmount);
+        }
+        if validate_liquidity_curve_mode(op.curve_mode).is_err() {
+            return Some(NoopReason::BadLiquidityCurveMode);
+        }
+        if validate_liquidity_curve_parameters(
+            op.curve_mode,
+            op.individual_virtual_cpay_reserves_sompi,
+            op.individual_virtual_token_multiplier_bps,
+        )
+        .is_err()
+        {
+            return Some(NoopReason::BadLiquidityCurveMode);
+        }
+        if op.liquidity_unlock_target_sompi > MAX_SOMPI {
+            return Some(NoopReason::BadLiquidityUnlockTarget);
+        }
+        if op.launch_buy_sompi == 0 {
+            return None;
+        }
+
+        let fee_trade = match calculate_trade_fee(op.launch_buy_sompi, op.fee_bps) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        let Some(launch_buy_net) = op.launch_buy_sompi.checked_sub(fee_trade) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        let virtual_cpay_reserves_sompi =
+            match initial_virtual_cpay_reserves_sompi_for_curve(op.curve_mode, op.individual_virtual_cpay_reserves_sompi) {
+                Ok(value) => value,
+                Err(_) => return Some(NoopReason::BadLiquidityCurveMode),
+            };
+        let virtual_token_reserves =
+            match initial_virtual_token_reserves_for_curve(op.max_supply, op.curve_mode, op.individual_virtual_token_multiplier_bps) {
+                Ok(value) => value,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
+        let (token_out, _new_real_token_reserves, _new_virtual_cpay_reserves_sompi, _new_virtual_token_reserves) =
+            match cpmm_buy(op.max_supply, virtual_cpay_reserves_sompi, virtual_token_reserves, launch_buy_net) {
+                Ok(state) => state,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
+        if token_out < op.launch_buy_min_token_out {
+            return Some(NoopReason::MinOutViolation);
+        }
+        let canonical_launch_buy = match min_gross_input_for_token_out(
+            op.max_supply,
+            virtual_cpay_reserves_sompi,
+            virtual_token_reserves,
+            token_out,
+            op.fee_bps,
+        ) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        if op.launch_buy_sompi != canonical_launch_buy {
+            return Some(NoopReason::InvalidAmount);
+        }
+        let real_cpay_after = match INITIAL_REAL_CPAY_RESERVES_SOMPI.checked_add(launch_buy_net) {
+            Some(value) => value,
+            None => return Some(NoopReason::SupplyOverflow),
+        };
+        let _ = token_out;
+        Self::validate_real_cpay_reserve(real_cpay_after)
+    }
+
+    fn simulate_buy_liquidity_noop_reason(
+        asset: &TokenAsset,
+        pool: &LiquidityPoolState,
+        op: &BuyLiquidityExactInOp,
+    ) -> Option<NoopReason> {
+        if pool.pool_nonce != op.expected_pool_nonce {
+            return Some(NoopReason::NonceStale);
+        }
+        let fee_trade = match calculate_trade_fee(op.cpay_in_sompi, pool.fee_bps) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        let Some(net_in) = op.cpay_in_sompi.checked_sub(fee_trade) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        let (token_out, _, _, _) =
+            match cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, net_in) {
+                Ok(state) => state,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
+        if token_out < op.min_token_out {
+            return Some(NoopReason::MinOutViolation);
+        }
+        let canonical_cpay_in = match min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            token_out,
+            pool.fee_bps,
+        ) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        if op.cpay_in_sompi != canonical_cpay_in {
+            return Some(NoopReason::InvalidAmount);
+        }
+        let Some(total_supply_after) = asset.total_supply.checked_add(token_out) else {
+            return Some(NoopReason::SupplyOverflow);
+        };
+        let _ = total_supply_after;
+        Self::validate_real_cpay_reserve(pool.real_cpay_reserves_sompi)
+    }
+
+    fn simulate_sell_liquidity_noop_reason(
+        asset: &TokenAsset,
+        pool: &LiquidityPoolState,
+        sender_balance: u128,
+        op: &SellLiquidityExactInOp,
+    ) -> Option<NoopReason> {
+        if pool.pool_nonce != op.expected_pool_nonce {
+            return Some(NoopReason::NonceStale);
+        }
+        if Self::liquidity_sell_locked(pool) {
+            return Some(NoopReason::LiquiditySellLocked);
+        }
+        if sender_balance < op.token_in {
+            return Some(NoopReason::InsufficientBalance);
+        }
+        let Some(supply_after) = asset.total_supply.checked_sub(op.token_in) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        let (gross_out, _, _, _) =
+            match cpmm_sell(pool.real_cpay_reserves_sompi, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, op.token_in)
+            {
+                Ok(state) => state,
+                Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+            };
+        let fee_trade = match calculate_trade_fee(gross_out, pool.fee_bps) {
+            Ok(value) => value,
+            Err(err) => return Some(Self::map_liquidity_math_noop_reason(err)),
+        };
+        let Some(cpay_out) = gross_out.checked_sub(fee_trade) else {
+            return Some(NoopReason::SupplyUnderflow);
+        };
+        if cpay_out == 0 {
+            return Some(NoopReason::ZeroOutput);
+        }
+        if cpay_out < op.min_cpay_out_sompi {
+            return Some(NoopReason::MinOutViolation);
+        }
+        if cpay_out < LIQUIDITY_MIN_PAYOUT_SOMPI {
+            return Some(NoopReason::InvalidAmount);
+        }
+        let _ = supply_after;
+        None
+    }
+
+    fn sanitize_token_display_text(bytes: &[u8]) -> String {
+        let decoded = String::from_utf8_lossy(bytes);
+        let mut out = String::with_capacity(decoded.len());
+
+        for ch in decoded.chars() {
+            if ch.is_control()
+                || matches!(
+                    ch,
+                    '\u{202A}' | '\u{202B}' | '\u{202C}' | '\u{202D}' | '\u{202E}' | '\u{2066}' | '\u{2067}' | '\u{2068}' | '\u{2069}'
+                )
+                || ch == '<'
+                || ch == '>'
+            {
+                out.push(' ');
+            } else {
+                out.push(ch);
+            }
+        }
+
+        out.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn owner_id_from_script(script_public_key: &ScriptPublicKey) -> Option<[u8; 32]> {
+        let script_bytes = script_public_key.script();
+        let (auth_scheme, canonical_pubkey_bytes) = match ScriptClass::from_script(script_public_key) {
+            ScriptClass::PubKey if script_bytes.len() == 34 => (OWNER_AUTH_SCHEME_PUBKEY, &script_bytes[1..33]),
+            ScriptClass::PubKeyECDSA if script_bytes.len() == 35 => (OWNER_AUTH_SCHEME_PUBKEY_ECDSA, &script_bytes[1..34]),
+            ScriptClass::ScriptHash if script_bytes.len() == 35 => (OWNER_AUTH_SCHEME_SCRIPT_HASH, &script_bytes[2..34]),
+            _ => return None,
+        };
+        let pubkey_len = u16::try_from(canonical_pubkey_bytes.len()).ok()?;
+        let mut hasher = Blake2bParams::new().hash_length(32).to_state();
+        hasher.update(CAT_OWNER_DOMAIN);
+        hasher.update(&[auth_scheme]);
+        hasher.update(&pubkey_len.to_le_bytes());
+        hasher.update(canonical_pubkey_bytes);
+        let digest = hasher.finalize();
+        let mut owner_id = [0u8; 32];
+        owner_id.copy_from_slice(digest.as_bytes());
+        Some(owner_id)
+    }
+
+    fn map_sc_bootstrap_source(source: ScBootstrapSource) -> RpcScBootstrapSource {
+        RpcScBootstrapSource {
+            snapshot_id: source.snapshot_id,
+            protocol_version: source.protocol_version as u32,
+            network_id: source.network_id,
+            node_identity: source.node_identity.as_slice().to_hex(),
+            at_block_hash: source.at_block_hash,
+            at_daa_score: source.at_daa_score,
+            state_hash_at_fp: source.state_hash_at_fp.as_slice().to_hex(),
+            window_start_block_hash: source.window_start_block_hash,
+            window_end_block_hash: source.window_end_block_hash,
+        }
+    }
+
+    fn map_sc_chunk(chunk: ScSnapshotChunk) -> GetScSnapshotChunkResponse {
+        GetScSnapshotChunkResponse {
+            snapshot_id: chunk.snapshot_id,
+            chunk_index: chunk.chunk_index,
+            total_chunks: chunk.total_chunks,
+            file_size: chunk.file_size,
+            chunk_hex: chunk.chunk_data.to_hex(),
+        }
+    }
+
+    fn map_sc_manifest_signature(signature: ScSnapshotManifestSignature) -> RpcScManifestSignature {
+        RpcScManifestSignature {
+            signer_pubkey_hex: signature.signer_pubkey.as_slice().to_hex(),
+            signature_hex: signature.signature.as_slice().to_hex(),
+        }
+    }
+
+    fn map_processed_op(op: ProcessedOp, context: RpcTokenContext) -> GetTokenOpStatusResponse {
+        GetTokenOpStatusResponse {
+            accepting_block_hash: Some(op.accepting_block_hash),
+            apply_status: Some(op.apply_status as u32),
+            noop_reason: Some(op.noop_reason as u32),
+            context,
+        }
+    }
+
+    fn map_health_response(health: AtomicTokenHealth, context: RpcTokenContext) -> GetTokenHealthResponse {
+        GetTokenHealthResponse {
+            is_degraded: health.is_degraded,
+            bootstrap_in_progress: health.bootstrap_in_progress,
+            live_correct: health.live_correct,
+            token_state: health.runtime_state.as_str().to_string(),
+            last_applied_block: health.last_applied_block,
+            last_sequence: health.last_sequence,
+            state_hash: health.current_state_hash.as_slice().to_hex(),
+            context,
+        }
+    }
+
+    fn expected_nonce_for_op(view: &AtomicTokenReadView, owner_id: [u8; 32], op: &TokenOp) -> u64 {
+        let key = nonce_key_for_op(owner_id, op);
+        view.nonces.get(&key).copied().unwrap_or(1)
+    }
+
+    fn simulate_token_noop_reason(
+        &self,
+        view: &AtomicTokenReadView,
+        owner_id: [u8; 32],
+        parsed: &cryptix_atomicindex::payload::ParsedTokenPayload,
+    ) -> Option<NoopReason> {
+        let expected_next_nonce = Self::expected_nonce_for_op(view, owner_id, &parsed.op);
+        if parsed.header.nonce != expected_next_nonce {
+            return Some(NoopReason::BadNonce);
+        }
+
+        match &parsed.op {
+            TokenOp::CreateAsset(op) => match op.supply_mode {
+                SupplyMode::Capped if op.max_supply == 0 => Some(NoopReason::BadMaxSupply),
+                SupplyMode::Uncapped if op.max_supply != 0 => Some(NoopReason::BadMaxSupply),
+                _ => None,
+            },
+            TokenOp::Transfer(op) => {
+                if !view.assets.contains_key(&op.asset_id) {
+                    return Some(NoopReason::AssetNotFound);
+                }
+                let sender_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if sender_balance < op.amount {
+                    return Some(NoopReason::InsufficientBalance);
+                }
+                let receiver_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id: op.to_owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if receiver_balance.checked_add(op.amount).is_none() {
+                    return Some(NoopReason::BalanceOverflow);
+                }
+                None
+            }
+            TokenOp::Mint(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if asset.mint_authority_owner_id != owner_id {
+                    return Some(NoopReason::UnauthorizedMint);
+                }
+                let Some(new_total_supply) = asset.total_supply.checked_add(op.amount) else {
+                    return Some(NoopReason::SupplyOverflow);
+                };
+                if matches!(asset.supply_mode, SupplyMode::Capped) && new_total_supply > asset.max_supply {
+                    return Some(NoopReason::SupplyCapExceeded);
+                }
+                let receiver_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id: op.to_owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if receiver_balance.checked_add(op.amount).is_none() {
+                    return Some(NoopReason::BalanceOverflow);
+                }
+                None
+            }
+            TokenOp::Burn(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                let sender_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                if sender_balance < op.amount {
+                    return Some(NoopReason::InsufficientBalance);
+                }
+                if asset.total_supply < op.amount {
+                    return Some(NoopReason::SupplyUnderflow);
+                }
+                None
+            }
+            TokenOp::CreateAssetWithMint(op) => Self::simulate_create_asset_with_mint_noop_reason(op),
+            TokenOp::CreateLiquidityAsset(op) => Self::simulate_create_liquidity_noop_reason(op),
+            TokenOp::BuyLiquidityExactIn(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                    return Some(NoopReason::LegacyOpForLiquidityAsset);
+                }
+                let Some(pool) = asset.liquidity.as_ref() else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                Self::simulate_buy_liquidity_noop_reason(asset, pool, op)
+            }
+            TokenOp::SellLiquidityExactIn(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                    return Some(NoopReason::LegacyOpForLiquidityAsset);
+                }
+                let Some(pool) = asset.liquidity.as_ref() else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                let sender_balance = view
+                    .balances
+                    .get(&cryptix_atomicindex::state::BalanceKey { asset_id: op.asset_id, owner_id })
+                    .copied()
+                    .unwrap_or(0);
+                Self::simulate_sell_liquidity_noop_reason(asset, pool, sender_balance, op)
+            }
+            TokenOp::ClaimLiquidityFees(op) => {
+                let Some(asset) = view.assets.get(&op.asset_id) else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                    return Some(NoopReason::LegacyOpForLiquidityAsset);
+                }
+                let Some(pool) = asset.liquidity.as_ref() else {
+                    return Some(NoopReason::AssetNotFound);
+                };
+                if pool.pool_nonce != op.expected_pool_nonce {
+                    return Some(NoopReason::NonceStale);
+                }
+                if Self::liquidity_sell_locked(pool) {
+                    return Some(NoopReason::LiquiditySellLocked);
+                }
+                let recipient_index = usize::from(op.recipient_index);
+                if recipient_index >= pool.fee_recipients.len() {
+                    return Some(NoopReason::BadLength);
+                }
+                if pool.fee_recipients[recipient_index].owner_id != owner_id {
+                    return Some(NoopReason::BadAuthInput);
+                }
+                if pool.fee_recipients[recipient_index].unclaimed_sompi < op.claim_amount_sompi {
+                    return Some(NoopReason::InsufficientBalance);
+                }
+                None
+            }
+        }
+    }
+
     fn extract_tx_query(&self, filter_transaction_pool: bool, include_orphan_pool: bool) -> RpcResult<TransactionQuery> {
         match (filter_transaction_pool, include_orphan_pool) {
             (true, true) => Ok(TransactionQuery::OrphansOnly),
@@ -312,6 +2092,10 @@ impl RpcApi for RpcCoreService {
         let block = try_block?;
         let hash = block.hash();
 
+        if let Err(reject_reason) = self.ensure_atomic_token_mining_ready("submit_block", block.header.daa_score).await? {
+            return Ok(SubmitBlockResponse { report: SubmitBlockReport::Reject(reject_reason) });
+        }
+
         if !request.allow_non_daa_blocks {
             let virtual_daa_score = session.get_virtual_daa_score();
 
@@ -331,7 +2115,7 @@ impl RpcApi for RpcCoreService {
             Err(ProtocolError::RuleError(RuleError::BadMerkleRoot(h1, h2))) => {
                 warn!(
                     "The RPC submitted block triggered a {} error: {}. 
-NOTE: This error usually indicates an RPC conversion error between the node and the miner. If you are on TN11 this is likely to reflect using a NON-SUPPORTED miner.",
+NOTE: This error usually indicates an RPC conversion error between the node and the miner or a mismatched miner implementation.",
                     stringify!(RuleError::BadMerkleRoot),
                     RuleError::BadMerkleRoot(h1, h2)
                 );
@@ -366,11 +2150,50 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(cryptix_addresses::AddressError::InvalidPrefix(request.pay_address.prefix.to_string()))?;
         }
 
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let virtual_daa_score = session.get_virtual_daa_score();
+        let is_nearly_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        if virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
+            && !is_nearly_synced
+            && !self.config.enable_unsynced_mining
+        {
+            if self.should_log_get_block_template_unsynced() {
+                warn!(
+                    "Rejecting get_block_template while node is not nearly synced after payload HF: virtual_daa_score={}, activation_daa={}, enable_unsynced_mining={}; mining from a partial Atomic/UTXO view can create blocks with invalid state commitments (warning throttled to once per 60s)",
+                    virtual_daa_score,
+                    self.config.params.payload_hf_activation_daa_score,
+                    self.config.enable_unsynced_mining
+                );
+            }
+            return Err(RpcError::General(
+                "mining template unavailable: node is not nearly synced after payload hardfork; wait for sync/Atomic catch-up before mining"
+                    .to_string(),
+            ));
+        }
+        if virtual_daa_score >= self.config.params.payload_hf_activation_daa_score
+            && !is_nearly_synced
+            && self.config.enable_unsynced_mining
+        {
+            if self.should_log_get_block_template_unsynced() {
+                warn!(
+                    "Allowing get_block_template while node is not nearly synced after payload HF because enable_unsynced_mining is set: virtual_daa_score={}, activation_daa={}; this is testing-oriented and can create blocks from a partial Atomic/UTXO view (warning throttled to once per 60s)",
+                    virtual_daa_score,
+                    self.config.params.payload_hf_activation_daa_score
+                );
+            }
+        }
+
+        if let Err(_) = self.ensure_atomic_token_mining_ready("get_block_template", virtual_daa_score).await? {
+            return Err(RpcError::General(
+                "mining template unavailable: Atomic token index is not ready after payload hardfork; wait for Atomic catch-up before mining"
+                    .to_string(),
+            ));
+        }
+
         // Build block template
         let script_public_key = cryptix_txscript::pay_to_address_script(&request.pay_address);
         let extra_data = version().as_bytes().iter().chain(once(&(b'/'))).chain(&request.extra_data).cloned().collect::<Vec<_>>();
         let miner_data: MinerData = MinerData::new(script_public_key, extra_data);
-        let session = self.consensus_manager.consensus().unguarded_session();
         let block_template = self.mining_manager.clone().get_block_template(&session, miner_data).await?;
 
         // Check coinbase tx payload length
@@ -378,11 +2201,10 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::CoinbasePayloadLengthAboveMax(self.config.max_coinbase_payload_len));
         }
 
-        let is_nearly_synced =
-            self.config.is_nearly_synced(block_template.selected_parent_timestamp, block_template.selected_parent_daa_score);
         Ok(GetBlockTemplateResponse {
             block: block_template.block.into(),
-            is_synced: self.has_sufficient_peer_connectivity() && is_nearly_synced,
+            is_synced: is_nearly_synced
+                && self.config.is_nearly_synced(block_template.selected_parent_timestamp, block_template.selected_parent_daa_score),
         })
     }
 
@@ -401,14 +2223,153 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
     async fn get_block_call(&self, _connection: Option<&DynRpcConnection>, request: GetBlockRequest) -> RpcResult<GetBlockResponse> {
         // TODO: test
+        let cache_now_ms = unix_now();
+        if let Some(mut rpc_block) = self.block_scan_cache.get_block(request.hash, request.include_transactions, cache_now_ms) {
+            self.annotate_block_fast_paths(&mut rpc_block);
+            return Ok(GetBlockResponse { block: rpc_block });
+        }
+
         let session = self.consensus_manager.consensus().session().await;
         let block = session.async_get_block_even_if_header_only(request.hash).await?;
-        Ok(GetBlockResponse {
-            block: self
-                .consensus_converter
-                .get_block(&session, &block, request.include_transactions, request.include_transactions)
-                .await?,
-        })
+        let rpc_block =
+            self.consensus_converter.get_block(&session, &block, request.include_transactions, request.include_transactions).await?;
+        if self.block_scan_cache.is_serving() {
+            self.block_scan_cache.insert_block(rpc_block.clone(), request.include_transactions, unix_now());
+        }
+        let mut rpc_block = rpc_block;
+        self.annotate_block_fast_paths(&mut rpc_block);
+        Ok(GetBlockResponse { block: rpc_block })
+    }
+
+    async fn submit_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: SubmitFastIntentRequest,
+    ) -> RpcResult<SubmitFastIntentResponse> {
+        let mut request = request;
+        let now_ms = unix_now();
+        let configured_drift_ms = self.hfa_engine.config().clock_drift_max_ms;
+        let drift_ms = now_ms.abs_diff(request.client_created_at_ms);
+        if drift_ms > configured_drift_ms {
+            warn!(
+                "Fastchain RPC clock drift correction: client_created_at_ms={} node_now_ms={} drift={}ms > {}ms, rewriting timestamp to node time",
+                request.client_created_at_ms, now_ms, drift_ms, configured_drift_ms
+            );
+            request.client_created_at_ms = now_ms;
+        }
+        let request_for_p2p = request.clone();
+
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let is_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+        let cpu_ratio = (self.perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+        let mut response = self
+            .hfa_engine
+            .submit_fast_intent(
+                &self.config.net.to_string(),
+                request,
+                session.clone(),
+                self.mining_manager.clone(),
+                is_synced,
+                cpu_ratio,
+                basechain_block_latency_ms,
+                FastIngressSource::Rpc,
+            )
+            .await;
+
+        let base_tx_for_normal: Transaction = match request_for_p2p.base_tx.clone().try_into() {
+            Ok(tx) => tx,
+            Err(_) => {
+                self.flow_context.broadcast_outbound_fast_microblocks().await;
+                if matches!(response.status, RpcFastIntentStatus::Rejected) && response.reason.as_deref() == Some("invalid_base_tx") {
+                    return Ok(response);
+                }
+                return Err(RpcError::General("submit_fast_intent received an invalid base transaction".to_string()));
+            }
+        };
+        let tx_id = base_tx_for_normal.id();
+
+        let normal_submit_result =
+            self.flow_context.submit_rpc_transaction(&session, base_tx_for_normal.clone(), Orphan::Forbidden).await;
+        if let Err(err) = normal_submit_result {
+            let tx_already_known = self.mining_manager.clone().has_transaction(tx_id, TransactionQuery::All).await
+                || self.mining_manager.clone().has_accepted_transaction(tx_id).await;
+            if !tx_already_known {
+                if let Some(cancel_token) = response.cancel_token.clone() {
+                    let _ = self.hfa_engine.cancel_fast_intent(CancelFastIntentRequest {
+                        intent_id: response.intent_id,
+                        cancel_token,
+                        node_epoch: response.node_epoch,
+                    });
+                }
+                return Err(RpcError::RejectedTransaction(tx_id, err.to_string()));
+            }
+        }
+        response.basechain_submitted = true;
+        if matches!(response.status, RpcFastIntentStatus::Locked | RpcFastIntentStatus::FastConfirmed) && response.reason.is_none() {
+            self.hfa_engine.mark_fast_tx_route(tx_id);
+        }
+
+        let should_broadcast_fast_intent = response.reason.is_none()
+            && matches!(response.status, RpcFastIntentStatus::Locked | RpcFastIntentStatus::FastConfirmed)
+            && self.hfa_engine.should_broadcast_intent_once(response.intent_id);
+
+        if should_broadcast_fast_intent {
+            self.processing_counters.fast_txs_counts.fetch_add(1, Ordering::Relaxed);
+            info!(
+                "Fastchain send accepted: intent {} tx {} status={:?} basechain_submitted=true",
+                response.intent_id, tx_id, response.status
+            );
+            self.flow_context
+                .broadcast_fast_intent(&FastIntentP2pData {
+                    intent_id: response.intent_id,
+                    base_tx: base_tx_for_normal,
+                    intent_nonce: request_for_p2p.intent_nonce,
+                    client_created_at_ms: request_for_p2p.client_created_at_ms,
+                    max_fee: request_for_p2p.max_fee,
+                })
+                .await;
+        } else {
+            info!(
+                "Fastchain send not activated: intent {} tx {} status={:?} reason={:?} basechain_submitted={}",
+                response.intent_id, tx_id, response.status, response.reason, response.basechain_submitted
+            );
+        }
+        self.flow_context.broadcast_outbound_fast_microblocks().await;
+        Ok(response)
+    }
+
+    async fn get_fast_intent_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetFastIntentStatusRequest,
+    ) -> RpcResult<GetFastIntentStatusResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let is_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+        let cpu_ratio = (self.perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+        self.hfa_engine.revalidate_active_budgeted(session, is_synced, cpu_ratio, basechain_block_latency_ms).await;
+        let response = self.hfa_engine.get_fast_intent_status(request);
+        self.flow_context.broadcast_outbound_fast_microblocks().await;
+        Ok(response)
+    }
+
+    async fn cancel_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: CancelFastIntentRequest,
+    ) -> RpcResult<CancelFastIntentResponse> {
+        let session = self.consensus_manager.consensus().unguarded_session();
+        let is_synced = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
+        let sink_timestamp_ms = session.async_get_sink_timestamp().await;
+        let basechain_block_latency_ms = unix_now().saturating_sub(sink_timestamp_ms) as f64;
+        let cpu_ratio = (self.perf_monitor.snapshot().cpu_usage as f64 / 100.0).clamp(0.0, 1.0);
+        self.hfa_engine.revalidate_active_budgeted(session, is_synced, cpu_ratio, basechain_block_latency_ms).await;
+        let response = self.hfa_engine.cancel_fast_intent(request);
+        self.flow_context.broadcast_outbound_fast_microblocks().await;
+        Ok(response)
     }
 
     async fn get_blocks_call(
@@ -450,11 +2411,21 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let blocks = if request.include_blocks {
             let mut blocks = Vec::with_capacity(block_hashes.len());
             for hash in block_hashes.iter().copied() {
-                let block = session.async_get_block_even_if_header_only(hash).await?;
-                let rpc_block = self
-                    .consensus_converter
-                    .get_block(&session, &block, request.include_transactions, request.include_transactions)
-                    .await?;
+                let mut rpc_block =
+                    if let Some(rpc_block) = self.block_scan_cache.get_block(hash, request.include_transactions, unix_now()) {
+                        rpc_block
+                    } else {
+                        let block = session.async_get_block_even_if_header_only(hash).await?;
+                        let rpc_block = self
+                            .consensus_converter
+                            .get_block(&session, &block, request.include_transactions, request.include_transactions)
+                            .await?;
+                        if self.block_scan_cache.is_serving() {
+                            self.block_scan_cache.insert_block(rpc_block.clone(), request.include_transactions, unix_now());
+                        }
+                        rpc_block
+                    };
+                self.annotate_block_fast_paths(&mut rpc_block);
                 blocks.push(rpc_block)
             }
             blocks
@@ -462,6 +2433,178 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             Vec::new()
         };
         Ok(GetBlocksResponse { block_hashes, blocks })
+    }
+
+    async fn get_transactions_by_ids_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTransactionsByIdsRequest,
+    ) -> RpcResult<GetTransactionsByIdsResponse> {
+        if request.entries.len() > TX_LOOKUP_MAX_IDS {
+            return Err(RpcError::General(format!(
+                "getTransactionsByIds accepts at most {TX_LOOKUP_MAX_IDS} transaction ids per request"
+            )));
+        }
+
+        if request.entries.is_empty() {
+            return Ok(GetTransactionsByIdsResponse { entries: vec![] });
+        }
+
+        let session = self.consensus_manager.consensus().session().await;
+        let mut found = HashMap::<TransactionId, RpcTransactionLookupResult>::new();
+
+        for entry in request.entries.iter() {
+            if found.contains_key(&entry.transaction_id) {
+                continue;
+            }
+            let query = self.extract_tx_query(request.filter_transaction_pool, request.include_orphan_pool)?;
+            if let Some(transaction) = self.mining_manager.clone().get_transaction(entry.transaction_id, query).await {
+                let rpc_transaction = self.consensus_converter.get_mempool_entry(&session, &transaction).transaction;
+                found.insert(
+                    entry.transaction_id,
+                    RpcTransactionLookupResult {
+                        transaction_id: entry.transaction_id,
+                        transaction: Some(rpc_transaction),
+                        block_hash: None,
+                        block_daa_score: None,
+                        source: "mempool".to_string(),
+                    },
+                );
+            }
+        }
+
+        let pending_by_id = request
+            .entries
+            .iter()
+            .filter(|entry| !found.contains_key(&entry.transaction_id))
+            .filter_map(|entry| entry.block_daa_score.map(|daa_score| (entry.transaction_id, daa_score)))
+            .collect::<HashMap<_, _>>();
+
+        if !pending_by_id.is_empty() {
+            let target_ids = pending_by_id.keys().copied().collect::<HashSet<_>>();
+            let target_scores = pending_by_id.values().copied().collect::<HashSet<_>>();
+            let target_scores_vec = target_scores.iter().copied().collect::<Vec<_>>();
+            let min_target_score = target_scores_vec.iter().copied().min().unwrap_or_default();
+
+            let stats = session.async_get_stats().await;
+            let max_header_window =
+                if self.config.is_archival { TX_LOOKUP_ARCHIVAL_LOOKBACK_MAX_HEADERS } else { self.config.pruning_depth }
+                    .max(TX_LOOKUP_LOOKBACK_MIN_HEADERS as u64);
+            let header_limit = stats
+                .virtual_stats
+                .daa_score
+                .saturating_sub(min_target_score)
+                .saturating_add(TX_LOOKUP_LOOKBACK_MARGIN_DAA)
+                .clamp(TX_LOOKUP_LOOKBACK_MIN_HEADERS as u64, max_header_window) as usize;
+
+            let mut exact_candidates = Vec::new();
+            let mut near_candidates = Vec::new();
+            let mut current = session.async_get_sink().await;
+            for _ in 0..header_limit {
+                let Ok(header) = session.async_get_header(current).await else {
+                    break;
+                };
+                let daa_score = header.daa_score;
+                if target_scores.contains(&daa_score) {
+                    exact_candidates.push(current);
+                } else if target_scores_vec.iter().any(|target| daa_score.abs_diff(*target) <= TX_LOOKUP_DAA_WINDOW) {
+                    near_candidates.push(current);
+                }
+
+                if daa_score < min_target_score.saturating_sub(TX_LOOKUP_DAA_WINDOW) {
+                    break;
+                }
+
+                let Ok(ghostdag) = session.async_get_ghostdag_data(current).await else {
+                    break;
+                };
+                if ghostdag.selected_parent.is_origin() {
+                    break;
+                }
+                current = ghostdag.selected_parent;
+            }
+
+            let mut pending_blocks = exact_candidates
+                .into_iter()
+                .chain(near_candidates.into_iter())
+                .take(TX_LOOKUP_MAX_CANDIDATE_BLOCKS)
+                .collect::<Vec<_>>();
+            pending_blocks.reverse();
+            let mut visited_blocks = HashSet::new();
+            let mut missing_ids = target_ids;
+            let mut scanned_blocks = 0usize;
+
+            while let Some(block_hash) = pending_blocks.pop() {
+                if scanned_blocks >= TX_LOOKUP_MAX_SCANNED_BLOCKS || missing_ids.is_empty() {
+                    break;
+                }
+                if !visited_blocks.insert(block_hash) {
+                    continue;
+                }
+
+                let Ok(block) = session.async_get_block_even_if_header_only(block_hash).await else {
+                    continue;
+                };
+                scanned_blocks = scanned_blocks.saturating_add(1);
+                let block_daa_score = block.header.daa_score;
+
+                for transaction in block.transactions.iter() {
+                    let transaction_id = transaction.id();
+                    if !missing_ids.contains(&transaction_id) {
+                        continue;
+                    }
+
+                    let rpc_transaction =
+                        self.consensus_converter.get_transaction(&session, transaction, Some(block.header.as_ref()), true);
+                    found.insert(
+                        transaction_id,
+                        RpcTransactionLookupResult {
+                            transaction_id,
+                            transaction: Some(rpc_transaction),
+                            block_hash: Some(block_hash),
+                            block_daa_score: Some(block_daa_score),
+                            source: "chain".to_string(),
+                        },
+                    );
+                    missing_ids.remove(&transaction_id);
+                    if missing_ids.is_empty() {
+                        break;
+                    }
+                }
+
+                if scanned_blocks >= TX_LOOKUP_MAX_SCANNED_BLOCKS || missing_ids.is_empty() {
+                    break;
+                }
+
+                if let Ok(ghostdag) = session.async_get_ghostdag_data(block_hash).await {
+                    for merged_hash in ghostdag.mergeset_blues.into_iter().chain(ghostdag.mergeset_reds.into_iter()) {
+                        if visited_blocks.contains(&merged_hash) {
+                            continue;
+                        }
+                        if pending_blocks.len().saturating_add(scanned_blocks) >= TX_LOOKUP_MAX_SCANNED_BLOCKS {
+                            break;
+                        }
+                        pending_blocks.push(merged_hash);
+                    }
+                }
+            }
+        }
+
+        let entries = request
+            .entries
+            .into_iter()
+            .map(|entry| {
+                found.get(&entry.transaction_id).cloned().unwrap_or(RpcTransactionLookupResult {
+                    transaction_id: entry.transaction_id,
+                    transaction: None,
+                    block_hash: None,
+                    block_daa_score: entry.block_daa_score,
+                    source: "missing".to_string(),
+                })
+            })
+            .collect();
+
+        Ok(GetTransactionsByIdsResponse { entries })
     }
 
     async fn get_info_call(&self, _connection: Option<&DynRpcConnection>, _request: GetInfoRequest) -> RpcResult<GetInfoResponse> {
@@ -487,7 +2630,9 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             return Err(RpcError::TransactionNotFound(request.transaction_id));
         };
         let session = self.consensus_manager.consensus().unguarded_session();
-        Ok(GetMempoolEntryResponse::new(self.consensus_converter.get_mempool_entry(&session, &transaction)))
+        let mut entry = self.consensus_converter.get_mempool_entry(&session, &transaction);
+        self.annotate_mempool_entry_fast_path(&mut entry);
+        Ok(GetMempoolEntryResponse::new(entry))
     }
 
     async fn get_mempool_entries_call(
@@ -498,11 +2643,14 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let query = self.extract_tx_query(request.filter_transaction_pool, request.include_orphan_pool)?;
         let session = self.consensus_manager.consensus().unguarded_session();
         let (transactions, orphans) = self.mining_manager.clone().get_all_transactions(query).await;
-        let mempool_entries = transactions
+        let mut mempool_entries = transactions
             .iter()
             .chain(orphans.iter())
             .map(|transaction| self.consensus_converter.get_mempool_entry(&session, transaction))
-            .collect();
+            .collect::<Vec<_>>();
+        for entry in &mut mempool_entries {
+            self.annotate_mempool_entry_fast_path(entry);
+        }
         Ok(GetMempoolEntriesResponse::new(mempool_entries))
     }
 
@@ -515,7 +2663,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let session = self.consensus_manager.consensus().unguarded_session();
         let script_public_keys = request.addresses.iter().map(pay_to_address_script).collect();
         let grouped_txs = self.mining_manager.clone().get_transactions_by_addresses(script_public_keys, query).await;
-        let mempool_entries = grouped_txs
+        let mut mempool_entries = grouped_txs
             .owners
             .iter()
             .map(|(script_public_key, owner_transactions)| {
@@ -528,7 +2676,15 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
                     &grouped_txs.transactions,
                 )
             })
-            .collect();
+            .collect::<Vec<_>>();
+        for owner_entry in &mut mempool_entries {
+            for tx in &mut owner_entry.sending {
+                self.annotate_mempool_entry_fast_path(tx);
+            }
+            for tx in &mut owner_entry.receiving {
+                self.annotate_mempool_entry_fast_path(tx);
+            }
+        }
         Ok(GetMempoolEntriesByAddressesResponse::new(mempool_entries))
     }
 
@@ -537,23 +2693,32 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         _connection: Option<&DynRpcConnection>,
         request: SubmitTransactionRequest,
     ) -> RpcResult<SubmitTransactionResponse> {
-        let allow_orphan = self.config.unsafe_rpc && request.allow_orphan;
-        if !self.config.unsafe_rpc && request.allow_orphan {
+        let requested_allow_orphan = request.allow_orphan;
+        let allow_orphan = self.config.unsafe_rpc && requested_allow_orphan;
+        if !self.config.unsafe_rpc && requested_allow_orphan {
             debug!("SubmitTransaction RPC command called with AllowOrphan enabled while node in safe RPC mode -- switching to ForbidOrphan.");
         }
 
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
         let session = self.consensus_manager.consensus().unguarded_session();
+        if self.hfa_engine.has_fast_lock_conflict_for_tx(&transaction) {
+            let err = RpcError::RejectedTransaction(transaction_id, NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT.to_string());
+            debug!("{err}");
+            return Err(err);
+        }
         let orphan = match allow_orphan {
             true => Orphan::Allowed,
             false => Orphan::Forbidden,
         };
-        self.flow_context.submit_rpc_transaction(&session, transaction, orphan).await.map_err(|err| {
-            let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
+        if let Err(err) = self.flow_context.submit_rpc_transaction(&session, transaction.clone(), orphan).await {
+            let error_message = err.to_string();
+            self.log_submit_transaction_orphan_rejection(&transaction, requested_allow_orphan, allow_orphan, error_message.as_str())
+                .await;
+            let err = RpcError::RejectedTransaction(transaction_id, error_message);
             debug!("{err}");
-            err
-        })?;
+            return Err(err);
+        }
         Ok(SubmitTransactionResponse::new(transaction_id))
     }
 
@@ -565,6 +2730,11 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let transaction: Transaction = request.transaction.try_into()?;
         let transaction_id = transaction.id();
         let session = self.consensus_manager.consensus().unguarded_session();
+        if self.hfa_engine.has_fast_lock_conflict_for_tx(&transaction) {
+            let err = RpcError::RejectedTransaction(transaction_id, NORMAL_POLICY_REJECT_FAST_LOCK_CONFLICT.to_string());
+            debug!("{err}");
+            return Err(err);
+        }
         let replaced_transaction =
             self.flow_context.submit_rpc_transaction_replacement(&session, transaction).await.map_err(|err| {
                 let err = RpcError::RejectedTransaction(transaction_id, err.to_string());
@@ -780,13 +2950,22 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             let consensus_manager = self.consensus_manager.clone();
             let prefix = self.config.prefix();
 
-            let response = self
+            let mut response = self
                 .fee_estimate_verbose_cache
                 .get(async move {
                     let session = consensus_manager.consensus().unguarded_session();
                     mining_manager.get_realtime_feerate_estimations_verbose(&session, prefix).await.map(FeeEstimateVerbose::into_rpc)
                 })
                 .await?;
+
+            if let Some(verbose) = response.verbose.as_mut() {
+                let minimum_relay_feerate = self.mining_manager.clone().minimum_relay_feerate().await.max(0.0);
+                let payload_overcap_feerate_floor = self.mining_manager.clone().payload_overcap_feerate_floor().await.max(0.0);
+                let effective_hfa_feerate_floor = self.hfa_engine.effective_feerate_floor(minimum_relay_feerate);
+                verbose.minimum_relay_feerate = Some(minimum_relay_feerate);
+                verbose.payload_overcap_feerate_floor = Some(payload_overcap_feerate_floor);
+                verbose.effective_hfa_feerate_floor = Some(effective_hfa_feerate_floor);
+            }
             Ok(response)
         } else {
             let estimate = self.get_fee_estimate_call(connection, GetFeeEstimateRequest {}).await?.estimate;
@@ -801,9 +2980,62 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
     async fn get_headers_call(
         &self,
         _connection: Option<&DynRpcConnection>,
-        _request: GetHeadersRequest,
+        request: GetHeadersRequest,
     ) -> RpcResult<GetHeadersResponse> {
-        Err(RpcError::NotImplemented)
+        if request.limit == 0 {
+            return Ok(GetHeadersResponse { headers: vec![] });
+        }
+
+        let session = self.consensus_manager.consensus().session().await;
+        let limit = request.limit as usize;
+        let mut header_hashes = Vec::with_capacity(limit);
+
+        if request.is_ascending {
+            header_hashes.push(request.start_hash);
+
+            if limit > 1 {
+                let chain_path = session.async_get_virtual_chain_from_block(request.start_hash, Some(limit.saturating_sub(1))).await?;
+                header_hashes.extend(chain_path.added);
+            }
+        } else {
+            let mut current = request.start_hash;
+            for _ in 0..limit {
+                header_hashes.push(current);
+
+                if let Some(selected_parent) = self.block_scan_cache.get_selected_parent(current, unix_now()) {
+                    if selected_parent.is_origin() {
+                        break;
+                    }
+                    current = selected_parent;
+                    continue;
+                }
+
+                let ghostdag = session.async_get_ghostdag_data(current).await?;
+                if let Some(header) = self.block_scan_cache.get_header(current, unix_now()) {
+                    self.block_scan_cache.insert_selected_parent(current, ghostdag.selected_parent, header.timestamp, unix_now());
+                }
+                if ghostdag.selected_parent.is_origin() {
+                    break;
+                }
+                current = ghostdag.selected_parent;
+            }
+        }
+
+        let mut headers = Vec::with_capacity(header_hashes.len());
+        for hash in header_hashes.into_iter() {
+            if let Some(header) = self.block_scan_cache.get_header(hash, unix_now()) {
+                headers.push(header);
+            } else {
+                let header = session.async_get_header(hash).await?;
+                let rpc_header: RpcHeader = (&*header).into();
+                if self.block_scan_cache.is_serving() {
+                    self.block_scan_cache.insert_header(rpc_header.clone(), unix_now());
+                }
+                headers.push(rpc_header);
+            }
+        }
+
+        Ok(GetHeadersResponse { headers })
     }
 
     async fn get_block_dag_info_call(
@@ -1051,7 +3283,186 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
         let storage_metrics = req.storage_metrics.then_some(StorageMetrics { storage_size_bytes: 0 });
 
-        let custom_metrics: Option<HashMap<String, CustomMetricValue>> = None;
+        let minimum_relay_feerate =
+            if req.custom_metrics { Some(self.mining_manager.clone().minimum_relay_feerate().await.max(0.0)) } else { None };
+        let diagnostics_metrics = req.custom_metrics && self.config.rpc_diagnostics;
+        let block_scan_cache_stats = req.custom_metrics.then(|| self.block_scan_cache.stats());
+        let mempool_metrics = if diagnostics_metrics { Some(self.mining_manager.snapshot()) } else { None };
+        let atomic_health = if diagnostics_metrics { Some(self.atomic_token_service.get_local_health().await) } else { None };
+        let atomic_footprint = if diagnostics_metrics { Some(self.atomic_token_service.get_state_footprint().await) } else { None };
+        let atomic_state_store_bytes =
+            if diagnostics_metrics { self.atomic_token_service.approximate_state_store_size_bytes() } else { None };
+
+        let custom_metrics: Option<HashMap<String, CustomMetricValue>> = req.custom_metrics.then(|| {
+            let hfa = self.hfa_engine.metrics_snapshot();
+            let minimum_relay_feerate = minimum_relay_feerate.unwrap_or(0.0);
+            let configured_hfa_feerate_floor = self.hfa_engine.config().min_feerate_floor.max(0.0);
+            let effective_hfa_feerate_floor = self.hfa_engine.effective_feerate_floor(minimum_relay_feerate);
+            let mut out = HashMap::new();
+            if let Some(stats) = block_scan_cache_stats {
+                out.insert("rpc_block_scan_cache_enabled".to_string(), CustomMetricValue::Bool(self.block_scan_cache.enabled()));
+                out.insert("rpc_block_scan_cache_serving".to_string(), CustomMetricValue::Bool(stats.serving));
+                out.insert("rpc_block_scan_cache_headers".to_string(), CustomMetricValue::U64(stats.headers as u64));
+                out.insert("rpc_block_scan_cache_blocks".to_string(), CustomMetricValue::U64(stats.blocks as u64));
+                out.insert(
+                    "rpc_block_scan_cache_parent_links".to_string(),
+                    CustomMetricValue::U64(stats.selected_parent_links as u64),
+                );
+                out.insert("rpc_block_scan_cache_bytes".to_string(), CustomMetricValue::U64(stats.current_bytes));
+                out.insert("rpc_block_scan_cache_max_bytes".to_string(), CustomMetricValue::U64(stats.max_bytes));
+                out.insert("rpc_block_scan_cache_days".to_string(), CustomMetricValue::F64(self.block_scan_cache.days()));
+            }
+            if let (Some(mempool), Some(atomic_health), Some(atomic_footprint)) = (mempool_metrics, atomic_health, atomic_footprint) {
+                out.insert(
+                    "rpc_borsh_live_connections".to_string(),
+                    CustomMetricValue::U64(self.wrpc_borsh_counters.active_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert(
+                    "rpc_json_live_connections".to_string(),
+                    CustomMetricValue::U64(self.wrpc_json_counters.active_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert(
+                    "rpc_borsh_connection_attempts".to_string(),
+                    CustomMetricValue::U64(self.wrpc_borsh_counters.total_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert(
+                    "rpc_json_connection_attempts".to_string(),
+                    CustomMetricValue::U64(self.wrpc_json_counters.total_connections.load(Ordering::Relaxed) as u64),
+                );
+                out.insert("mempool_ready_txs".to_string(), CustomMetricValue::U64(mempool.ready_txs_sample));
+                out.insert("mempool_txs".to_string(), CustomMetricValue::U64(mempool.txs_sample));
+                out.insert("mempool_orphans".to_string(), CustomMetricValue::U64(mempool.orphans_sample));
+                out.insert("mempool_accepted_cache".to_string(), CustomMetricValue::U64(mempool.accepted_sample));
+                out.insert(
+                    "mempool_high_priority_submitted_total".to_string(),
+                    CustomMetricValue::U64(mempool.high_priority_tx_counts),
+                );
+                out.insert("mempool_low_priority_submitted_total".to_string(), CustomMetricValue::U64(mempool.low_priority_tx_counts));
+                out.insert("mempool_accepted_total".to_string(), CustomMetricValue::U64(mempool.tx_accepted_counts));
+                out.insert("mempool_evicted_total".to_string(), CustomMetricValue::U64(mempool.tx_evicted_counts));
+                out.insert(
+                    "atomic_runtime_state".to_string(),
+                    CustomMetricValue::Text(atomic_health.runtime_state.as_str().to_string()),
+                );
+                out.insert("atomic_degraded".to_string(), CustomMetricValue::Bool(atomic_health.is_degraded));
+                out.insert("atomic_bootstrap_in_progress".to_string(), CustomMetricValue::Bool(atomic_health.bootstrap_in_progress));
+                out.insert("atomic_live_correct".to_string(), CustomMetricValue::Bool(atomic_health.live_correct));
+                out.insert("atomic_last_sequence".to_string(), CustomMetricValue::U64(atomic_health.last_sequence));
+                out.insert(
+                    "atomic_has_last_applied_block".to_string(),
+                    CustomMetricValue::Bool(atomic_health.last_applied_block.is_some()),
+                );
+                out.insert(
+                    "atomic_state_hash".to_string(),
+                    CustomMetricValue::Text(atomic_health.current_state_hash.as_slice().to_hex()),
+                );
+                out.insert("atomic_assets".to_string(), CustomMetricValue::U64(atomic_footprint.assets as u64));
+                out.insert("atomic_balances".to_string(), CustomMetricValue::U64(atomic_footprint.balances as u64));
+                out.insert("atomic_nonces".to_string(), CustomMetricValue::U64(atomic_footprint.nonces as u64));
+                out.insert("atomic_anchor_counts".to_string(), CustomMetricValue::U64(atomic_footprint.anchor_counts as u64));
+                out.insert("atomic_processed_ops".to_string(), CustomMetricValue::U64(atomic_footprint.processed_ops as u64));
+                out.insert("atomic_retained_blocks".to_string(), CustomMetricValue::U64(atomic_footprint.retained_blocks as u64));
+                out.insert("atomic_events".to_string(), CustomMetricValue::U64(atomic_footprint.events as u64));
+                out.insert("atomic_block_journals".to_string(), CustomMetricValue::U64(atomic_footprint.block_journals as u64));
+                out.insert(
+                    "atomic_state_hash_checkpoints".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.state_hash_checkpoints as u64),
+                );
+                out.insert(
+                    "atomic_event_sequence_checkpoints".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.event_sequence_checkpoints as u64),
+                );
+                out.insert(
+                    "atomic_liquidity_vault_outpoints".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.liquidity_vault_outpoints as u64),
+                );
+                out.insert(
+                    "atomic_known_owner_addresses".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.known_owner_addresses as u64),
+                );
+                out.insert(
+                    "atomic_owners_with_balances".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.owners_with_balances as u64),
+                );
+                out.insert(
+                    "atomic_assets_with_holders".to_string(),
+                    CustomMetricValue::U64(atomic_footprint.assets_with_holders as u64),
+                );
+                if let Some(state_store_bytes) = atomic_state_store_bytes {
+                    out.insert("atomic_state_store_bytes".to_string(), CustomMetricValue::U64(state_store_bytes));
+                }
+            }
+            out.insert("hfa_enabled".to_string(), CustomMetricValue::Bool(hfa.enabled));
+            out.insert("hfa_node_epoch".to_string(), CustomMetricValue::U64(hfa.node_epoch));
+            out.insert("hfa_mode".to_string(), CustomMetricValue::Text(hfa.mode.to_string()));
+            let fast_recent_route_ids =
+                self.hfa_engine.recent_fast_tx_route_ids(128).into_iter().map(|tx_id| tx_id.to_string()).collect::<Vec<_>>();
+            out.insert("fast_recent_tx_ids".to_string(), CustomMetricValue::Text(fast_recent_route_ids.join(",")));
+            out.insert("hfa_minimum_relay_feerate".to_string(), CustomMetricValue::F64(minimum_relay_feerate));
+            out.insert("hfa_min_feerate_floor_config".to_string(), CustomMetricValue::F64(configured_hfa_feerate_floor));
+            out.insert("hfa_effective_feerate_floor".to_string(), CustomMetricValue::F64(effective_hfa_feerate_floor));
+            out.insert("fast_minimum_relay_feerate".to_string(), CustomMetricValue::F64(minimum_relay_feerate));
+            out.insert("fast_effective_feerate_floor".to_string(), CustomMetricValue::F64(effective_hfa_feerate_floor));
+            out.insert("hfa_paused_for_ms".to_string(), CustomMetricValue::U64(hfa.paused_for_ms));
+            out.insert("fast_active_locks".to_string(), CustomMetricValue::U64(hfa.active_locks as u64));
+            out.insert("fast_pending_intents".to_string(), CustomMetricValue::U64(hfa.pending_intents as u64));
+            out.insert("fast_prelock_intents".to_string(), CustomMetricValue::U64(hfa.prelock_intents as u64));
+            out.insert("fast_active_intents".to_string(), CustomMetricValue::U64(hfa.active_intents as u64));
+            out.insert("fast_submit_total".to_string(), CustomMetricValue::U64(hfa.submit_total));
+            out.insert("fast_submit_total_rpc".to_string(), CustomMetricValue::U64(hfa.submit_rpc_total));
+            out.insert("fast_submit_total_p2p".to_string(), CustomMetricValue::U64(hfa.submit_p2p_total));
+            out.insert("fast_reject_total".to_string(), CustomMetricValue::U64(hfa.rejected_total));
+            out.insert("fast_overload_reject_total".to_string(), CustomMetricValue::U64(hfa.overload_reject_total));
+            out.insert("fast_normal_conflict_reject_total".to_string(), CustomMetricValue::U64(hfa.normal_conflict_reject_total));
+            out.insert("fast_drop_total".to_string(), CustomMetricValue::U64(hfa.dropped_total));
+            out.insert("fast_expired_total".to_string(), CustomMetricValue::U64(hfa.expired_total));
+            out.insert("fast_terminal_entries".to_string(), CustomMetricValue::U64(hfa.terminal_entries as u64));
+            out.insert("fast_terminal_bytes".to_string(), CustomMetricValue::U64(hfa.terminal_bytes as u64));
+            out.insert(
+                "fast_terminal_evictions_total_retention".to_string(),
+                CustomMetricValue::U64(hfa.terminal_evictions_retention_total),
+            );
+            out.insert(
+                "fast_terminal_evictions_total_expired".to_string(),
+                CustomMetricValue::U64(hfa.terminal_evictions_expired_total),
+            );
+            out.insert(
+                "fast_terminal_evictions_total_oldest".to_string(),
+                CustomMetricValue::U64(hfa.terminal_evictions_oldest_total),
+            );
+            out.insert("fast_arbiter_queue_len".to_string(), CustomMetricValue::U64(hfa.fast_arbiter_queue_len as u64));
+            out.insert("fast_arbiter_queue_ratio".to_string(), CustomMetricValue::F64(hfa.fast_arbiter_queue_ratio));
+            out.insert("fast_arbiter_wait_ms".to_string(), CustomMetricValue::F64(hfa.fast_arbiter_wait_ms));
+            out.insert("fast_arbiter_hold_ms".to_string(), CustomMetricValue::F64(hfa.fast_arbiter_hold_ms));
+            out.insert("fast_validation_queue_ratio".to_string(), CustomMetricValue::F64(hfa.fast_validation_queue_ratio));
+            out.insert("fast_worker_cpu_ratio".to_string(), CustomMetricValue::F64(hfa.fast_worker_cpu_ratio));
+            out.insert("basechain_block_latency_ms".to_string(), CustomMetricValue::F64(hfa.basechain_block_latency_ms));
+            out.insert(
+                "basechain_latency_delta_vs_baseline_ms".to_string(),
+                CustomMetricValue::F64(hfa.basechain_latency_delta_vs_baseline_ms),
+            );
+            out.insert("fast_pull_miss_total".to_string(), CustomMetricValue::U64(hfa.pull_miss_total));
+            out.insert("fast_pull_fail_total".to_string(), CustomMetricValue::U64(hfa.pull_fail_total));
+            out.insert("fast_mode_transition_total".to_string(), CustomMetricValue::U64(hfa.mode_transition_total));
+            out.insert(
+                "fast_mode_transition_normal_to_degraded_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_normal_to_degraded_total),
+            );
+            out.insert(
+                "fast_mode_transition_degraded_to_paused_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_degraded_to_paused_total),
+            );
+            out.insert(
+                "fast_mode_transition_paused_to_degraded_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_paused_to_degraded_total),
+            );
+            out.insert(
+                "fast_mode_transition_degraded_to_normal_total".to_string(),
+                CustomMetricValue::U64(hfa.mode_transition_degraded_to_normal_total),
+            );
+            out.insert("fast_revalidation_backlog_seconds".to_string(), CustomMetricValue::F64(hfa.revalidation_backlog_seconds));
+            out
+        });
 
         let server_time = unix_now();
 
@@ -1114,6 +3525,677 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let session = self.consensus_manager.consensus().unguarded_session();
         let is_synced: bool = self.has_sufficient_peer_connectivity() && session.async_is_nearly_synced().await;
         Ok(GetSyncStatusResponse { is_synced })
+    }
+
+    async fn get_strong_nodes_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetStrongNodesRequest,
+    ) -> RpcResult<GetStrongNodesResponse> {
+        let snapshot = self.flow_context.strong_node_claims_snapshot();
+        let entries = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| RpcStrongNodeEntry {
+                node_id: entry.node_id,
+                public_key_xonly: entry.public_key_xonly,
+                source: "claimant-v1".to_string(),
+                claimed_blocks: entry.claimed_blocks,
+                share_bps: entry.share_bps,
+                last_claim_block_hash: entry.last_claim_block_hash,
+                last_claim_time_ms: entry.last_claim_time_ms,
+            })
+            .collect();
+
+        Ok(GetStrongNodesResponse {
+            enabled_by_config: snapshot.enabled,
+            hardfork_active: snapshot.hardfork_active,
+            runtime_available: snapshot.runtime_available,
+            disabled_reason_code: None,
+            disabled_reason_message: None,
+            conflict_total: snapshot.conflict_total,
+            window_size: snapshot.window_size,
+            entries,
+        })
+    }
+
+    async fn simulate_token_op_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: SimulateTokenOpRequest,
+    ) -> RpcResult<SimulateTokenOpResponse> {
+        let SimulateTokenOpRequest { payload_hex, owner_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let (base_context, owner_nonce) =
+            atomic.get_nonce_with_context(NonceKey::owner(owner_id), at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&base_context)?;
+        let payload = Vec::<u8>::from_hex(&payload_hex).map_err(|err| RpcError::General(format!("invalid `payloadHex`: {err}")))?;
+        let (result, noop_reason, expected_next_nonce, response_context) = match parse_atomic_token_payload(&payload) {
+            None => ("ignored".to_string(), None, owner_nonce, base_context),
+            Some(Err(noop_reason)) => ("noop".to_string(), Some(noop_reason as u32), owner_nonce, base_context),
+            Some(Ok(parsed)) => {
+                let view = atomic.get_simulation_view(owner_id, &parsed.op, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+                Self::ensure_token_simulation_ready(&view)?;
+                let expected_next_nonce = Self::expected_nonce_for_op(&view, owner_id, &parsed.op);
+                let noop_reason = self.simulate_token_noop_reason(&view, owner_id, &parsed).map(|reason| reason as u32);
+                if noop_reason.is_some() {
+                    ("noop".to_string(), noop_reason, expected_next_nonce, view.context())
+                } else {
+                    ("state_only".to_string(), None, expected_next_nonce, view.context())
+                }
+            }
+        };
+
+        let context = self.atomic_context_from_read_context(&response_context).await?;
+        Ok(SimulateTokenOpResponse { result, noop_reason, expected_next_nonce, context })
+    }
+
+    async fn get_token_balance_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenBalanceRequest,
+    ) -> RpcResult<GetTokenBalanceResponse> {
+        let GetTokenBalanceRequest { asset_id, owner_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let (read_context, balance) =
+            atomic.get_balance_with_context(asset_id, owner_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let balance = balance.to_string();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenBalanceResponse { balance, context })
+    }
+
+    async fn get_token_nonce_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenNonceRequest,
+    ) -> RpcResult<GetTokenNonceResponse> {
+        let GetTokenNonceRequest { owner_id, asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let asset_id = asset_id.as_deref().map(|asset_id| Self::parse_hex_32(asset_id, "assetId")).transpose()?;
+        let key = match asset_id {
+            Some(asset_id) => NonceKey::asset(owner_id, asset_id),
+            None => NonceKey::owner(owner_id),
+        };
+        let (read_context, expected_next_nonce) =
+            atomic.get_nonce_with_context(key, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenNonceResponse { expected_next_nonce, context })
+    }
+
+    async fn get_owner_nonce_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetOwnerNonceRequest,
+    ) -> RpcResult<GetOwnerNonceResponse> {
+        let GetOwnerNonceRequest { owner_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let (read_context, expected_next_nonce) =
+            atomic.get_nonce_with_context(NonceKey::owner(owner_id), at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenNonceResponse { expected_next_nonce, context })
+    }
+
+    async fn get_token_asset_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenAssetRequest,
+    ) -> RpcResult<GetTokenAssetResponse> {
+        let GetTokenAssetRequest { asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let (read_context, asset) = atomic.get_asset_with_context(asset_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let asset = asset.map(Self::map_token_asset);
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenAssetResponse { asset, context })
+    }
+
+    async fn get_token_op_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenOpStatusRequest,
+    ) -> RpcResult<GetTokenOpStatusResponse> {
+        let GetTokenOpStatusRequest { txid, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let (read_context, status) = atomic.get_op_status_with_context(txid, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(match status {
+            Some(status) => Self::map_processed_op(status, context),
+            None => GetTokenOpStatusResponse { accepting_block_hash: None, apply_status: None, noop_reason: None, context },
+        })
+    }
+
+    async fn get_token_state_hash_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenStateHashRequest,
+    ) -> RpcResult<GetTokenStateHashResponse> {
+        let GetTokenStateHashRequest { at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenStateHashResponse { context })
+    }
+
+    async fn get_token_spendability_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenSpendabilityRequest,
+    ) -> RpcResult<GetTokenSpendabilityResponse> {
+        let GetTokenSpendabilityRequest { asset_id, owner_id, min_daa_for_spend, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let min_daa_for_spend = min_daa_for_spend.unwrap_or(10);
+        let (read_context, balance) =
+            atomic.get_balance_with_context(asset_id, owner_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        match read_context.runtime_state {
+            AtomicTokenRuntimeState::NotReady => return Err(RpcError::AtomicStateNotReady),
+            AtomicTokenRuntimeState::Recovering => return Err(RpcError::AtomicStateRecovering),
+            AtomicTokenRuntimeState::Healthy | AtomicTokenRuntimeState::Degraded => {}
+        }
+        let (_, anchor_count) = atomic.get_anchor_count_with_context(owner_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        let (_, expected_next_nonce) =
+            atomic.get_nonce_with_context(NonceKey::asset(owner_id, asset_id), at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+
+        let (can_spend, reason) = if context.is_degraded {
+            (false, Some("token_state_degraded".to_string()))
+        } else if context.at_daa_score < min_daa_for_spend {
+            (false, Some("min_daa_not_reached".to_string()))
+        } else if balance == 0 {
+            (false, Some("zero_balance".to_string()))
+        } else if anchor_count == 0 {
+            (false, Some("missing_anchor_utxo".to_string()))
+        } else {
+            (true, None)
+        };
+
+        Ok(GetTokenSpendabilityResponse {
+            can_spend,
+            reason,
+            balance: balance.to_string(),
+            expected_next_nonce,
+            min_daa_for_spend,
+            context,
+        })
+    }
+
+    async fn get_token_events_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenEventsRequest,
+    ) -> RpcResult<GetTokenEventsResponse> {
+        let GetTokenEventsRequest { after_sequence, limit, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_EVENTS_LIMIT_MAX);
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let events = atomic
+            .get_events_since_capped(after_sequence, limit, read_context.event_sequence_cutoff)
+            .await
+            .into_iter()
+            .map(Self::map_token_event)
+            .collect();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenEventsResponse { events, context })
+    }
+
+    async fn get_token_assets_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenAssetsRequest,
+    ) -> RpcResult<GetTokenAssetsResponse> {
+        let GetTokenAssetsRequest { offset, limit, query, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_ASSETS_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let query = query.unwrap_or_default();
+        let (read_context, assets, total) =
+            atomic.get_assets_page(offset, limit, query, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let assets = assets.into_iter().map(Self::map_token_asset).collect();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenAssetsResponse { assets, total, context })
+    }
+
+    async fn get_token_balances_by_owner_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenBalancesByOwnerRequest,
+    ) -> RpcResult<GetTokenBalancesByOwnerResponse> {
+        let GetTokenBalancesByOwnerRequest { owner_id, offset, limit, include_assets, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let owner_id = Self::parse_hex_32(&owner_id, "ownerId")?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_OWNER_BALANCES_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let (read_context, balances) =
+            atomic.get_indexed_balances_by_owner(owner_id, include_assets, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+
+        let (balances, total) = Self::page_token_owner_balances(balances, offset, limit);
+        let balances = balances.into_iter().map(Self::map_token_owner_balance).collect();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenBalancesByOwnerResponse { balances, total, context })
+    }
+
+    async fn get_token_holders_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenHoldersRequest,
+    ) -> RpcResult<GetTokenHoldersResponse> {
+        let GetTokenHoldersRequest { asset_id, offset, limit, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_HOLDERS_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let (read_context, holders) =
+            atomic.get_indexed_holders_by_asset(asset_id, at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+
+        let (holders, total) = Self::page_token_holders(holders, offset, limit);
+        let holders = holders.into_iter().map(Self::map_token_holder).collect();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenHoldersResponse { holders, total, context })
+    }
+
+    async fn get_token_owner_id_by_address_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenOwnerIdByAddressRequest,
+    ) -> RpcResult<GetTokenOwnerIdByAddressResponse> {
+        let GetTokenOwnerIdByAddressRequest { address, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+        let address = Address::try_from(address.as_str()).map_err(|e| RpcError::General(format!("invalid `address` string: {e}")))?;
+        let script_public_key = pay_to_address_script(&address);
+        let (owner_id, reason) = match Self::owner_id_from_script(&script_public_key) {
+            Some(owner_id) => (Some(owner_id.as_slice().to_hex()), None),
+            None => (None, Some("unsupported_script_class".to_string())),
+        };
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetTokenOwnerIdByAddressResponse { owner_id, reason, context })
+    }
+
+    async fn get_liquidity_pool_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityPoolStateRequest,
+    ) -> RpcResult<GetLiquidityPoolStateResponse> {
+        let GetLiquidityPoolStateRequest { asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let (read_context, asset) = atomic
+            .get_asset_with_context(asset_id, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+
+        let prefix = self.config.prefix();
+        let pool = asset.as_ref().and_then(|asset| {
+            if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+                return None;
+            }
+            asset.liquidity.as_ref().map(|liquidity| Self::map_liquidity_pool_state(asset, liquidity, prefix))
+        });
+
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetLiquidityPoolStateResponse { pool, context })
+    }
+
+    async fn get_liquidity_quote_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityQuoteRequest,
+    ) -> RpcResult<GetLiquidityQuoteResponse> {
+        let GetLiquidityQuoteRequest { asset_id, side, exact_in_amount, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id = Self::parse_hex_32(&asset_id, "assetId")?;
+        let (read_context, asset) =
+            self.latest_liquidity_asset_with_submit_ready_vault(&atomic, "getLiquidityQuote", asset_id, at_block_hash).await?;
+
+        let asset = asset.as_ref().ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let (effective_exact_in_amount, fee_amount_sompi, net_in_amount, amount_out) = match side {
+            LIQUIDITY_QUOTE_SIDE_BUY => {
+                let cpay_budget = exact_in_amount
+                    .parse::<u64>()
+                    .map_err(|e| RpcError::General(format!("invalid `exactInAmount` for buy side: {e}")))?;
+                if cpay_budget == 0 {
+                    return Err(Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "buy exactInAmount must be > 0"));
+                }
+                let budget_fee_trade = calculate_trade_fee(cpay_budget, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
+                let cpay_net_in = cpay_budget
+                    .checked_sub(budget_fee_trade)
+                    .ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
+                let (token_out, _, _, _) =
+                    cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, cpay_net_in)
+                        .map_err(Self::map_liquidity_math_error)?;
+                let canonical_cpay_in = min_gross_input_for_token_out(
+                    pool.real_token_reserves,
+                    pool.virtual_cpay_reserves_sompi,
+                    pool.virtual_token_reserves,
+                    token_out,
+                    pool.fee_bps,
+                )
+                .map_err(Self::map_liquidity_math_error)?;
+                let fee_trade = calculate_trade_fee(canonical_cpay_in, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
+                let cpay_net_in = canonical_cpay_in
+                    .checked_sub(fee_trade)
+                    .ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
+                (canonical_cpay_in.to_string(), fee_trade.to_string(), cpay_net_in.to_string(), token_out.to_string())
+            }
+            LIQUIDITY_QUOTE_SIDE_SELL => {
+                let token_in = exact_in_amount
+                    .parse::<u128>()
+                    .map_err(|e| RpcError::General(format!("invalid `exactInAmount` for sell side: {e}")))?;
+                if token_in == 0 {
+                    return Err(Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "sell exactInAmount must be > 0"));
+                }
+                let (gross_out, _, _, _) =
+                    cpmm_sell(pool.real_cpay_reserves_sompi, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, token_in)
+                        .map_err(Self::map_liquidity_math_error)?;
+                let fee_trade = calculate_trade_fee(gross_out, pool.fee_bps).map_err(Self::map_liquidity_math_error)?;
+                let cpay_out =
+                    gross_out.checked_sub(fee_trade).ok_or_else(|| RpcError::General("liquidity quote underflow".to_string()))?;
+                if cpay_out == 0 {
+                    return Err(Self::cat_error_with_detail(CAT_ERR_ZERO_OUTPUT, "liquidity quote zero output"));
+                }
+                if cpay_out < LIQUIDITY_MIN_PAYOUT_SOMPI {
+                    return Err(Self::cat_error_with_detail(
+                        CAT_ERR_MIN_OUT_VIOLATION,
+                        format!("liquidity quote output below minimum payout: {cpay_out} < {LIQUIDITY_MIN_PAYOUT_SOMPI}"),
+                    ));
+                }
+                (exact_in_amount.clone(), fee_trade.to_string(), token_in.to_string(), cpay_out.to_string())
+            }
+            _ => {
+                return Err(RpcError::General("invalid `side` (expected 0=buy or 1=sell)".to_string()));
+            }
+        };
+
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetLiquidityQuoteResponse {
+            side,
+            exact_in_amount: effective_exact_in_amount,
+            fee_amount_sompi,
+            net_in_amount,
+            amount_out,
+            context,
+        })
+    }
+
+    async fn get_liquidity_fee_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityFeeStateRequest,
+    ) -> RpcResult<GetLiquidityFeeStateResponse> {
+        let GetLiquidityFeeStateRequest { asset_id, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
+        let (read_context, asset) = atomic
+            .get_asset_with_context(asset_id_bytes, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+
+        let asset = asset.as_ref().ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let prefix = self.config.prefix();
+        let recipients: Vec<RpcLiquidityFeeRecipient> =
+            pool.fee_recipients.iter().map(|recipient| Self::map_liquidity_fee_recipient(recipient, prefix)).collect();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetLiquidityFeeStateResponse {
+            asset_id,
+            fee_bps: u32::from(pool.fee_bps),
+            total_unclaimed_sompi: pool.unclaimed_fee_total_sompi.to_string(),
+            recipients,
+            context,
+        })
+    }
+
+    async fn get_liquidity_claim_preview_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityClaimPreviewRequest,
+    ) -> RpcResult<GetLiquidityClaimPreviewResponse> {
+        let GetLiquidityClaimPreviewRequest { asset_id, recipient_address, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
+        let (read_context, asset) = atomic
+            .get_asset_with_context(asset_id_bytes, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+
+        let asset = asset.as_ref().ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let address = Address::try_from(recipient_address.as_str()).map_err(|e| {
+            Self::cat_error_with_detail(CAT_ERR_RECIPIENT_ENCODING_INVALID, format!("invalid `recipientAddress` string: {e}"))
+        })?;
+        let script_public_key = pay_to_address_script(&address);
+        let (owner_id, claimable_amount_sompi, claimable_now, reason) = match Self::owner_id_from_script(&script_public_key) {
+            Some(owner_id) => {
+                let maybe_recipient = pool.fee_recipients.iter().find(|recipient| recipient.owner_id == owner_id);
+                match maybe_recipient {
+                    Some(recipient) => {
+                        let claimable = recipient.unclaimed_sompi;
+                        let (claimable_now, reason) = Self::liquidity_claim_preview_status(pool, claimable);
+                        (Some(owner_id.as_slice().to_hex()), claimable, claimable_now, reason)
+                    }
+                    None => (Some(owner_id.as_slice().to_hex()), 0u64, false, Some("recipient_not_configured".to_string())),
+                }
+            }
+            None => (None, 0u64, false, Some(format!("{CAT_ERR_PAYOUT_SCRIPT_CLASS_INVALID}: unsupported_script_class"))),
+        };
+
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetLiquidityClaimPreviewResponse {
+            recipient_address,
+            owner_id,
+            claimable_amount_sompi: claimable_amount_sompi.to_string(),
+            min_payout_sompi: LIQUIDITY_MIN_PAYOUT_SOMPI.to_string(),
+            claimable_now,
+            reason,
+            context,
+        })
+    }
+
+    async fn get_liquidity_holders_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetLiquidityHoldersRequest,
+    ) -> RpcResult<GetLiquidityHoldersResponse> {
+        let GetLiquidityHoldersRequest { asset_id, offset, limit, at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let asset_id_bytes = Self::parse_hex_32(&asset_id, "assetId")?;
+        let limit = usize::try_from(limit).map_err(|e| RpcError::General(e.to_string()))?.min(TOKEN_LIQUIDITY_HOLDERS_LIMIT_MAX);
+        let offset = usize::try_from(offset).map_err(|e| RpcError::General(e.to_string()))?;
+        let (read_context, asset, holders, owner_to_address_state) = atomic
+            .get_indexed_liquidity_holders(asset_id_bytes, at_block_hash)
+            .await
+            .ok_or_else(|| Self::liquidity_read_view_unavailable_error(at_block_hash))?;
+        Self::ensure_token_context_read_ready(&read_context)?;
+
+        let asset = asset.ok_or_else(|| RpcError::General("liquidity asset not found".to_string()))?;
+        if !matches!(asset.asset_class, TokenAssetClass::Liquidity) {
+            return Err(RpcError::General("asset is not a liquidity asset".to_string()));
+        }
+        asset.liquidity.as_ref().ok_or_else(|| RpcError::General("liquidity state missing for asset".to_string()))?;
+
+        let prefix = self.config.prefix();
+        let owner_to_address: HashMap<[u8; 32], String> = owner_to_address_state
+            .iter()
+            .filter_map(|(owner_id, holder)| {
+                Self::liquidity_address_string_from_components(prefix, holder.address_version, holder.address_payload.as_slice())
+                    .map(|address| (*owner_id, address))
+            })
+            .collect();
+
+        let (holders, total) = Self::page_token_holders(holders, offset, limit);
+        let holders = holders.into_iter().map(|entry| Self::map_liquidity_holder(entry, &owner_to_address)).collect();
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(GetLiquidityHoldersResponse { holders, total, context })
+    }
+
+    async fn export_token_snapshot_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: ExportTokenSnapshotRequest,
+    ) -> RpcResult<ExportTokenSnapshotResponse> {
+        let atomic = self.atomic_service()?;
+        if !self.config.unsafe_rpc {
+            warn!("ExportTokenSnapshot RPC command called while node in safe RPC mode -- rejecting.");
+            return Err(RpcError::UnavailableInSafeMode);
+        }
+        atomic.export_snapshot_to_file(&request.path).await.map_err(|err| RpcError::General(err.to_string()))?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(ExportTokenSnapshotResponse { exported: true, context })
+    }
+
+    async fn import_token_snapshot_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: ImportTokenSnapshotRequest,
+    ) -> RpcResult<ImportTokenSnapshotResponse> {
+        let atomic = self.atomic_service()?;
+        if !self.config.unsafe_rpc {
+            warn!("ImportTokenSnapshot RPC command called while node in safe RPC mode -- rejecting.");
+            return Err(RpcError::UnavailableInSafeMode);
+        }
+        atomic.import_snapshot_from_file(&request.path).await.map_err(|err| RpcError::General(err.to_string()))?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(ImportTokenSnapshotResponse { imported: true, context })
+    }
+
+    async fn get_token_health_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetTokenHealthRequest,
+    ) -> RpcResult<GetTokenHealthResponse> {
+        let GetTokenHealthRequest { at_block_hash } = request;
+        let atomic = self.atomic_service()?;
+        let read_context = atomic.get_read_context(at_block_hash).await.ok_or(RpcError::StaleContext)?;
+        let health = atomic.get_health().await;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        Ok(Self::map_health_response(health, context))
+    }
+
+    async fn get_sc_bootstrap_sources_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScBootstrapSourcesRequest,
+    ) -> RpcResult<GetScBootstrapSourcesResponse> {
+        let atomic = self.atomic_service()?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        let sources = atomic
+            .get_sc_bootstrap_sources()
+            .await
+            .map_err(|err| RpcError::General(err.to_string()))?
+            .into_iter()
+            .map(Self::map_sc_bootstrap_source)
+            .collect();
+        Ok(GetScBootstrapSourcesResponse { sources, context })
+    }
+
+    async fn get_sc_snapshot_manifest_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetScSnapshotManifestRequest,
+    ) -> RpcResult<GetScSnapshotManifestResponse> {
+        let atomic = self.atomic_service()?;
+        let manifest_payload =
+            atomic.get_sc_snapshot_manifest(&request.snapshot_id).await.map_err(|err| RpcError::General(err.to_string()))?;
+        Ok(GetScSnapshotManifestResponse {
+            snapshot_id: manifest_payload.snapshot_id,
+            manifest_hex: manifest_payload.manifest_bytes.to_hex(),
+            manifest_signatures: manifest_payload.signatures.into_iter().map(Self::map_sc_manifest_signature).collect(),
+        })
+    }
+
+    async fn get_sc_snapshot_chunk_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetScSnapshotChunkRequest,
+    ) -> RpcResult<GetScSnapshotChunkResponse> {
+        let atomic = self.atomic_service()?;
+        let chunk = atomic
+            .get_sc_snapshot_chunk(&request.snapshot_id, request.chunk_index, request.chunk_size)
+            .await
+            .map_err(|err| RpcError::General(err.to_string()))?;
+        Ok(Self::map_sc_chunk(chunk))
+    }
+
+    async fn get_sc_replay_window_chunk_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetScReplayWindowChunkRequest,
+    ) -> RpcResult<GetScReplayWindowChunkResponse> {
+        let atomic = self.atomic_service()?;
+        let chunk = atomic
+            .get_sc_replay_window_chunk(&request.snapshot_id, request.chunk_index, request.chunk_size)
+            .await
+            .map_err(|err| RpcError::General(err.to_string()))?;
+        Ok(GetScReplayWindowChunkResponse {
+            snapshot_id: chunk.snapshot_id,
+            chunk_index: chunk.chunk_index,
+            total_chunks: chunk.total_chunks,
+            file_size: chunk.file_size,
+            chunk_hex: chunk.chunk_data.to_hex(),
+        })
+    }
+
+    async fn get_sc_snapshot_head_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScSnapshotHeadRequest,
+    ) -> RpcResult<GetScSnapshotHeadResponse> {
+        let atomic = self.atomic_service()?;
+        let read_context = atomic.get_read_context(None).await.ok_or(RpcError::StaleContext)?;
+        let context = self.atomic_context_from_read_context(&read_context).await?;
+        let head =
+            atomic.get_sc_snapshot_head().await.map_err(|err| RpcError::General(err.to_string()))?.map(Self::map_sc_bootstrap_source);
+        Ok(GetScSnapshotHeadResponse { head, context })
+    }
+
+    async fn get_consensus_atomic_state_hash_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        request: GetConsensusAtomicStateHashRequest,
+    ) -> RpcResult<GetConsensusAtomicStateHashResponse> {
+        let session = self.consensus_manager.consensus().session().await;
+        let state_hash = session
+            .async_get_atomic_state_hash(request.block_hash)
+            .await
+            .map_err(|err| RpcError::General(format!("failed reading consensus atomic state hash: {err}")))?
+            .map(|hash| hash.as_slice().to_hex());
+        Ok(GetConsensusAtomicStateHashResponse { state_hash })
     }
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1197,5 +4279,220 @@ impl AsyncService for RpcCoreService {
             trace!("{} stopped", Self::IDENT);
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cryptix_atomicindex::{
+        liquidity_math::{
+            DEFAULT_LIQUIDITY_CURVE_MODE, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES,
+            LIQUIDITY_TOKEN_SUPPLY_RAW,
+        },
+        payload::{CURRENT_LIQUIDITY_CURVE_VERSION, CURRENT_TOKEN_VERSION},
+    };
+    use cryptix_consensus_core::{tx::TransactionOutpoint, Hash};
+
+    fn sample_liquidity_pool(real_token_reserves: u128, real_cpay_reserves_sompi: u64, fee_bps: u16) -> LiquidityPoolState {
+        LiquidityPoolState {
+            pool_nonce: 7,
+            curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+            curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+            individual_virtual_cpay_reserves_sompi: 0,
+            individual_virtual_token_multiplier_bps: 0,
+            real_cpay_reserves_sompi,
+            real_token_reserves,
+            virtual_cpay_reserves_sompi: INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+            virtual_token_reserves: INITIAL_VIRTUAL_TOKEN_RESERVES,
+            unclaimed_fee_total_sompi: 0,
+            fee_bps,
+            fee_recipients: vec![],
+            vault_outpoint: TransactionOutpoint::new(Hash::from_u64_word(77), 0),
+            vault_value_sompi: real_cpay_reserves_sompi,
+            unlock_target_sompi: 0,
+            unlocked: true,
+            holder_addresses: HashMap::new(),
+        }
+    }
+
+    fn sample_liquidity_asset(max_supply: u128, total_supply: u128, pool: LiquidityPoolState) -> TokenAsset {
+        TokenAsset {
+            asset_id: [0x11; 32],
+            creator_owner_id: [0x22; 32],
+            asset_class: TokenAssetClass::Liquidity,
+            token_version: CURRENT_TOKEN_VERSION,
+            mint_authority_owner_id: [0u8; 32],
+            decimals: 0,
+            supply_mode: SupplyMode::Capped,
+            max_supply,
+            total_supply,
+            name: b"Pool".to_vec(),
+            symbol: b"POOL".to_vec(),
+            metadata: vec![],
+            platform_tag: Vec::new(),
+            created_block_hash: None,
+            created_daa_score: None,
+            created_at: None,
+            liquidity: Some(pool),
+        }
+    }
+
+    #[test]
+    fn owner_id_accepts_standard_p2sh_script() {
+        let script_public_key = cryptix_txscript::pay_to_script_hash_script(&[0x51]);
+
+        assert_eq!(script_public_key.script().len(), 35);
+        assert!(RpcCoreService::owner_id_from_script(&script_public_key).is_some());
+    }
+
+    #[test]
+    fn simulate_create_asset_with_mint_rejects_initial_mint_above_cap() {
+        let op = CreateAssetWithMintOp {
+            token_version: CURRENT_TOKEN_VERSION,
+            decimals: 0,
+            supply_mode: SupplyMode::Capped,
+            max_supply: 100,
+            mint_authority_owner_id: [0x33; 32],
+            name: b"Token".to_vec(),
+            symbol: b"TKN".to_vec(),
+            metadata: vec![],
+            initial_mint_amount: 101,
+            initial_mint_to_owner_id: [0x44; 32],
+            platform_tag: Vec::new(),
+        };
+
+        assert_eq!(RpcCoreService::simulate_create_asset_with_mint_noop_reason(&op), Some(NoopReason::SupplyCapExceeded));
+    }
+
+    #[test]
+    fn simulate_create_liquidity_rejects_zero_seed_reserve() {
+        let op = CreateLiquidityAssetOp {
+            token_version: CURRENT_TOKEN_VERSION,
+            curve_version: CURRENT_LIQUIDITY_CURVE_VERSION,
+            curve_mode: DEFAULT_LIQUIDITY_CURVE_MODE,
+            individual_virtual_cpay_reserves_sompi: 0,
+            individual_virtual_token_multiplier_bps: 0,
+            decimals: 0,
+            max_supply: LIQUIDITY_TOKEN_SUPPLY_RAW,
+            name: b"Pool".to_vec(),
+            symbol: b"POOL".to_vec(),
+            metadata: vec![],
+            seed_reserve_sompi: 0,
+            fee_bps: 0,
+            recipients: vec![],
+            launch_buy_sompi: 0,
+            launch_buy_min_token_out: 0,
+            platform_tag: Vec::new(),
+            liquidity_unlock_target_sompi: 0,
+        };
+
+        assert_eq!(RpcCoreService::simulate_create_liquidity_noop_reason(&op), Some(NoopReason::InvalidAmount));
+    }
+
+    #[test]
+    fn simulate_buy_liquidity_detects_min_out_violation() {
+        let pool = sample_liquidity_pool(900, 1_000, 0);
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let budget_cpay_in_sompi = 10 * INITIAL_REAL_CPAY_RESERVES_SOMPI;
+        let (token_out, _, _, _) =
+            cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, budget_cpay_in_sompi)
+                .expect("buy quote should work");
+        let canonical_cpay_in_sompi = min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            token_out,
+            pool.fee_bps,
+        )
+        .expect("canonical buy should calculate");
+        let op = BuyLiquidityExactInOp {
+            asset_id: asset.asset_id,
+            expected_pool_nonce: pool.pool_nonce,
+            cpay_in_sompi: canonical_cpay_in_sompi,
+            min_token_out: token_out + 1,
+        };
+
+        assert_eq!(RpcCoreService::simulate_buy_liquidity_noop_reason(&asset, &pool, &op), Some(NoopReason::MinOutViolation));
+    }
+
+    #[test]
+    fn map_liquidity_pool_state_exposes_fdv_and_circulating_mcap_separately() {
+        let pool = sample_liquidity_pool(900, 1_000, 30);
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let rpc_pool = RpcCoreService::map_liquidity_pool_state(&asset, &pool, cryptix_addresses::Prefix::Testnet);
+        let spot_price = min_gross_input_for_token_out(
+            pool.real_token_reserves,
+            pool.virtual_cpay_reserves_sompi,
+            pool.virtual_token_reserves,
+            1,
+            pool.fee_bps,
+        )
+        .expect("spot price should quote one token");
+
+        assert_eq!(rpc_pool.liquidity_cpay_sompi, pool.real_cpay_reserves_sompi.to_string());
+        assert_eq!(rpc_pool.current_spot_price_sompi, spot_price.to_string());
+        assert_eq!(rpc_pool.circulating_mcap_cpay_sompi, (100u128 * u128::from(spot_price)).to_string());
+        assert_eq!(rpc_pool.fdv_mcap_cpay_sompi, (1_000u128 * u128::from(spot_price)).to_string());
+    }
+
+    #[test]
+    fn simulate_sell_liquidity_rejects_gross_reserve_breach_even_when_net_payout_would_fit() {
+        let mut pool = sample_liquidity_pool(900, 1_000, 9000);
+        pool.virtual_cpay_reserves_sompi = 2_000;
+        pool.virtual_token_reserves = 1;
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let op = SellLiquidityExactInOp {
+            asset_id: asset.asset_id,
+            expected_pool_nonce: pool.pool_nonce,
+            token_in: 1,
+            min_cpay_out_sompi: 1,
+            cpay_receive_output_index: 0,
+        };
+
+        assert_eq!(RpcCoreService::simulate_sell_liquidity_noop_reason(&asset, &pool, 100, &op), Some(NoopReason::InvalidAmount));
+    }
+
+    #[test]
+    fn simulate_sell_liquidity_rejects_active_lock() {
+        let mut pool = sample_liquidity_pool(900, 1_000, 0);
+        pool.unlock_target_sompi = 2_000;
+        pool.unlocked = false;
+        let asset = sample_liquidity_asset(1_000, 100, pool.clone());
+        let op = SellLiquidityExactInOp {
+            asset_id: asset.asset_id,
+            expected_pool_nonce: pool.pool_nonce,
+            token_in: 1,
+            min_cpay_out_sompi: 1,
+            cpay_receive_output_index: 0,
+        };
+
+        assert_eq!(
+            RpcCoreService::simulate_sell_liquidity_noop_reason(&asset, &pool, 100, &op),
+            Some(NoopReason::LiquiditySellLocked)
+        );
+    }
+
+    #[test]
+    fn liquidity_claim_preview_reports_active_lock_before_payout_amount() {
+        let mut pool = sample_liquidity_pool(900, 1_000, 0);
+        pool.unlock_target_sompi = 2_000;
+        pool.unlocked = false;
+
+        assert_eq!(
+            RpcCoreService::liquidity_claim_preview_status(&pool, LIQUIDITY_MIN_PAYOUT_SOMPI),
+            (false, Some("liquidity_sell_locked".to_string()))
+        );
+    }
+
+    #[test]
+    fn liquidity_claim_preview_reports_below_min_only_when_unlocked() {
+        let pool = sample_liquidity_pool(900, 1_000, 0);
+
+        assert_eq!(
+            RpcCoreService::liquidity_claim_preview_status(&pool, LIQUIDITY_MIN_PAYOUT_SOMPI - 1),
+            (false, Some("below_min_payout".to_string()))
+        );
+        assert_eq!(RpcCoreService::liquidity_claim_preview_status(&pool, LIQUIDITY_MIN_PAYOUT_SOMPI), (true, None));
     }
 }

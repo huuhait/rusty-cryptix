@@ -998,6 +998,63 @@ pub async fn cryptix_cli(terminal_options: TerminalOptions, banner: Option<Strin
     Ok(())
 }
 
+fn quote_command_arg(arg: &str) -> String {
+    if arg.is_empty() {
+        return "\"\"".to_string();
+    }
+
+    let requires_quotes = arg.chars().any(|ch| ch.is_whitespace() || matches!(ch, '"' | '\\'));
+    if !requires_quotes {
+        return arg.to_string();
+    }
+
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    for ch in arg.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn build_command_line(argv: &[String]) -> String {
+    argv.iter().map(|arg| quote_command_arg(arg)).collect::<Vec<_>>().join(" ")
+}
+
+pub async fn cryptix_cli_command(terminal_options: TerminalOptions, banner: Option<String>, argv: Vec<String>) -> Result<()> {
+    if argv.is_empty() {
+        return Err(Error::custom("missing command"));
+    }
+
+    CryptixCli::init();
+
+    let options = Options::new(terminal_options, None);
+    let cli = CryptixCli::try_new_arc(options).await?;
+
+    if let Some(banner) = banner {
+        cli.term().writeln(banner);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    workflow_log::pipe(Some(cli.clone()));
+
+    cli.register_handlers()?;
+    cli.start().await?;
+
+    let command = build_command_line(argv.as_slice());
+    let exec_result = cli.handlers().execute(&cli, &command).await.map_err(Error::from);
+    let stop_result = cli.stop().await;
+
+    exec_result?;
+    stop_result?;
+
+    Ok(())
+}
+
 mod panic_handler {
     use regex::Regex;
     use wasm_bindgen::prelude::*;
@@ -1016,7 +1073,7 @@ mod panic_handler {
         fn stack(error: &Error) -> String;
     }
 
-    pub fn process(info: &std::panic::PanicInfo) -> String {
+    pub fn process(info: &std::panic::PanicHookInfo<'_>) -> String {
         let mut msg = info.to_string();
 
         // Add the error stack to our message.
@@ -1053,7 +1110,7 @@ mod panic_handler {
 impl CryptixCli {
     pub fn init_panic_hook(self: &Arc<Self>) {
         let this = self.clone();
-        let handler = move |info: &std::panic::PanicInfo| {
+        let handler = move |info: &std::panic::PanicHookInfo<'_>| {
             let msg = panic_handler::process(info);
             this.term().writeln(msg.crlf());
             panic_handler::console_error(msg);

@@ -8,7 +8,7 @@ use workflow_core::enums::Describe;
 pub const RPC_API_VERSION: u16 = 1;
 /// API revision. Change in this value denotes
 /// backwards-compatible changes.
-pub const RPC_API_REVISION: u16 = 0;
+pub const RPC_API_REVISION: u16 = 2;
 
 #[derive(Describe, Clone, Copy, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,6 +36,7 @@ pub enum RpcApiOps {
     NotifyVirtualDaaScoreChanged = 16,
     NotifyVirtualChainChanged = 17,
     NotifySinkBlueScoreChanged = 18,
+    NotifyTokenEvents = 19,
 
     // Notification ops required by wRPC
 
@@ -50,6 +51,7 @@ pub enum RpcApiOps {
     VirtualDaaScoreChangedNotification = 66,
     PruningPointUtxoSetOverrideNotification = 67,
     NewBlockTemplateNotification = 68,
+    TokenEventsChangedNotification = 69,
 
     // RPC methods
     /// Ping the node to check if connection is alive
@@ -132,6 +134,70 @@ pub enum RpcApiOps {
     GetFeeEstimateExperimental = 148,
     /// Block color determination by iterating DAG.
     GetCurrentBlockColor = 149,
+    /// Submit a fast rail transfer intent (node-local, non-final).
+    SubmitFastIntent = 150,
+    /// Query local fast rail intent status.
+    GetFastIntentStatus = 151,
+    /// Cancel a local fast rail intent context.
+    CancelFastIntent = 152,
+    /// Get announced strong nodes overlay state and entries.
+    GetStrongNodes = 153,
+    /// Simulate a Cryptix Atomic token payload operation without mutating state (best-effort hint, not strict execution parity).
+    SimulateTokenOp = 154,
+    /// Get Cryptix Atomic token balance for owner and asset.
+    GetTokenBalance = 155,
+    /// Get Cryptix Atomic next nonce for owner-scope or owner/asset-scope.
+    GetTokenNonce = 156,
+    /// Get Cryptix Atomic asset metadata.
+    GetTokenAsset = 157,
+    /// Get Cryptix Atomic operation status by txid.
+    GetTokenOpStatus = 158,
+    /// Get Cryptix Atomic state hash and context.
+    GetTokenStateHash = 159,
+    /// Get Cryptix Atomic wallet-policy spendability hint (not a final spendability proof).
+    GetTokenSpendability = 160,
+    /// Get Cryptix Atomic token events stream window.
+    GetTokenEvents = 161,
+    /// Export Cryptix Atomic snapshot to a file.
+    ExportTokenSnapshot = 162,
+    /// Import Cryptix Atomic snapshot from a file.
+    ImportTokenSnapshot = 163,
+    /// Get Cryptix Atomic service health.
+    GetTokenHealth = 164,
+    /// List available Cryptix Atomic bootstrap snapshot sources.
+    GetScBootstrapSources = 165,
+    /// Get Cryptix Atomic snapshot manifest by snapshot id.
+    GetScSnapshotManifest = 166,
+    /// Get a snapshot-package chunk by snapshot id and chunk index.
+    GetScSnapshotChunk = 167,
+    /// Get a replay-window chunk by snapshot id and chunk index.
+    GetScReplayWindowChunk = 168,
+    /// Get the latest available Cryptix Atomic snapshot head.
+    GetScSnapshotHead = 169,
+    /// List Cryptix Atomic token assets with optional query and pagination.
+    GetTokenAssets = 170,
+    /// List Cryptix Atomic balances for a specific owner across assets.
+    GetTokenBalancesByOwner = 171,
+    /// List Cryptix Atomic holders for a specific asset.
+    GetTokenHolders = 172,
+    /// Derive Cryptix Atomic owner id from an address, if script class is supported.
+    GetTokenOwnerIdByAddress = 173,
+    /// Get Cryptix Atomic liquidity pool state for a liquidity asset.
+    GetLiquidityPoolState = 174,
+    /// Get Cryptix Atomic liquidity quote for exact-in buy/sell.
+    GetLiquidityQuote = 175,
+    /// Get Cryptix Atomic liquidity fee accrual state for a liquidity asset.
+    GetLiquidityFeeState = 176,
+    /// Get Cryptix Atomic liquidity fee-claim preview for a specific recipient address.
+    GetLiquidityClaimPreview = 177,
+    /// List Cryptix Atomic liquidity holders for a liquidity asset.
+    GetLiquidityHolders = 178,
+    /// Get the consensus Atomic state hash for an exact block hash.
+    GetConsensusAtomicStateHash = 179,
+    /// Resolve transactions by id, optionally using block DAA hints for batched payload/history enrichment.
+    GetTransactionsByIds = 180,
+    /// Get Cryptix Atomic next nonce for owner-scope create operations.
+    GetOwnerNonce = 181,
 }
 
 impl RpcApiOps {
@@ -147,6 +213,7 @@ impl RpcApiOps {
                 | RpcApiOps::NotifyFinalityConflictResolved
                 | RpcApiOps::NotifySinkBlueScoreChanged
                 | RpcApiOps::NotifyVirtualDaaScoreChanged
+                | RpcApiOps::NotifyTokenEvents
                 | RpcApiOps::Subscribe
                 | RpcApiOps::Unsubscribe
         )
@@ -173,6 +240,7 @@ impl From<EventType> for RpcApiOps {
             EventType::VirtualDaaScoreChanged => RpcApiOps::VirtualDaaScoreChangedNotification,
             EventType::PruningPointUtxoSetOverride => RpcApiOps::PruningPointUtxoSetOverrideNotification,
             EventType::NewBlockTemplate => RpcApiOps::NewBlockTemplateNotification,
+            EventType::TokenEventsChanged => RpcApiOps::TokenEventsChangedNotification,
         }
     }
 }

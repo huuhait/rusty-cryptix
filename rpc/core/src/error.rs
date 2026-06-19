@@ -56,8 +56,20 @@ pub enum RpcError {
     #[error("Transaction {0} not found")]
     TransactionNotFound(TransactionId),
 
-    #[error("Method unavailable. Run the node with the --utxoindex argument.")]
+    #[error("Method unavailable. Enable the UTXO index for this node.")]
     NoUtxoIndex,
+
+    #[error("ERR_STALE_CONTEXT")]
+    StaleContext,
+
+    #[error("Cryptix Atomic state unavailable: token index not ready")]
+    AtomicStateNotReady,
+
+    #[error("Cryptix Atomic state unavailable: token recovery in progress")]
+    AtomicStateRecovering,
+
+    #[error("Cryptix Atomic state unavailable: token state degraded")]
+    AtomicStateDegraded,
 
     #[error("Method unavailable. No connection manager is currently available.")]
     NoConnectionManager,

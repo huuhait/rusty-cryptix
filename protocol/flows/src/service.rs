@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cryptix_addressmanager::NetAddress;
@@ -6,7 +7,7 @@ use cryptix_core::{
     task::service::{AsyncService, AsyncServiceFuture},
     trace,
 };
-use cryptix_p2p_lib::Adaptor;
+use cryptix_p2p_lib::{Adaptor, P2P_SERVICE_BIT_ARCHIVAL, P2P_SERVICE_BIT_HFA};
 use cryptix_utils::triggers::SingleTrigger;
 use cryptix_utils_tower::counters::TowerConnectionCounters;
 
@@ -23,6 +24,8 @@ pub struct P2pService {
     inbound_limit: usize,
     dns_seeders: &'static [&'static str],
     default_port: u16,
+    banserver_enabled: bool,
+    anti_fraud_persist_base_dir: Option<PathBuf>,
     shutdown: SingleTrigger,
     counters: Arc<TowerConnectionCounters>,
 }
@@ -37,6 +40,8 @@ impl P2pService {
         inbound_limit: usize,
         dns_seeders: &'static [&'static str],
         default_port: u16,
+        banserver_enabled: bool,
+        anti_fraud_persist_base_dir: Option<PathBuf>,
         counters: Arc<TowerConnectionCounters>,
     ) -> Self {
         Self {
@@ -49,6 +54,8 @@ impl P2pService {
             inbound_limit,
             dns_seeders,
             default_port,
+            banserver_enabled,
+            anti_fraud_persist_base_dir,
             counters,
         }
     }
@@ -68,13 +75,24 @@ impl AsyncService for P2pService {
         let p2p_adaptor =
             Adaptor::bidirectional(self.listen, self.flow_context.hub().clone(), self.flow_context.clone(), self.counters.clone())
                 .unwrap();
+        let mut preferred_service_mask = 0u64;
+        if !self.flow_context.config.is_archival {
+            preferred_service_mask |= P2P_SERVICE_BIT_ARCHIVAL;
+        }
+        if self.flow_context.is_hfa_p2p_enabled() {
+            preferred_service_mask |= P2P_SERVICE_BIT_HFA;
+        }
         let connection_manager = ConnectionManager::new(
             p2p_adaptor.clone(),
             self.outbound_target,
             self.inbound_limit,
+            preferred_service_mask,
             self.dns_seeders,
             self.default_port,
             self.flow_context.address_manager.clone(),
+            self.banserver_enabled,
+            self.flow_context.config.network_name(),
+            self.anti_fraud_persist_base_dir.clone(),
         );
 
         self.flow_context.set_connection_manager(connection_manager.clone());

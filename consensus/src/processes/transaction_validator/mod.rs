@@ -28,6 +28,12 @@ pub struct TransactionValidator {
 
     /// Storage mass hardfork DAA score
     storage_mass_activation_daa_score: u64,
+
+    /// Payload hardfork DAA score
+    payload_hf_activation_daa_score: u64,
+
+    /// Consensus hard cap for payload transactions
+    payload_max_len_consensus: usize,
 }
 
 impl TransactionValidator {
@@ -42,6 +48,8 @@ impl TransactionValidator {
         counters: Arc<TxScriptCacheCounters>,
         mass_calculator: MassCalculator,
         storage_mass_activation_daa_score: u64,
+        payload_hf_activation_daa_score: u64,
+        payload_max_len_consensus: usize,
     ) -> Self {
         Self {
             max_tx_inputs,
@@ -54,6 +62,8 @@ impl TransactionValidator {
             sig_cache: Cache::with_counters(10_000, counters),
             mass_calculator,
             storage_mass_activation_daa_score,
+            payload_hf_activation_daa_score,
+            payload_max_len_consensus,
         }
     }
 
@@ -76,8 +86,15 @@ impl TransactionValidator {
             coinbase_payload_script_public_key_max_len,
             coinbase_maturity,
             sig_cache: Cache::with_counters(10_000, counters),
-            mass_calculator: MassCalculator::new(0, 0, 0, 0),
+            mass_calculator: MassCalculator::new(0, 0, 0, 0, 1),
             storage_mass_activation_daa_score: u64::MAX,
+            payload_hf_activation_daa_score: 33_739_200,
+            payload_max_len_consensus: usize::MAX,
         }
+    }
+
+    #[inline]
+    pub(crate) fn is_payload_hf_active(&self, pov_daa_score: u64) -> bool {
+        pov_daa_score >= self.payload_hf_activation_daa_score
     }
 }

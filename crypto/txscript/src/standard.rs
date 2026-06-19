@@ -80,6 +80,7 @@ pub fn extract_script_pub_key_address(script_public_key: &ScriptPublicKey, prefi
         ScriptClass::PubKey => Ok(Address::new(prefix, Version::PubKey, &script[1..33])),
         ScriptClass::PubKeyECDSA => Ok(Address::new(prefix, Version::PubKeyECDSA, &script[1..34])),
         ScriptClass::ScriptHash => Ok(Address::new(prefix, Version::ScriptHash, &script[2..34])),
+        ScriptClass::LiquidityVault => Err(TxScriptError::PubKeyFormat),
     }
 }
 
@@ -173,7 +174,11 @@ mod tests {
                     ),
                 ),
                 prefix: Prefix::Mainnet,
-                expected_address: Ok("cryptix:qpauqsvk7yf9unexwmxsnmg547mhyga37csh0kj53q6xxgl24ydxjsgzthw5j".try_into().unwrap()),
+                expected_address: Ok(Address::new(
+                    Prefix::Mainnet,
+                    Version::PubKey,
+                    &hex::decode("7bc04196f1125e4f2676cd09ed14afb77223b1f62177da5488346323eaa91a69").unwrap(),
+                )),
             },
             Test {
                 name: "Testnet PubKeyECDSA script and address",
@@ -184,7 +189,11 @@ mod tests {
                     ),
                 ),
                 prefix: Prefix::Testnet,
-                expected_address: Ok("cryptixtest:qxaqrlzlf6wes72en3568khahq66wf27tuhfxn5nytkd8tcep2c0vrse6gdmpks".try_into().unwrap()),
+                expected_address: Ok(Address::new(
+                    Prefix::Testnet,
+                    Version::PubKeyECDSA,
+                    &hex::decode("ba01fc5f4e9d9879599c69a3dafdb835a7255e5f2e934e9322ecd3af190ab0f60e").unwrap(),
+                )),
             },
             Test {
                 name: "Testnet non standard script",

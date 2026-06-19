@@ -70,6 +70,17 @@ impl Flow for RelayTransactionsFlow {
     async fn start(&mut self) -> Result<(), ProtocolError> {
         self.start_impl().await
     }
+
+    async fn on_error(&self, err: &ProtocolError) {
+        let reason = match err {
+            ProtocolError::MisbehavingPeer(reason) => Some(reason.to_owned()),
+            ProtocolError::UnexpectedMessage(_, _) | ProtocolError::ConversionError(_) => Some(err.to_string()),
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            self.ctx.report_misbehaving_peer(&self.router, &reason).await;
+        }
+    }
 }
 
 impl RelayTransactionsFlow {
@@ -110,7 +121,11 @@ impl RelayTransactionsFlow {
             // trace!("Receive an inv message from {} with {} transaction ids", self.router.identity(), inv.len());
 
             if inv.len() > MAX_INV_PER_TX_INV_MSG {
-                return Err(ProtocolError::Other("Number of invs in tx inv message is over the limit"));
+                return Err(ProtocolError::MisbehavingPeer(format!(
+                    "number of invs in tx inv message is over the limit: {} > {}",
+                    inv.len(),
+                    MAX_INV_PER_TX_INV_MSG
+                )));
             }
 
             let session = self.ctx.consensus().unguarded_session();
@@ -135,12 +150,12 @@ impl RelayTransactionsFlow {
         // by another peer
         let transaction_ids = self.ctx.mining_manager().clone().unknown_transactions(transaction_ids).await;
         let mut requests = Vec::new();
-        let snapshot_delta = curr_snapshot - &self.ctx.mining_manager().clone().p2p_tx_count_sample();
+        let now_snapshot = self.ctx.mining_manager().clone().p2p_tx_count_sample();
+        let curr_p2p_tps = p2p_tps_delta(curr_snapshot, &now_snapshot);
 
         // To reduce the P2P TPS to below the threshold, we need to request up to a max of
         // whatever the balances overage. If MAX_TPS_THRESHOLD is 3000 and the current TPS is 4000,
         // then we can only request up to 2000 (MAX - (4000 - 3000)) to average out into the threshold.
-        let curr_p2p_tps = 1000 * snapshot_delta.low_priority_tx_counts / (snapshot_delta.elapsed_time.as_millis().max(1) as u64);
         let overage = if should_throttle && curr_p2p_tps > MAX_TPS_THRESHOLD { curr_p2p_tps - MAX_TPS_THRESHOLD } else { 0 };
 
         let limit = MAX_TPS_THRESHOLD.saturating_sub(overage);
@@ -206,7 +221,7 @@ impl RelayTransactionsFlow {
             let response = self.read_response().await?;
             let transaction_id = response.transaction_id();
             if transaction_id != request.req {
-                return Err(ProtocolError::OtherOwned(format!(
+                return Err(ProtocolError::MisbehavingPeer(format!(
                     "requested transaction id {} but got transaction {}",
                     request.req, transaction_id
                 )));
@@ -215,6 +230,21 @@ impl RelayTransactionsFlow {
                 transactions.push(transaction);
             }
         }
+
+        if let Some(bridge) = self.ctx.hfa_bridge() {
+            if bridge.hfa_enabled() {
+                let before = transactions.len();
+                transactions.retain(|tx| !bridge.has_fast_lock_conflict_for_tx(tx));
+                let dropped = before.saturating_sub(transactions.len());
+                if dropped > 0 {
+                    warn!("Filtered {} incoming P2P txs due to active HFA fast-lock conflict (peer: {})", dropped, self.router);
+                }
+            }
+        }
+        if transactions.is_empty() {
+            return Ok(());
+        }
+
         let insert_results = self
             .ctx
             .mining_manager()
@@ -303,6 +333,11 @@ impl RequestTransactionsFlow {
     }
 }
 
+fn p2p_tps_delta(from_snapshot: &P2pTxCountSample, to_snapshot: &P2pTxCountSample) -> u64 {
+    let snapshot_delta = to_snapshot - from_snapshot;
+    1000 * snapshot_delta.low_priority_tx_counts / (snapshot_delta.elapsed_time.as_millis().max(1) as u64)
+}
+
 /// If in the last 10 seconds we exceeded the TPS threshold, we will throttle tx relay
 fn check_tx_throttling(throttling_state: &mut ThrottlingState, next_snapshot: P2pTxCountSample) {
     let snapshot_delta = &next_snapshot - &throttling_state.curr_snapshot;
@@ -372,5 +407,13 @@ mod tests {
         elapsed_time += 1000;
         check_tx_throttling(&mut throttling_state, create_snapshot(p2p_tx_counts, elapsed_time));
         assert!(!throttling_state.should_throttle);
+    }
+
+    #[test]
+    fn test_p2p_tps_delta_direction() {
+        let from = create_snapshot(1_000, 1_000);
+        let to = create_snapshot(1_600, 1_200);
+        assert_eq!(p2p_tps_delta(&from, &to), 3_000);
+        assert_eq!(p2p_tps_delta(&to, &from), 0);
     }
 }

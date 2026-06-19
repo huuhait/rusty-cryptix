@@ -4,11 +4,11 @@
 
 use crate::imports::{AccountId, AccountKind, AssocPrvKeyDataIds, PrvKeyDataId};
 use base64::DecodeError;
-use downcast::DowncastError;
 use cryptix_bip32::Error as BIP32Error;
 use cryptix_consensus_core::sign::Error as CoreSignError;
 use cryptix_rpc_core::RpcError as CryptixRpcError;
 use cryptix_wrpc_client::error::Error as CryptixWorkflowRpcError;
+use downcast::DowncastError;
 use std::sync::PoisonError;
 use thiserror::Error;
 use wasm_bindgen::JsValue;
@@ -76,7 +76,7 @@ pub enum Error {
     #[error("Wallet is not connected")]
     NotConnected,
 
-    #[error("No network selected. Please use `network (mainnet|testnet-10|testnet-11)` to select a network.")]
+    #[error("No network selected. Please use `network (mainnet|testnet|devnet)` to select a network.")]
     MissingNetworkId,
 
     #[error("RPC client version mismatch, please upgrade you client (needs: v{0}, connected to: v{1})")]
@@ -276,6 +276,15 @@ pub enum Error {
 
     #[error("Transaction exceeds the maximum allowed mass")]
     GeneratorTransactionIsTooHeavy,
+
+    #[error("Payload length {actual} exceeds wallet v1 hard limit {max} bytes")]
+    WalletPayloadTooLarge { actual: usize, max: usize },
+
+    #[error("Unsupported messenger payload version {version}")]
+    WalletUnsupportedMessengerVersion { version: u8 },
+
+    #[error("Invalid messenger payload envelope: {details}")]
+    WalletInvalidMessengerEnvelope { details: String },
 
     #[error("Storage mass exceeds maximum")]
     StorageMassExceedsMaximumTransactionMass { storage_mass: u64 },

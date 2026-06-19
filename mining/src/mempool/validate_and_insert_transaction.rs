@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::mempool::{
+    atomic_slots::{atomic_mempool_debug_summary, is_cat_transaction},
     errors::{RuleError, RuleResult},
     model::{
         pool::Pool,
@@ -14,7 +15,7 @@ use cryptix_consensus_core::{
     constants::UNACCEPTED_DAA_SCORE,
     tx::{MutableTransaction, Transaction, TransactionId, TransactionOutpoint, UtxoEntry},
 };
-use cryptix_core::{debug, info};
+use cryptix_core::{debug, info, warn};
 
 impl Mempool {
     pub(crate) fn pre_validate_and_populate_transaction(
@@ -58,6 +59,25 @@ impl Mempool {
             Ok(_) => {}
             Err(RuleError::RejectMissingOutpoint) => {
                 if orphan == Orphan::Forbidden {
+                    let missing_outpoints = transaction.missing_outpoints().collect::<Vec<_>>();
+                    let first_missing =
+                        missing_outpoints.iter().take(8).map(|outpoint| outpoint.to_string()).collect::<Vec<_>>().join(",");
+                    let message = format!(
+                        "Rejecting transaction as disallowed orphan: tx={} {} priority={:?} rbf_policy={:?} virtual_daa={} inputs={} missing_outpoints={} first_missing=[{}]",
+                        transaction_id,
+                        atomic_mempool_debug_summary(transaction.tx.as_ref()),
+                        priority,
+                        rbf_policy,
+                        consensus.get_virtual_daa_score(),
+                        transaction.tx.as_ref().inputs.len(),
+                        missing_outpoints.len(),
+                        first_missing
+                    );
+                    if is_cat_transaction(transaction.tx.as_ref()) {
+                        debug!("{message}");
+                    } else {
+                        warn!("{message}");
+                    }
                     return Err(RuleError::RejectDisallowedOrphan(transaction_id));
                 }
                 let _ = self.get_replace_by_fee_constraint(&transaction, rbf_policy)?;
@@ -75,6 +95,10 @@ impl Mempool {
         // Check double spends and try to remove them if the RBF policy requires it
         let removed_transaction = self.execute_replace_by_fee(&transaction, rbf_policy)?;
 
+        // Reject exact Atomic slot conflicts before capacity eviction so a same-nonce submission cannot
+        // evict unrelated pending descendants and then fail on insertion.
+        self.transaction_pool.check_atomic_slot_conflicts(&transaction)?;
+
         //
         // Note: there exists a case below where `limit_transaction_count` returns an error signaling that
         //       this tx should be rejected due to mempool size limits (rather than evicting others). However,
@@ -85,7 +109,11 @@ impl Mempool {
 
         // Before adding the transaction, check if there is room in the pool
         let transaction_size = transaction.mempool_estimated_bytes();
-        let txs_to_remove = self.transaction_pool.limit_transaction_count(&transaction, transaction_size)?;
+        let txs_to_remove = if is_cat_transaction(transaction.tx.as_ref()) {
+            self.transaction_pool.limit_transaction_count_preserving_atomic_slot_order(&transaction, transaction_size)?
+        } else {
+            self.transaction_pool.limit_transaction_count(&transaction, transaction_size)?
+        };
         if !txs_to_remove.is_empty() {
             let transaction_pool_len_before = self.transaction_pool.len();
             for x in txs_to_remove.iter() {
@@ -218,6 +246,11 @@ impl Mempool {
         unorphaned_transactions
     }
 
+    pub(crate) fn remove_promoted_orphan(&mut self, transaction_id: &TransactionId) -> RuleResult<()> {
+        self.orphan_pool.remove_orphan(transaction_id, false, TxRemovalReason::Unorphaned, "")?;
+        Ok(())
+    }
+
     fn unorphan_transaction(&mut self, transaction_id: &TransactionId) -> RuleResult<MempoolTransaction> {
         // Rust rewrite:
         // - Instead of adding the validated transaction to mempool transaction pool,
@@ -226,13 +259,11 @@ impl Mempool {
         // - The function no longer validates the transaction in mempool (signatures) nor in context.
         //   This job is delegated to a fn called later in the process (Manager::validate_and_insert_unorphaned_transactions).
 
-        // Remove the transaction identified by transaction_id from the orphan pool.
-        let mut transactions = self.orphan_pool.remove_orphan(transaction_id, false, TxRemovalReason::Unorphaned, "")?;
-
-        // At this point, `transactions` contains exactly one transaction.
-        // The one we just removed from the orphan pool.
-        assert_eq!(transactions.len(), 1, "the list returned by remove_orphan is expected to contain exactly one transaction");
-        let transaction = transactions.pop().unwrap();
+        // Do not remove the transaction from the orphan pool yet. A block body can arrive before the
+        // parent output is actually available in virtual UTXO, especially in a DAG or after a relay gap.
+        // The manager removes the orphan only after full consensus validation and successful mempool insertion.
+        let transaction =
+            self.orphan_pool.get(transaction_id).ok_or(RuleError::RejectMissingOrphanTransaction(*transaction_id))?.clone();
         let rbf_policy = Self::get_orphan_transaction_rbf_policy(transaction.priority);
 
         self.validate_transaction_unacceptance(&transaction.mtx)?;

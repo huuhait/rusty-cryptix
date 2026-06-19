@@ -3,7 +3,7 @@ use crate::{
     core::adaptor::ConnectionInitializer,
     handshake::CryptixdHandshake,
     pb::{self, VersionMessage},
-    IncomingRoute, CryptixdMessagePayloadType, Router,
+    CryptixdMessagePayloadType, IncomingRoute, Router,
 };
 use cryptix_core::{debug, time::unix_now, trace, warn};
 use std::sync::Arc;
@@ -101,6 +101,11 @@ fn build_dummy_version_message() -> VersionMessage {
         disable_relay_tx: false,
         subnetwork_id: None,
         network: "cryptix-mainnet".to_string(),
+        anti_fraud_hashes: Vec::new(),
+        node_pubkey_xonly: Vec::new(),
+        node_pow_nonce: None,
+        node_challenge_nonce: None,
+        pq_ml_kem1024_pubkey: Vec::new(),
     }
 }
 
@@ -134,7 +139,13 @@ impl ConnectionInitializer for EchoFlowInitializer {
         EchoFlow::register(router.clone()).await;
 
         // Send a ready signal
-        handshake.exchange_ready_messages().await?;
+        handshake
+            .exchange_ready_messages(pb::ReadyMessage {
+                node_auth_signature: Vec::new(),
+                pq_ml_kem1024_ciphertext: Vec::new(),
+                pq_handshake_proof: Vec::new(),
+            })
+            .await?;
 
         // Note: at this point receivers for handshake subscriptions
         // are dropped, thus effectively unsubscribing

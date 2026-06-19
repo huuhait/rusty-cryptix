@@ -27,6 +27,1207 @@ macro_rules! try_from {
 
 // ---
 
+// Cryptix Atomic Token + Snapshot bootstrap interfaces
+
+declare! {
+    IRpcTokenContext,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcTokenContext {
+        atBlockHash : HexString;
+        atDaaScore : bigint;
+        stateHash : string;
+        isDegraded : boolean;
+    }
+    "#,
+}
+
+try_from! ( args: RpcTokenContext, IRpcTokenContext, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcTokenAsset,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcTokenAsset {
+        assetId : string;
+        creatorOwnerId : string;
+        tokenVersion : number;
+        mintAuthorityOwnerId : string;
+        decimals : number;
+        supplyMode : number;
+        maxSupply : string;
+        totalSupply : string;
+        name : string;
+        symbol : string;
+        metadataHex : string;
+        createdBlockHash? : HexString;
+        createdDaaScore? : bigint;
+        createdAt? : bigint;
+        platformTag : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcTokenAsset, IRpcTokenAsset, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcTokenEvent,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcTokenEvent {
+        eventId : string;
+        sequence : bigint;
+        acceptingBlockHash : HexString;
+        txid : HexString;
+        eventType : number;
+        applyStatus : number;
+        noopReason : number;
+        ordinal : number;
+        reorgOfEventId? : string;
+        opType? : number;
+        assetId? : string;
+        fromOwnerId? : string;
+        toOwnerId? : string;
+        amount? : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcTokenEvent, IRpcTokenEvent, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcTokenOwnerBalance,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcTokenOwnerBalance {
+        assetId : string;
+        balance : string;
+        asset? : IRpcTokenAsset;
+    }
+    "#,
+}
+
+try_from! ( args: RpcTokenOwnerBalance, IRpcTokenOwnerBalance, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcTokenHolder,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcTokenHolder {
+        ownerId : string;
+        balance : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcTokenHolder, IRpcTokenHolder, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcLiquidityFeeRecipient,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcLiquidityFeeRecipient {
+        ownerId : string;
+        address : string;
+        unclaimedSompi : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcLiquidityFeeRecipient, IRpcLiquidityFeeRecipient, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcLiquidityPoolState,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcLiquidityPoolState {
+        assetId : string;
+        poolNonce : bigint;
+        curveVersion : number;
+        curveMode : number;
+        curveModeLabel : string;
+        individualVirtualCpayReservesSompi : string;
+        individualVirtualTokenMultiplierBps : number;
+        feeBps : number;
+        maxSupply : string;
+        totalSupply : string;
+        circulatingTokenSupply : string;
+        realCpayReservesSompi : string;
+        realTokenReserves : string;
+        virtualCpayReservesSompi : string;
+        virtualTokenReserves : string;
+        maxBuyInSompi : string;
+        maxTokensOut : string;
+        unclaimedFeeTotalSompi : string;
+        vaultValueSompi : string;
+        vaultTxid : HexString;
+        vaultOutputIndex : number;
+        feeRecipients : IRpcLiquidityFeeRecipient[];
+        liquidityLockEnabled : boolean;
+        unlockTargetSompi : string;
+        unlocked : boolean;
+        sellLocked : boolean;
+        liquidityCpaySompi : string;
+        currentSpotPriceSompi : string;
+        circulatingMcapCpaySompi : string;
+        fdvMcapCpaySompi : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcLiquidityPoolState, IRpcLiquidityPoolState, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcLiquidityHolder,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcLiquidityHolder {
+        address? : string;
+        ownerId : string;
+        balance : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcLiquidityHolder, IRpcLiquidityHolder, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcScBootstrapSource,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcScBootstrapSource {
+        snapshotId : string;
+        protocolVersion : number;
+        networkId : string;
+        nodeIdentity : string;
+        atBlockHash : HexString;
+        atDaaScore : bigint;
+        stateHashAtFp : string;
+        windowStartBlockHash : HexString;
+        windowEndBlockHash : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: RpcScBootstrapSource, IRpcScBootstrapSource, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IRpcScManifestSignature,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IRpcScManifestSignature {
+        signerPubkeyHex : string;
+        signatureHex : string;
+    }
+    "#,
+}
+
+try_from! ( args: RpcScManifestSignature, IRpcScManifestSignature, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    ISimulateTokenOpRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface ISimulateTokenOpRequest {
+        payloadHex : string;
+        ownerId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: ISimulateTokenOpRequest, SimulateTokenOpRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    ISimulateTokenOpResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface ISimulateTokenOpResponse {
+        result : string;
+        noopReason? : number;
+        expectedNextNonce : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: SimulateTokenOpResponse, ISimulateTokenOpResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenBalanceRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenBalanceRequest {
+        assetId : string;
+        ownerId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenBalanceRequest, GetTokenBalanceRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenBalanceResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenBalanceResponse {
+        balance : string;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenBalanceResponse, IGetTokenBalanceResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenNonceRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenNonceRequest {
+        ownerId : string;
+        assetId? : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenNonceRequest, GetTokenNonceRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenNonceResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenNonceResponse {
+        expectedNextNonce : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenNonceResponse, IGetTokenNonceResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetOwnerNonceRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetOwnerNonceRequest {
+        ownerId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetOwnerNonceRequest, GetOwnerNonceRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetOwnerNonceResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetOwnerNonceResponse {
+        expectedNextNonce : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetOwnerNonceResponse, IGetOwnerNonceResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenAssetRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenAssetRequest {
+        assetId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenAssetRequest, GetTokenAssetRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenAssetResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenAssetResponse {
+        asset? : IRpcTokenAsset;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenAssetResponse, IGetTokenAssetResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenOpStatusRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenOpStatusRequest {
+        txid : HexString;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenOpStatusRequest, GetTokenOpStatusRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenOpStatusResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenOpStatusResponse {
+        acceptingBlockHash? : HexString;
+        applyStatus? : number;
+        noopReason? : number;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenOpStatusResponse, IGetTokenOpStatusResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenStateHashRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenStateHashRequest {
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenStateHashRequest, GetTokenStateHashRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenStateHashResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenStateHashResponse {
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenStateHashResponse, IGetTokenStateHashResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenSpendabilityRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenSpendabilityRequest {
+        assetId : string;
+        ownerId : string;
+        minDaaForSpend? : bigint;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenSpendabilityRequest, GetTokenSpendabilityRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenSpendabilityResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenSpendabilityResponse {
+        canSpend : boolean;
+        reason? : string;
+        balance : string;
+        expectedNextNonce : bigint;
+        minDaaForSpend : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenSpendabilityResponse, IGetTokenSpendabilityResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenEventsRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenEventsRequest {
+        afterSequence : bigint;
+        limit : number;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenEventsRequest, GetTokenEventsRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenEventsResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenEventsResponse {
+        events : IRpcTokenEvent[];
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenEventsResponse, IGetTokenEventsResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenAssetsRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenAssetsRequest {
+        offset : number;
+        limit : number;
+        query? : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenAssetsRequest, GetTokenAssetsRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenAssetsResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenAssetsResponse {
+        assets : IRpcTokenAsset[];
+        total : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenAssetsResponse, IGetTokenAssetsResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenBalancesByOwnerRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenBalancesByOwnerRequest {
+        ownerId : string;
+        offset : number;
+        limit : number;
+        includeAssets : boolean;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenBalancesByOwnerRequest, GetTokenBalancesByOwnerRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenBalancesByOwnerResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenBalancesByOwnerResponse {
+        balances : IRpcTokenOwnerBalance[];
+        total : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenBalancesByOwnerResponse, IGetTokenBalancesByOwnerResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenHoldersRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenHoldersRequest {
+        assetId : string;
+        offset : number;
+        limit : number;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenHoldersRequest, GetTokenHoldersRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenHoldersResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenHoldersResponse {
+        holders : IRpcTokenHolder[];
+        total : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenHoldersResponse, IGetTokenHoldersResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenOwnerIdByAddressRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenOwnerIdByAddressRequest {
+        address : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenOwnerIdByAddressRequest, GetTokenOwnerIdByAddressRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenOwnerIdByAddressResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenOwnerIdByAddressResponse {
+        ownerId? : string;
+        reason? : string;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenOwnerIdByAddressResponse, IGetTokenOwnerIdByAddressResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityPoolStateRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityPoolStateRequest {
+        assetId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityPoolStateRequest, GetLiquidityPoolStateRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityPoolStateResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityPoolStateResponse {
+        pool? : IRpcLiquidityPoolState;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityPoolStateResponse, IGetLiquidityPoolStateResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityQuoteRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityQuoteRequest {
+        assetId : string;
+        side : number;
+        exactInAmount : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityQuoteRequest, GetLiquidityQuoteRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityQuoteResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityQuoteResponse {
+        side : number;
+        exactInAmount : string;
+        feeAmountSompi : string;
+        netInAmount : string;
+        amountOut : string;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityQuoteResponse, IGetLiquidityQuoteResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityFeeStateRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityFeeStateRequest {
+        assetId : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityFeeStateRequest, GetLiquidityFeeStateRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityFeeStateResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityFeeStateResponse {
+        assetId : string;
+        feeBps : number;
+        totalUnclaimedSompi : string;
+        recipients : IRpcLiquidityFeeRecipient[];
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityFeeStateResponse, IGetLiquidityFeeStateResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityClaimPreviewRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityClaimPreviewRequest {
+        assetId : string;
+        recipientAddress : string;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityClaimPreviewRequest, GetLiquidityClaimPreviewRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityClaimPreviewResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityClaimPreviewResponse {
+        recipientAddress : string;
+        ownerId? : string;
+        claimableAmountSompi : string;
+        minPayoutSompi : string;
+        claimableNow : boolean;
+        reason? : string;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityClaimPreviewResponse, IGetLiquidityClaimPreviewResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetLiquidityHoldersRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityHoldersRequest {
+        assetId : string;
+        offset : number;
+        limit : number;
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetLiquidityHoldersRequest, GetLiquidityHoldersRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetLiquidityHoldersResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetLiquidityHoldersResponse {
+        holders : IRpcLiquidityHolder[];
+        total : bigint;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetLiquidityHoldersResponse, IGetLiquidityHoldersResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetConsensusAtomicStateHashRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetConsensusAtomicStateHashRequest {
+        blockHash : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetConsensusAtomicStateHashRequest, GetConsensusAtomicStateHashRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetConsensusAtomicStateHashResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetConsensusAtomicStateHashResponse {
+        stateHash? : string;
+    }
+    "#,
+}
+
+try_from! ( args: GetConsensusAtomicStateHashResponse, IGetConsensusAtomicStateHashResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IExportTokenSnapshotRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IExportTokenSnapshotRequest {
+        path : string;
+    }
+    "#,
+}
+
+try_from! ( args: IExportTokenSnapshotRequest, ExportTokenSnapshotRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IExportTokenSnapshotResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IExportTokenSnapshotResponse {
+        exported : boolean;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: ExportTokenSnapshotResponse, IExportTokenSnapshotResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IImportTokenSnapshotRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IImportTokenSnapshotRequest {
+        path : string;
+    }
+    "#,
+}
+
+try_from! ( args: IImportTokenSnapshotRequest, ImportTokenSnapshotRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IImportTokenSnapshotResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IImportTokenSnapshotResponse {
+        imported : boolean;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: ImportTokenSnapshotResponse, IImportTokenSnapshotResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetTokenHealthRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenHealthRequest {
+        atBlockHash? : HexString;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTokenHealthRequest, GetTokenHealthRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTokenHealthResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetTokenHealthResponse {
+        isDegraded : boolean;
+        bootstrapInProgress : boolean;
+        liveCorrect : boolean;
+        tokenState : string;
+        lastAppliedBlock? : HexString;
+        lastSequence : bigint;
+        stateHash : string;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetTokenHealthResponse, IGetTokenHealthResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetScBootstrapSourcesRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScBootstrapSourcesRequest { }
+    "#,
+}
+
+try_from! ( args: IGetScBootstrapSourcesRequest, GetScBootstrapSourcesRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetScBootstrapSourcesResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScBootstrapSourcesResponse {
+        sources : IRpcScBootstrapSource[];
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetScBootstrapSourcesResponse, IGetScBootstrapSourcesResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetScSnapshotManifestRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScSnapshotManifestRequest {
+        snapshotId : string;
+    }
+    "#,
+}
+
+try_from! ( args: IGetScSnapshotManifestRequest, GetScSnapshotManifestRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetScSnapshotManifestResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScSnapshotManifestResponse {
+        snapshotId : string;
+        manifestHex : string;
+        manifestSignatures : IRpcScManifestSignature[];
+    }
+    "#,
+}
+
+try_from! ( args: GetScSnapshotManifestResponse, IGetScSnapshotManifestResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetScSnapshotChunkRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScSnapshotChunkRequest {
+        snapshotId : string;
+        chunkIndex : number;
+        chunkSize? : number;
+    }
+    "#,
+}
+
+try_from! ( args: IGetScSnapshotChunkRequest, GetScSnapshotChunkRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetScSnapshotChunkResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScSnapshotChunkResponse {
+        snapshotId : string;
+        chunkIndex : number;
+        totalChunks : number;
+        fileSize : bigint;
+        chunkHex : string;
+    }
+    "#,
+}
+
+try_from! ( args: GetScSnapshotChunkResponse, IGetScSnapshotChunkResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetScReplayWindowChunkRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScReplayWindowChunkRequest {
+        snapshotId : string;
+        chunkIndex : number;
+        chunkSize? : number;
+    }
+    "#,
+}
+
+try_from! ( args: IGetScReplayWindowChunkRequest, GetScReplayWindowChunkRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetScReplayWindowChunkResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScReplayWindowChunkResponse {
+        snapshotId : string;
+        chunkIndex : number;
+        totalChunks : number;
+        fileSize : bigint;
+        chunkHex : string;
+    }
+    "#,
+}
+
+try_from! ( args: GetScReplayWindowChunkResponse, IGetScReplayWindowChunkResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+declare! {
+    IGetScSnapshotHeadRequest,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScSnapshotHeadRequest { }
+    "#,
+}
+
+try_from! ( args: IGetScSnapshotHeadRequest, GetScSnapshotHeadRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetScSnapshotHeadResponse,
+    r#"
+    /**
+     * @category Node RPC
+     */
+    export interface IGetScSnapshotHeadResponse {
+        head? : IRpcScBootstrapSource;
+        context : IRpcTokenContext;
+    }
+    "#,
+}
+
+try_from! ( args: GetScSnapshotHeadResponse, IGetScSnapshotHeadResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
 #[wasm_bindgen(typescript_custom_section)]
 const TS_ACCEPTED_TRANSACTION_IDS: &'static str = r#"
     /**
@@ -796,6 +1997,55 @@ declare! {
 }
 
 try_from! ( args: GetBlocksResponse, IGetBlocksResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
+    IGetTransactionsByIdsRequest,
+    r#"
+    /**
+     * Resolves transactions by id, optionally using block DAA score hints.
+     * 
+     * @category Node RPC
+     */
+    export interface IGetTransactionsByIdsRequest {
+        entries : {
+            transactionId : HexString;
+            blockDaaScore? : bigint;
+        }[];
+        includeOrphanPool? : boolean;
+        filterTransactionPool? : boolean;
+    }
+    "#,
+}
+
+try_from! ( args: IGetTransactionsByIdsRequest, GetTransactionsByIdsRequest, {
+    Ok(from_value(args.into())?)
+});
+
+declare! {
+    IGetTransactionsByIdsResponse,
+    r#"
+    /**
+     * Batched transaction lookup results.
+     * 
+     * @category Node RPC
+     */
+    export interface IGetTransactionsByIdsResponse {
+        entries : {
+            transactionId : HexString;
+            transaction? : ITransaction;
+            blockHash? : HexString;
+            blockDaaScore? : bigint;
+            source : string;
+        }[];
+    }
+    "#,
+}
+
+try_from! ( args: GetTransactionsByIdsResponse, IGetTransactionsByIdsResponse, {
     Ok(to_value(&args)?.into())
 });
 
@@ -1661,6 +2911,9 @@ declare! {
         nextBlockTemplateFeerateMin : number;
         nextBlockTemplateFeerateMedian : number;
         nextBlockTemplateFeerateMax : number;
+        minimumRelayFeerate? : number;
+        payloadOvercapFeerateFloor? : number;
+        effectiveHfaFeerateFloor? : number;
     }
     "#,
 }
@@ -1674,6 +2927,15 @@ try_from!( data: RpcFeeEstimateVerboseExperimentalData, IFeeEstimateVerboseExper
     target.set("nextBlockTemplateFeerateMin", &data.next_block_template_feerate_min.into())?;
     target.set("nextBlockTemplateFeerateMedian", &data.next_block_template_feerate_median.into())?;
     target.set("nextBlockTemplateFeerateMax", &data.next_block_template_feerate_max.into())?;
+    if let Some(minimum_relay_feerate) = data.minimum_relay_feerate {
+        target.set("minimumRelayFeerate", &minimum_relay_feerate.into())?;
+    }
+    if let Some(payload_overcap_feerate_floor) = data.payload_overcap_feerate_floor {
+        target.set("payloadOvercapFeerateFloor", &payload_overcap_feerate_floor.into())?;
+    }
+    if let Some(effective_hfa_feerate_floor) = data.effective_hfa_feerate_floor {
+        target.set("effectiveHfaFeerateFloor", &effective_hfa_feerate_floor.into())?;
+    }
 
     Ok(target)
 });

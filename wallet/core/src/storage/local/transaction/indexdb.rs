@@ -18,6 +18,74 @@ const TRANSACTIONS_STORE_TIMESTAMP_INDEX: &str = "timestamp";
 const TRANSACTIONS_STORE_DATA_INDEX: &str = "data";
 
 const ENCRYPTION_KIND: EncryptionKind = EncryptionKind::XChaCha20Poly1305;
+static TX_INDEXED_DB_DISABLED: AtomicBool = AtomicBool::new(false);
+
+struct AutoCloseDb(Option<IdbDatabase>);
+
+impl AutoCloseDb {
+    fn new(db: IdbDatabase) -> Self {
+        Self(Some(db))
+    }
+
+    fn db(&self) -> &IdbDatabase {
+        self.0.as_ref().expect("AutoCloseDb database is always present before drop")
+    }
+}
+
+impl Drop for AutoCloseDb {
+    fn drop(&mut self) {
+        if let Some(db) = self.0.take() {
+            db.close();
+        }
+    }
+}
+
+async fn delete_transaction_db(db_name: String) -> Result<()> {
+    call_async_no_send!(async move {
+        IdbDatabase::delete_by_name(&db_name)
+            .map_err(|err| Error::Custom(format!("Failed to delete indexdb transaction database {:?}", err)))?
+            .await
+            .map_err(|err| Error::Custom(format!("Failed to delete indexdb transaction database {:?}", err)))?;
+        Ok(())
+    })
+}
+
+async fn open_db_or_disable(inner: Arc<Inner>, db_name: String, operation: &'static str) -> Result<Option<AutoCloseDb>> {
+    if TX_INDEXED_DB_DISABLED.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+
+    match inner.open_db(db_name.clone()).await {
+        Ok(db) => Ok(Some(AutoCloseDb::new(db))),
+        Err(first_err) => {
+            log_error!(
+                "IndexedDB transaction history open failed during {operation} for {db_name}: {:?}; deleting local transaction DB and retrying once",
+                first_err
+            );
+
+            if let Err(delete_err) = delete_transaction_db(db_name.clone()).await {
+                log_error!("IndexedDB transaction history repair delete failed for {db_name}: {:?}", delete_err);
+            }
+
+            match inner.open_db(db_name.clone()).await {
+                Ok(db) => {
+                    log_info!("IndexedDB transaction history recovered after deleting local transaction DB {db_name}");
+                    Ok(Some(AutoCloseDb::new(db)))
+                }
+                Err(second_err) => {
+                    let already_disabled = TX_INDEXED_DB_DISABLED.swap(true, Ordering::SeqCst);
+                    if !already_disabled {
+                        log_error!(
+                            "IndexedDB transaction history disabled for this browser session after repeated open failures for {db_name}: {:?}",
+                            second_err
+                        );
+                    }
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
 
 pub struct Inner {
     known_databases: HashMap<String, HashSet<String>>,
@@ -26,7 +94,7 @@ pub struct Inner {
 impl Inner {
     async fn open_db(&self, db_name: String) -> Result<IdbDatabase> {
         call_async_no_send!(async move {
-            let mut db_req: OpenDbRequest = IdbDatabase::open_u32(&db_name, 2)
+            let mut db_req: OpenDbRequest = IdbDatabase::open_u32(&db_name, 3)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb database {:?}", err)))?;
             let fix_timestamp = Arc::new(Mutex::new(false));
             let fix_timestamp_clone = fix_timestamp.clone();
@@ -34,27 +102,56 @@ impl Inner {
                 let old_version = evt.old_version();
                 if old_version < 1.0 {
                     let object_store = evt.db().create_object_store(TRANSACTIONS_STORE_NAME)?;
-                    let db_index_params = IdbIndexParameters::new();
-                    db_index_params.set_unique(true);
+
+                    let unique_index_params = IdbIndexParameters::new();
+                    unique_index_params.set_unique(true);
                     object_store.create_index_with_params(
                         TRANSACTIONS_STORE_ID_INDEX,
                         &IdbKeyPath::str(TRANSACTIONS_STORE_ID_INDEX),
-                        &db_index_params,
+                        &unique_index_params,
                     )?;
+
+                    let non_unique_index_params = IdbIndexParameters::new();
+                    non_unique_index_params.set_unique(false);
                     object_store.create_index_with_params(
                         TRANSACTIONS_STORE_TIMESTAMP_INDEX,
                         &IdbKeyPath::str(TRANSACTIONS_STORE_TIMESTAMP_INDEX),
-                        &db_index_params,
+                        &non_unique_index_params,
                     )?;
                     object_store.create_index_with_params(
                         TRANSACTIONS_STORE_DATA_INDEX,
                         &IdbKeyPath::str(TRANSACTIONS_STORE_DATA_INDEX),
-                        &db_index_params,
+                        &non_unique_index_params,
                     )?;
 
                 // these changes are not required for new db
                 } else if old_version < 2.0 {
                     *fix_timestamp_clone.lock().unwrap() = true;
+                }
+
+                if old_version >= 1.0 && old_version < 3.0 {
+                    let upgrade_tx = evt.transaction();
+                    let object_store = upgrade_tx.object_store(TRANSACTIONS_STORE_NAME)?;
+                    let index_names = object_store.index_names().collect::<Vec<_>>();
+                    if index_names.iter().any(|name| name == TRANSACTIONS_STORE_TIMESTAMP_INDEX) {
+                        object_store.delete_index(TRANSACTIONS_STORE_TIMESTAMP_INDEX)?;
+                    }
+                    if index_names.iter().any(|name| name == TRANSACTIONS_STORE_DATA_INDEX) {
+                        object_store.delete_index(TRANSACTIONS_STORE_DATA_INDEX)?;
+                    }
+
+                    let non_unique_index_params = IdbIndexParameters::new();
+                    non_unique_index_params.set_unique(false);
+                    object_store.create_index_with_params(
+                        TRANSACTIONS_STORE_TIMESTAMP_INDEX,
+                        &IdbKeyPath::str(TRANSACTIONS_STORE_TIMESTAMP_INDEX),
+                        &non_unique_index_params,
+                    )?;
+                    object_store.create_index_with_params(
+                        TRANSACTIONS_STORE_DATA_INDEX,
+                        &IdbKeyPath::str(TRANSACTIONS_STORE_DATA_INDEX),
+                        &non_unique_index_params,
+                    )?;
                 }
                 // // Check if the object store exists; create it if it doesn't
                 // if !evt.db().object_store_names().any(|n| n == TRANSACTIONS_STORE_NAME) {
@@ -121,6 +218,13 @@ impl Inner {
                         }
                     }
                 }
+                drop(binding);
+                drop(store);
+
+                idb_tx
+                    .await
+                    .into_result()
+                    .map_err(|err| Error::Custom(format!("Failed to finish indexdb timestamp repair transaction {:?}", err)))?;
             }
 
             Ok(db)
@@ -165,7 +269,7 @@ impl TransactionStore {
 
         let inner = self.inner().clone();
 
-        inner.open_db(db_name).await?;
+        let _db = open_db_or_disable(inner, db_name, "register_database").await?;
 
         let mut inner = self.inner();
 
@@ -216,9 +320,12 @@ impl TransactionRecordStore for TransactionStore {
         let inner = inner_guard.lock().unwrap().clone();
 
         call_async_no_send!(async move {
-            let db = inner.open_db(db_name).await?;
+            let Some(db) = open_db_or_disable(inner, db_name, "load_single").await? else {
+                return Err(Error::Custom("Transaction record not found in indexdb".to_string()));
+            };
 
             let idb_tx = db
+                .db()
                 .transaction_on_one_with_mode(TRANSACTIONS_STORE_NAME, IdbTransactionMode::Readonly)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb transaction for reading {:?}", err)))?;
             let store = idb_tx
@@ -234,6 +341,8 @@ impl TransactionRecordStore for TransactionStore {
 
             let transaction_record = transaction_record_from_js_value(&js_value, None)
                 .map_err(|err| Error::Custom(format!("Failed to deserialize transaction record from indexdb {:?}", err)))?;
+            drop(store);
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
 
             Ok(Arc::new(transaction_record))
         })
@@ -255,9 +364,12 @@ impl TransactionRecordStore for TransactionStore {
         let inner = inner_guard.lock().unwrap().clone();
 
         call_async_no_send!(async move {
-            let db = inner.open_db(db_name).await?;
+            let Some(db) = open_db_or_disable(inner, db_name, "load_multiple").await? else {
+                return Ok(vec![]);
+            };
 
             let idb_tx = db
+                .db()
                 .transaction_on_one_with_mode(TRANSACTIONS_STORE_NAME, IdbTransactionMode::Readonly)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb transaction for reading {:?}", err)))?;
             let store = idb_tx
@@ -277,6 +389,8 @@ impl TransactionRecordStore for TransactionStore {
                     .map_err(|err| Error::Custom(format!("Failed to deserialize transaction record from indexdb {:?}", err)))?;
                 transaction_records.push(Arc::new(transaction_record));
             }
+            drop(store);
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
 
             Ok(transaction_records)
         })
@@ -295,8 +409,11 @@ impl TransactionRecordStore for TransactionStore {
         let db_name = self.make_db_name(&binding_str, &network_id_str);
         let inner = self.inner().clone();
         call_async_no_send!(async move {
-            let db = inner.open_db(db_name).await?;
+            let Some(db) = open_db_or_disable(inner, db_name, "load_range").await? else {
+                return Ok(TransactionRangeResult { transactions: vec![], total: 0 });
+            };
             let idb_tx = db
+                .db()
                 .transaction_on_one_with_mode(TRANSACTIONS_STORE_NAME, IdbTransactionMode::Readonly)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb transaction for reading {:?}", err)))?;
             let store = idb_tx
@@ -361,6 +478,9 @@ impl TransactionRecordStore for TransactionStore {
                     }
                 })
                 .collect::<Vec<_>>();
+            drop(binding);
+            drop(store);
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb read transaction {:?}", err)))?;
 
             Ok(TransactionRangeResult { transactions, total: total.into() })
         })
@@ -391,9 +511,12 @@ impl TransactionRecordStore for TransactionStore {
 
         call_async_no_send!(async move {
             for (db_name, items) in &items.into_iter().chunk_by(|item| item.db_name.clone()) {
-                let db = inner.open_db(db_name).await?;
+                let Some(db) = open_db_or_disable(inner.clone(), db_name, "store").await? else {
+                    continue;
+                };
 
                 let idb_tx = db
+                    .db()
                     .transaction_on_one_with_mode(TRANSACTIONS_STORE_NAME, IdbTransactionMode::Readwrite)
                     .map_err(|err| Error::Custom(format!("Failed to open indexdb transaction for writing {:?}", err)))?;
                 let store = idb_tx
@@ -405,6 +528,11 @@ impl TransactionRecordStore for TransactionStore {
                         .put_key_val_owned(item.id.as_str(), &item.js_value)
                         .map_err(|_err| Error::Custom("Failed to put transaction record in indexdb object store".to_string()))?;
                 }
+                drop(store);
+                idb_tx
+                    .await
+                    .into_result()
+                    .map_err(|err| Error::Custom(format!("Failed to finish indexdb write transaction {:?}", err)))?;
             }
 
             Ok(())
@@ -422,9 +550,12 @@ impl TransactionRecordStore for TransactionStore {
         let inner = inner_guard.lock().unwrap().clone();
 
         call_async_no_send!(async move {
-            let db = inner.open_db(db_name).await?;
+            let Some(db) = open_db_or_disable(inner, db_name, "remove").await? else {
+                return Ok(());
+            };
 
             let idb_tx = db
+                .db()
                 .transaction_on_one_with_mode(TRANSACTIONS_STORE_NAME, IdbTransactionMode::Readwrite)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb transaction for writing {:?}", err)))?;
             let store = idb_tx
@@ -436,6 +567,11 @@ impl TransactionRecordStore for TransactionStore {
                     .delete_owned(&id_str)
                     .map_err(|_err| Error::Custom("Failed to delete transaction record from indexdb object store".to_string()))?;
             }
+            drop(store);
+            idb_tx
+                .await
+                .into_result()
+                .map_err(|err| Error::Custom(format!("Failed to finish indexdb delete transaction {:?}", err)))?;
 
             Ok(())
         })
@@ -457,9 +593,12 @@ impl TransactionRecordStore for TransactionStore {
         let inner = inner_guard.lock().unwrap().clone();
 
         call_async_no_send!(async move {
-            let db = inner.open_db(db_name).await?;
+            let Some(db) = open_db_or_disable(inner, db_name, "store_transaction_note").await? else {
+                return Ok(());
+            };
 
             let idb_tx = db
+                .db()
                 .transaction_on_one_with_mode(TRANSACTIONS_STORE_NAME, IdbTransactionMode::Readwrite)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb transaction for writing {:?}", err)))?;
             let store = idb_tx
@@ -483,6 +622,8 @@ impl TransactionRecordStore for TransactionStore {
             store
                 .put_key_val_owned(id_str.as_str(), &new_js_value)
                 .map_err(|_err| Error::Custom("Failed to update transaction record in indexdb object store".to_string()))?;
+            drop(store);
+            idb_tx.await.into_result().map_err(|err| Error::Custom(format!("Failed to finish indexdb note transaction {:?}", err)))?;
 
             Ok(())
         })
@@ -504,9 +645,12 @@ impl TransactionRecordStore for TransactionStore {
         let inner = inner_guard.lock().unwrap().clone();
 
         call_async_no_send!(async move {
-            let db = inner.open_db(db_name).await?;
+            let Some(db) = open_db_or_disable(inner, db_name, "store_transaction_metadata").await? else {
+                return Ok(());
+            };
 
             let idb_tx = db
+                .db()
                 .transaction_on_one_with_mode(TRANSACTIONS_STORE_NAME, IdbTransactionMode::Readwrite)
                 .map_err(|err| Error::Custom(format!("Failed to open indexdb transaction for writing {:?}", err)))?;
             let store = idb_tx
@@ -530,6 +674,11 @@ impl TransactionRecordStore for TransactionStore {
             store
                 .put_key_val_owned(id_str.as_str(), &new_js_value)
                 .map_err(|_err| Error::Custom("Failed to update transaction record in indexdb object store".to_string()))?;
+            drop(store);
+            idb_tx
+                .await
+                .into_result()
+                .map_err(|err| Error::Custom(format!("Failed to finish indexdb metadata transaction {:?}", err)))?;
 
             Ok(())
         })

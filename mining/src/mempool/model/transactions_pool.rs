@@ -1,6 +1,7 @@
 use crate::{
     feerate::{FeerateEstimator, FeerateEstimatorArgs},
     mempool::{
+        atomic_slots::{atomic_mempool_slots, is_cat_transaction, AtomicMempoolSlot},
         config::Config,
         errors::{RuleError, RuleResult},
         model::{
@@ -18,9 +19,9 @@ use cryptix_consensus_core::{
     block::TemplateTransactionSelector,
     tx::{MutableTransaction, TransactionId, TransactionOutpoint},
 };
-use cryptix_core::{debug, time::unix_now, trace};
+use cryptix_core::{debug, trace};
 use std::{
-    collections::{hash_map::Keys, hash_set::Iter},
+    collections::{hash_map::Keys, hash_set::Iter, HashMap},
     iter::once,
     sync::Arc,
 };
@@ -64,13 +65,16 @@ pub(crate) struct TransactionsPool {
     /// Transactions dependencies formed by outputs present in pool - successor relations.
     chained_transactions: TransactionsEdges,
 
+    /// First-seen CAT slots currently occupied in the mempool.
+    atomic_slot_owners: HashMap<AtomicMempoolSlot, TransactionId>,
+
+    /// Reverse mapping for removing CAT slots with their owning transaction.
+    atomic_slots_by_tx: HashMap<TransactionId, Vec<AtomicMempoolSlot>>,
+
     /// Transactions with no parents in the mempool -- ready to be inserted into a block template
     ready_transactions: Frontier,
 
     last_expire_scan_daa_score: u64,
-
-    /// last expire scan time in milliseconds
-    last_expire_scan_time: u64,
 
     /// Sum of estimated size for all transactions currently held in `all_transactions`
     estimated_size: usize,
@@ -86,9 +90,10 @@ impl TransactionsPool {
             all_transactions: MempoolTransactionCollection::default(),
             parent_transactions: TransactionsEdges::default(),
             chained_transactions: TransactionsEdges::default(),
+            atomic_slot_owners: HashMap::new(),
+            atomic_slots_by_tx: HashMap::new(),
             ready_transactions: Default::default(),
             last_expire_scan_daa_score: 0,
-            last_expire_scan_time: unix_now(),
             utxo_set: MempoolUtxoSet::new(),
             estimated_size: 0,
         }
@@ -115,6 +120,9 @@ impl TransactionsPool {
         assert!(!self.all_transactions.contains_key(&id), "transaction {id} to be added already exists in the transactions pool");
         assert!(transaction.mtx.is_fully_populated(), "transaction {id} to be added in the transactions pool is not fully populated");
 
+        let atomic_slots = atomic_mempool_slots(&transaction.mtx)?;
+        self.check_atomic_slot_conflicts_for_slots(id, &atomic_slots)?;
+
         // Create the bijective parent/chained relations.
         // This concerns only the parents of the added transaction.
         // The transactions chained to the added transaction cannot be stored
@@ -131,13 +139,23 @@ impl TransactionsPool {
 
         self.utxo_set.add_transaction(&transaction.mtx);
         self.estimated_size += transaction_size;
+        for slot in atomic_slots.iter() {
+            self.atomic_slot_owners.insert(slot.clone(), id);
+        }
+        if !atomic_slots.is_empty() {
+            self.atomic_slots_by_tx.insert(id, atomic_slots);
+        }
         self.all_transactions.insert(id, transaction);
         trace!("Added transaction {}", id);
         Ok(())
     }
 
     /// Fully removes the transaction from all relational sets, as well as from the UTXO set
-    pub(crate) fn remove_transaction(&mut self, transaction_id: &TransactionId) -> RuleResult<MempoolTransaction> {
+    pub(crate) fn remove_transaction(
+        &mut self,
+        transaction_id: &TransactionId,
+        unblocked_at_daa_score: Option<u64>,
+    ) -> RuleResult<MempoolTransaction> {
         // Remove all bijective parent/chained relations
         if let Some(parents) = self.parent_transactions.get(transaction_id) {
             for parent in parents.iter() {
@@ -151,8 +169,14 @@ impl TransactionsPool {
                 if let Some(parents) = self.parent_transactions.get_mut(chain) {
                     parents.remove(transaction_id);
                     if parents.is_empty() {
-                        let tx = self.all_transactions.get(chain).unwrap();
-                        self.ready_transactions.insert(tx.into());
+                        let ready_key = {
+                            let tx = self.all_transactions.get_mut(chain).unwrap();
+                            if let Some(daa_score) = unblocked_at_daa_score {
+                                tx.ready_at_daa_score = daa_score;
+                            }
+                            (&*tx).into()
+                        };
+                        self.ready_transactions.insert(ready_key);
                     }
                 }
             }
@@ -162,6 +186,13 @@ impl TransactionsPool {
 
         // Remove the transaction itself
         let removed_tx = self.all_transactions.remove(transaction_id).ok_or(RuleError::RejectMissingTransaction(*transaction_id))?;
+        if let Some(slots) = self.atomic_slots_by_tx.remove(transaction_id) {
+            for slot in slots {
+                if self.atomic_slot_owners.get(&slot).is_some_and(|owner| owner == transaction_id) {
+                    self.atomic_slot_owners.remove(&slot);
+                }
+            }
+        }
 
         self.ready_transactions.remove(&(&removed_tx).into());
 
@@ -194,6 +225,28 @@ impl TransactionsPool {
         }
     }
 
+    pub(crate) fn all_atomic_transaction_ids(&self) -> Vec<TransactionId> {
+        self.all_transactions.values().filter_map(|tx| is_cat_transaction(tx.mtx.tx.as_ref()).then_some(tx.id())).collect()
+    }
+
+    pub(crate) fn atomic_slot_owner(&self, slot: &AtomicMempoolSlot) -> Option<&TransactionId> {
+        self.atomic_slot_owners.get(slot)
+    }
+
+    pub(crate) fn check_atomic_slot_conflicts(&self, transaction: &MutableTransaction) -> RuleResult<()> {
+        let slots = atomic_mempool_slots(transaction)?;
+        self.check_atomic_slot_conflicts_for_slots(transaction.id(), &slots)
+    }
+
+    fn check_atomic_slot_conflicts_for_slots(&self, transaction_id: TransactionId, slots: &[AtomicMempoolSlot]) -> RuleResult<()> {
+        for slot in slots {
+            if let Some(existing_id) = self.atomic_slot_owners.get(slot) {
+                return Err(RuleError::RejectAtomicSlotConflict(transaction_id, *existing_id, slot.to_string()));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn ready_transaction_count(&self) -> usize {
         self.ready_transactions.len()
     }
@@ -204,7 +257,12 @@ impl TransactionsPool {
 
     /// Dynamically builds a transaction selector based on the specific state of the ready transactions frontier
     pub(crate) fn build_selector(&self) -> Box<dyn TemplateTransactionSelector> {
-        self.ready_transactions.build_selector(&Policy::new(self.config.maximum_mass_per_block))
+        self.ready_transactions.build_selector(&Policy::new_with_payload_policy(
+            self.config.maximum_mass_per_block,
+            self.config.payload_soft_cap_per_block_bytes,
+            self.config.payload_overcap_feerate_multiplier,
+            self.config.minimum_feerate(),
+        ))
     }
 
     /// Builds a feerate estimator based on internal state of the ready transactions frontier
@@ -224,6 +282,32 @@ impl TransactionsPool {
         transaction: &MutableTransaction,
         transaction_size: usize,
     ) -> RuleResult<Vec<TransactionId>> {
+        self.limit_transaction_count_by(transaction, transaction_size, |_| Ok(true))
+    }
+
+    pub(crate) fn limit_transaction_count_preserving_atomic_slot_order(
+        &self,
+        transaction: &MutableTransaction,
+        transaction_size: usize,
+    ) -> RuleResult<Vec<TransactionId>> {
+        let incoming_slots = atomic_mempool_slots(transaction)?;
+        self.limit_transaction_count_by(transaction, transaction_size, |tx| {
+            let existing_slots = atomic_mempool_slots(&tx.mtx)?;
+            // Do not make room by removing a first-seen same/earlier Atomic slot that the incoming CAT
+            // transaction either conflicts with directly or may have validated against as pending context.
+            Ok(!atomic_slots_block_capacity_eviction(&incoming_slots, &existing_slots))
+        })
+    }
+
+    fn limit_transaction_count_by<F>(
+        &self,
+        transaction: &MutableTransaction,
+        transaction_size: usize,
+        can_remove: F,
+    ) -> RuleResult<Vec<TransactionId>>
+    where
+        F: Fn(&MempoolTransaction) -> RuleResult<bool>,
+    {
         // No eviction needed -- return
         if self.len() < self.config.maximum_transaction_count
             && self.estimated_size + transaction_size <= self.config.mempool_size_limit
@@ -235,12 +319,11 @@ impl TransactionsPool {
         let feerate_threshold = transaction.calculated_feerate().unwrap();
         let mut txs_to_remove = Vec::with_capacity(1); // Normally we expect a single removal
         let mut selection_overall_size = 0;
-        for tx in self
-            .ready_transactions
-            .ascending_iter()
-            .map(|tx| self.all_transactions.get(&tx.id()).unwrap())
-            .filter(|mtx| mtx.priority == Priority::Low)
-        {
+        for tx in self.ready_transactions.ascending_iter().map(|tx| self.all_transactions.get(&tx.id()).unwrap()) {
+            if tx.priority != Priority::Low || !can_remove(tx)? {
+                continue;
+            }
+
             // TODO (optimization): inline the `has_parent_in_set` check within the redeemer traversal and exit early if possible
             let redeemers = self.get_redeemer_ids_in_pool(&tx.id()).into_iter().chain(once(tx.id())).collect::<TransactionIdSet>();
             if transaction.has_parent_in_set(&redeemers) {
@@ -313,23 +396,32 @@ impl TransactionsPool {
     }
 
     pub(crate) fn collect_expired_low_priority_transactions(&mut self, virtual_daa_score: u64) -> Vec<TransactionId> {
-        let now = unix_now();
-        if virtual_daa_score < self.last_expire_scan_daa_score + self.config.transaction_expire_scan_interval_daa_score
-            || now < self.last_expire_scan_time + self.config.transaction_expire_scan_interval_milliseconds
-        {
+        if virtual_daa_score < self.last_expire_scan_daa_score + self.config.transaction_expire_scan_interval_daa_score {
             return vec![];
         }
 
         self.last_expire_scan_daa_score = virtual_daa_score;
-        self.last_expire_scan_time = now;
 
-        // Never expire high priority transactions
-        // Remove all transactions whose added_at_daa_score is older then transaction_expire_interval_daa_score
+        // High-priority non-CAT transactions do not expire. CAT transactions have a bounded ready/frontier
+        // lifetime and a longer total lifetime so token/pool slots cannot be pinned indefinitely.
         self.all_transactions
             .values()
             .filter_map(|x| {
-                if (x.priority == Priority::Low)
-                    && virtual_daa_score > x.added_at_daa_score + self.config.transaction_expire_interval_daa_score
+                let is_cat = is_cat_transaction(x.mtx.tx.as_ref());
+                if is_cat {
+                    let has_mempool_parents = self.parent_transactions.get(&x.id()).is_some_and(|parents| !parents.is_empty());
+                    let total_expired = virtual_daa_score
+                        > x.added_at_daa_score.saturating_add(self.config.atomic_transaction_total_expire_interval_daa_score);
+                    let frontier_expired = !has_mempool_parents
+                        && virtual_daa_score
+                            > x.ready_at_daa_score.saturating_add(self.config.atomic_transaction_expire_interval_daa_score);
+                    if total_expired || frontier_expired {
+                        Some(x.id())
+                    } else {
+                        None
+                    }
+                } else if x.priority == Priority::Low
+                    && virtual_daa_score > x.added_at_daa_score.saturating_add(self.config.transaction_expire_interval_daa_score)
                 {
                     Some(x.id())
                 } else {
@@ -342,6 +434,33 @@ impl TransactionsPool {
 
 type IterTxId<'a> = Iter<'a, TransactionId>;
 type KeysTxId<'a> = Keys<'a, TransactionId, MempoolTransaction>;
+
+fn atomic_slots_block_capacity_eviction(incoming: &[AtomicMempoolSlot], existing: &[AtomicMempoolSlot]) -> bool {
+    incoming
+        .iter()
+        .any(|incoming_slot| existing.iter().any(|existing_slot| atomic_slot_blocks_capacity_eviction(incoming_slot, existing_slot)))
+}
+
+fn atomic_slot_blocks_capacity_eviction(incoming: &AtomicMempoolSlot, existing: &AtomicMempoolSlot) -> bool {
+    match (incoming, existing) {
+        (
+            AtomicMempoolSlot::Nonce {
+                owner_id: incoming_owner,
+                scope_kind: incoming_scope_kind,
+                scope_id: incoming_scope_id,
+                nonce: incoming_nonce,
+            },
+            AtomicMempoolSlot::Nonce { owner_id, scope_kind, scope_id, nonce },
+        ) => {
+            owner_id == incoming_owner && scope_kind == incoming_scope_kind && scope_id == incoming_scope_id && nonce <= incoming_nonce
+        }
+        (
+            AtomicMempoolSlot::LiquidityPool { asset_id: incoming_asset_id, pool_nonce: incoming_pool_nonce },
+            AtomicMempoolSlot::LiquidityPool { asset_id, pool_nonce },
+        ) => asset_id == incoming_asset_id && pool_nonce <= incoming_pool_nonce,
+        _ => false,
+    }
+}
 
 impl<'a> TopologicalIndex<'a, KeysTxId<'a>, IterTxId<'a>, TransactionId> for TransactionsPool {
     fn topology_nodes(&'a self) -> KeysTxId<'a> {

@@ -1,13 +1,85 @@
+# Cryptix Rust Node
 
-<h1>Cryptix On Rust</h1>
+This repository contains the Rust implementation of the Cryptix full node and related libraries.
+The goal is simple: a production-ready node that stays compatible with the existing Cryptix network and can replace the legacy Golang daemon in day-to-day operation.
+If you prefer the previous implementation, the <a href="https://github.com/cryptix-network/cryptixd">Golang node</a> remains available as an alternative.
 
-Welcome to the Rust-based implementation of the Cryptix full-node and its ancillary libraries. The contained node release serves as a drop-in replacement to the established <a href="https://github.com/cryptix-network/cryptixd">Golang node</a> and to date is the recommended node software for the Cryptix network, introducing developers to the possibilities of Rust in the Cryptix network's context.
+If you run infrastructure, build tooling, or contribute code, this repo is the main place to work on the Rust node stack.
+Feedback and contributions are always welcome.
 
-We invite developers and blockchain enthusiasts to collaborate, test, and optimize our Rust implementation. Each line of code here is an opportunity to contribute to the open-source blockchain movement, shaping a platform designed for scalability and speed without compromising on security and decentralization.
+## Node Startup Arguments (`cryptixd`)
 
-Your feedback, contributions, and issue reports will be integral to evolving this codebase and continuing its maturity as a reliable node in the Cryptix network.
 
-The default branch of this repository is `master` and new contributions are constantly merged into it. For a stable branch corresponding to the latest stable release please pull and compile the `stable` branch. 
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `-C`, `--configfile=<CONFIG_FILE>` | path | none | Load settings from a TOML config file. |
+| `-b`, `--appdir=<DATA_DIR>` | path | none | Base data directory. |
+| `--logdir=<LOG_DIR>` | path | none | Log file directory. |
+| `--nologfiles` | switch | `false` | Disable logging to files. |
+| `-t`, `--async-threads=<N>` | integer | CPU core count | Number of async runtime threads. |
+| `-d`, `--loglevel=<LEVEL>` | string | `info` | Global/per-subsystem log level. |
+| `--rpclisten[=IP[:PORT]]` | address | auto | gRPC listen address (defaults to network-specific port). |
+| `--rpclisten-borsh[=IP[:PORT]]` | address | auto | wRPC Borsh listen address (defaults to network-specific port). |
+| `--rpclisten-json[=IP[:PORT]]` | address | auto | wRPC JSON listen address (defaults to network-specific port). |
+| `--unsaferpc` | switch | `false` | Enable RPC commands that mutate node state. |
+| `--rpc-diagnostics` | switch | `false` | Enable opt-in RPC diagnostics logs: endpoint request-volume summaries every 5 seconds and slow request snapshots at `>=500ms`. Useful for debugging WebWallet/wRPC lag; disabled by default. |
+| `--rpc-block-scan-cache` | switch | `false` | Enable an opt-in RAM cache for recent `GetHeaders`/`GetBlock`/`GetBlocks` RPC scan data used by wallet sync/resync, including selected-parent links for fast descending header scans. When enabled, the node waits until it is nearly synced and Atomic is ready after the token HF, warms the newest selected-chain data, serves the cache only after warmup completes, logs warmup/activity progress, and refreshes it while running. It is read-only and falls back to normal storage on cache misses. |
+| `--rpc-block-scan-cache-days=<DAYS>` | float | `1.0` | Recent-data window for `--rpc-block-scan-cache`; values are clamped to `0.1..7.0` days. |
+| `--rpc-block-scan-cache-max-mb=<MB>` | integer | `1024` | Approximate RAM cap for `--rpc-block-scan-cache`. When full, old entries are evicted and uncached data is read normally. |
+| `--connect=<IP[:PORT]>` | address (repeatable) | empty | Connect only to specified peers. |
+| `--addpeer=<IP[:PORT]>` | address (repeatable) | empty | Add peers to connect to on startup. |
+| `--listen=<IP[:PORT]>` | address | auto | P2P listen address (defaults to network-specific port). |
+| `--outpeers=<N>` | integer | `8` | Target outbound peer count. |
+| `--maxinpeers=<N>` | integer | `128` | Maximum inbound peer count. |
+| `--rpcmaxclients=<N>` | integer | `128` | Maximum standard RPC clients. |
+| `--reset-db` | switch | `false` | Reset local database before startup. |
+| `--startup-repair-plan=<JSON>` | path | none | Apply a JSON startup database repair plan before networking starts. |
+| `--enable-unsynced-mining` | switch | `false` | Accept RPC block submits while unsynced (testing-oriented). |
+| `--enable-mainnet-mining` | switch | `true` (deprecated flag) | Backward-compatible flag; mainnet mining is enabled by default. |
+| `--utxoindex` | switch | `true` | Enable UTXO index. |
+| `--no-utxoindex` | switch | `false` | Disable UTXO index for low-resource nodes. |
+| `--atomic-bootstrap-peer=<IP[:PORT]>` | address (repeatable) | empty | Optional gRPC Atomic snapshot endpoint. Normal P2P sync, local Atomic replay, and local selected-chain backfill do not require this. |
+| `--no-atomic-seed` | switch | `false` | Disable only Atomic seed sources for Atomic sync/bootstrap/health quorum. Normal P2P DNS seeding stays enabled. Alias: `--atomic-bootstrap-no-seed`. |
+| `--atomic-bootstrap-allow-peer-fallback` | switch | `false` | On mainnet, allow peer-only Atomic quorum fallback when Atomic seed sources are disabled or unreachable. This does not disable seeds by itself; use `--no-atomic-seed` when you intentionally want Atomic peer-only mode while keeping normal P2P DNS seeding. |
+| `--atomic-bootstrap-peer-quorum-min-sources=<N>` | integer | seed-confirmed: `2`, peer-only fallback: `3` | Override the minimum independent non-seed/P2P sources required for Atomic quorum. On mainnet the default seed-confirmed policy requires `>=1` seed source plus `>=2` independent non-seed sources with the same Atomic state/snapshot hash; peer-only fallback defaults to `>=3` independent non-seed/P2P sources with majority. Alias: `--atomic-bootstrap-peer-quorum=<N>`. Values below `3` are intended only for private/testing networks. |
+| `--disable-atomic-health-audit` | switch | `false` | Disable the periodic Atomic P2P healthy-state/token audit. Alias: `--atomic-health-audit-disable`. |
+| `--atomic-health-audit-interval-minutes=<MINUTES>` | integer | `3` | Set the periodic Atomic P2P healthy-state/token audit interval. The audit uses a DAA-rendezvous anchor behind the local selected-parent tip so peers can be checked against a stable block hash/DAA pair. |
+| `--max-tracked-addresses=<N>` | integer | `0` | Preallocated max addresses for UTXO change tracking. |
+| `--testnet` | switch | `false` | Use testnet. |
+| `--netsuffix=<N>` | integer | none | Optional testnet suffix (for dedicated parallel testnet variants). |
+| `--devnet` | switch | `false` | Use devnet. |
+| `--simnet` | switch | `false` | Use simnet. |
+| `--archival` | switch | `false` | Run in archival mode (increased disk usage). |
+| `--sanity` | switch | `false` | Enable additional sanity checks. |
+| `--yes` | switch | `false` | Auto-confirm interactive prompts. |
+| `--uacomment=<TEXT>` | string (repeatable) | empty | Append user-agent comments. |
+| `--externalip=<IP[:PORT]>` | address | none | Advertised external P2P address. |
+| `--perf-metrics` | switch | `false` | Enable runtime perf metrics collection. |
+| `--perf-metrics-interval-sec=<SECONDS>` | integer | `10` | Perf metrics collection interval. |
+| `--tx-relay-broadcast-interval-ms=<MS>` | integer | `250` | Interval in milliseconds for batching mempool transaction INV broadcasts. |
+| `--datacenter` | switch | `false` | Enable datacenter peer filter mode (skip private/unroutable peer addresses in address manager). |
+| `--hfa` | switch | `false` | Enable HFA fast rail for this process. |
+| `--hfa-cpu=<RATIO>` | float | `0.7` | HFA CPU low-water ratio (`0.0 < value <= 1.0`). |
+| `--hfa-drift-ms=<MS>` | integer | `5000` | HFA clock drift window in milliseconds for fast-intent admission. |
+| `--hfa-microblock-interval-ms-normal=<MS>` | integer | `50` | HFA microblock interval in milliseconds while in normal mode. |
+| `--no-hfa` | switch | `false` | Force-disable HFA (overrides config). |
+| `--autoban` | switch | `false` | Enable automatic banning of repeatedly misbehaving peers. |
+| `--no-autoban` | switch | `false` | Force-disable automatic banning of repeatedly misbehaving peers (overrides config). |
+| `--banserver` | switch | `true` | Enable signed AntiFraud list synchronization from the primary seed endpoint. |
+| `--no-banserver`, `--antifraud-no-seed` | switch | `false` | Disable the AntiFraud seed endpoint and use peer-majority snapshots only (overrides config). |
+| `--disable-upnp` | switch | `false` | Disable UPnP. |
+| `--nodnsseed` | switch | `false` | Disable normal DNS peer seeding. Because the same DNS seed list is also used as Atomic seed-source candidates, this also disables Atomic seed sources. If you only want to disable Atomic seed sources while keeping normal P2P DNS seeding, use `--no-atomic-seed` instead. |
+| `--nogrpc` | switch | `false` | Disable gRPC server. |
+| `--ram-scale=<FACTOR>` | float | `1.0` | Scale memory-bound internal limits. |
+| `--num-prealloc-utxos=<N>` | integer | none | Devnet preallocation count (`devnet-prealloc` feature only). |
+| `--prealloc-address=<ADDR>` | string | none | Devnet preallocation target address (`devnet-prealloc` feature only). |
+| `--prealloc-amount=<SOMPI>` | integer | `10000000000` | Devnet preallocation amount per UTXO (`devnet-prealloc` feature only). |
+
+RPC diagnostics example:
+
+```bash
+cryptixd --utxoindex --rpclisten-borsh=default --rpc-diagnostics
+```
 
 ## Installation
   <details>
@@ -225,8 +297,8 @@ The framework is compatible with all major desktop and mobile browsers.
 
   ```bash
   cargo run --release --bin cryptixd
-  # or with UTXO-index enabled (needed when using wallets)
-  cargo run --release --bin cryptixd -- --utxoindex
+  # opt out of the default UTXO index on low-resource nodes
+  cargo run --release --bin cryptixd -- --no-utxoindex
   ```
   **Start a testnet node**
 
@@ -234,9 +306,8 @@ The framework is compatible with all major desktop and mobile browsers.
 cargo run --release --bin cryptixd -- --testnet
   ```
 
-  **Testnet 11**
+  Optionally, `--netsuffix=<N>` can be used to run an isolated suffixed testnet id when needed.
 
-  For participation in the 10BPS test network (TN11), see the following detailed [guide](docs/testnet11.md).
 
 <details>
 
@@ -257,18 +328,25 @@ cargo run --release --bin cryptixd -- -C /path/to/configfile.toml
   For example:
   ```
 testnet = true
-utxoindex = false
+utxoindex = true
 disable-upnp = true
 perf-metrics = true
+tx-relay-broadcast-interval-ms = 250
+rpc-block-scan-cache = true
+rpc-block-scan-cache-days = 1.0
+rpc-block-scan-cache-max-mb = 1024
 appdir = "some-dir"
-netsuffix = 11
+hfa-microblock-interval-ms-normal = 50
+autoban = false
+banserver = true
 addpeer = ["10.0.0.1", "1.2.3.4"]
   ```
- Pass the `--help` flag to view all possible arguments
+Pass the `--help` flag to view all possible arguments
 
   ```bash
 cargo run --release --bin cryptixd -- --help
   ```
+
 </details>
 
 <details>

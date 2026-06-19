@@ -23,7 +23,9 @@ use crate::storage::account::AccountSettings;
 use crate::storage::AccountMetadata;
 use crate::storage::{PrvKeyData, PrvKeyDataId};
 use crate::tx::PaymentOutput;
-use crate::tx::{Fees, Generator, GeneratorSettings, GeneratorSummary, PaymentDestination, PendingTransaction, Signer};
+use crate::tx::{
+    FastSubmitOptions, Fees, Generator, GeneratorSettings, GeneratorSummary, PaymentDestination, PendingTransaction, Signer,
+};
 use crate::utxo::balance::{AtomicBalance, BalanceStrings};
 use crate::utxo::UtxoContextBinding;
 use cryptix_bip32::{ChildNumber, ExtendedPrivateKey, PrivateKey};
@@ -37,6 +39,15 @@ pub type GenerationNotifier = Arc<dyn Fn(&PendingTransaction) + Send + Sync>;
 /// Scan notification callback type used by [`DerivationCapableAccount::derivation_scan`].
 /// Provides derivation discovery scan progress information.
 pub type ScanNotifier = Arc<dyn Fn(usize, usize, u64, Option<TransactionId>) + Send + Sync>;
+
+#[derive(Clone, Debug, Default)]
+pub struct AccountSendFastSummary {
+    pub requested: bool,
+    pub used: bool,
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    pub basechain_submitted: bool,
+}
 
 /// General-purpose wrapper around [`AccountSettings`] (managed by [`Inner`]).
 pub struct Context {
@@ -231,14 +242,18 @@ pub trait Account: AnySync + Send + Sync + 'static {
                         &balance,
                         current_daa_score,
                         window_size,
+                        None,
                         Some(extent),
+                        None,
                     ),
                     Scan::new_with_address_manager(
                         derivation.change_address_manager(),
                         &balance,
                         current_daa_score,
                         window_size,
+                        None,
                         Some(extent),
+                        None,
                     ),
                 ];
 
@@ -259,6 +274,115 @@ pub trait Account: AnySync + Send + Sync + 'static {
         self.utxo_context().update_balance().await?;
 
         Ok(())
+    }
+
+    async fn scan_smart(
+        self: Arc<Self>,
+        window_size: Option<usize>,
+        monitor_window_size: Option<usize>,
+        extent: Option<u32>,
+        start_index: Option<u32>,
+        relative_to_current_index: bool,
+        known_addresses: Option<Vec<Address>>,
+    ) -> Result<Vec<SmartScanSummary>> {
+        self.utxo_context().clear().await?;
+
+        let current_daa_score = self.wallet().current_daa_score().ok_or(Error::NotConnected)?;
+        let balance = Arc::new(AtomicBalance::default());
+        let mut summaries = Vec::new();
+
+        match self.clone().as_derivation_capable() {
+            Ok(account) => {
+                let derivation = account.derivation();
+
+                let receive_manager = derivation.receive_address_manager();
+                let change_manager = derivation.change_address_manager();
+                let receive_index = receive_manager.index();
+                let change_index = change_manager.index();
+                let receive_start_index = if relative_to_current_index { Some(receive_index) } else { start_index };
+                let change_start_index = if relative_to_current_index { Some(change_index) } else { start_index };
+                let receive_extent = match extent {
+                    Some(depth) if relative_to_current_index => ScanExtent::Depth(receive_index.saturating_add(depth)),
+                    Some(depth) => ScanExtent::Depth(depth),
+                    None => ScanExtent::EmptyWindow,
+                };
+                let change_extent = match extent {
+                    Some(depth) if relative_to_current_index => ScanExtent::Depth(change_index.saturating_add(depth)),
+                    Some(depth) => ScanExtent::Depth(depth),
+                    None => ScanExtent::EmptyWindow,
+                };
+
+                let scans = [
+                    Scan::new_with_address_manager(
+                        receive_manager.clone(),
+                        &balance,
+                        current_daa_score,
+                        window_size,
+                        monitor_window_size,
+                        Some(receive_extent),
+                        receive_start_index,
+                    ),
+                    Scan::new_with_address_manager(
+                        change_manager.clone(),
+                        &balance,
+                        current_daa_score,
+                        window_size,
+                        monitor_window_size,
+                        Some(change_extent),
+                        change_start_index,
+                    ),
+                ];
+
+                let futures = scans.iter().map(|scan| scan.scan_smart(self.utxo_context())).collect::<Vec<_>>();
+                summaries = join_all(futures).await.into_iter().collect::<Result<Vec<_>>>()?;
+
+                let known_address_set_all = known_addresses.unwrap_or_default().into_iter().collect::<HashSet<_>>();
+                if !known_address_set_all.is_empty() {
+                    let fallback_window = window_size.unwrap_or(crate::utxo::scan::DEFAULT_WINDOW_SIZE) as u32;
+                    let receive_known_depth = match receive_extent {
+                        ScanExtent::Depth(depth) => depth,
+                        ScanExtent::EmptyWindow => receive_index.saturating_add(fallback_window),
+                    };
+                    let change_known_depth = match change_extent {
+                        ScanExtent::Depth(depth) => depth,
+                        ScanExtent::EmptyWindow => change_index.saturating_add(fallback_window),
+                    };
+                    let known_search_depth = receive_known_depth.max(change_known_depth);
+                    let receive_hydrated =
+                        receive_manager.hydrate_known_address_indexes(&known_address_set_all, known_search_depth)?;
+                    let change_hydrated = change_manager.hydrate_known_address_indexes(&known_address_set_all, known_search_depth)?;
+                    if receive_hydrated > 0 || change_hydrated > 0 {
+                        log_info!(
+                            "smart account activation hydrated {} receive and {} change known address index entries up to depth {}",
+                            receive_hydrated,
+                            change_hydrated,
+                            known_search_depth
+                        );
+                    }
+                }
+
+                let known_address_set = known_address_set_all
+                    .into_iter()
+                    .filter(|address| !self.utxo_context().addresses().contains(&Arc::new(address.clone())))
+                    .collect::<HashSet<_>>();
+                if !known_address_set.is_empty() {
+                    let scan = Scan::new_with_address_set(known_address_set, &balance, current_daa_score);
+                    summaries.push(scan.scan_smart(self.utxo_context()).await?);
+                }
+            }
+            Err(_) => {
+                let mut address_set = HashSet::<Address>::new();
+                address_set.insert(self.receive_address()?);
+                address_set.insert(self.change_address()?);
+
+                let scan = Scan::new_with_address_set(address_set, &balance, current_daa_score);
+                summaries.push(scan.scan_smart(self.utxo_context()).await?);
+            }
+        }
+
+        self.utxo_context().update_balance().await?;
+
+        Ok(summaries)
     }
 
     fn sig_op_count(&self) -> u8;
@@ -311,7 +435,7 @@ pub trait Account: AnySync + Send + Sync + 'static {
         let keydata = self.prv_key_data(wallet_secret).await?;
         let signer = Arc::new(Signer::new(self.clone().as_dyn_arc(), keydata, payment_secret));
         let settings =
-            GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), PaymentDestination::Change, Fees::None, None)?;
+            GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), PaymentDestination::Change, Fees::None, None, None)?;
         let generator = Generator::try_new(settings, Some(signer), Some(abortable))?;
 
         let mut stream = generator.stream();
@@ -336,23 +460,48 @@ pub trait Account: AnySync + Send + Sync + 'static {
         destination: PaymentDestination,
         priority_fee_sompi: Fees,
         payload: Option<Vec<u8>>,
+        sender_address: Option<Address>,
+        fast_submit: Option<FastSubmitOptions>,
         wallet_secret: Secret,
         payment_secret: Option<Secret>,
         abortable: &Abortable,
         notifier: Option<GenerationNotifier>,
-    ) -> Result<(GeneratorSummary, Vec<cryptix_hashes::Hash>)> {
+    ) -> Result<(GeneratorSummary, Vec<cryptix_hashes::Hash>, AccountSendFastSummary)> {
         let keydata = self.prv_key_data(wallet_secret).await?;
         let signer = Arc::new(Signer::new(self.clone().as_dyn_arc(), keydata, payment_secret));
 
-        let settings = GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), destination, priority_fee_sompi, payload)?;
+        let settings = GeneratorSettings::try_new_with_account(
+            self.clone().as_dyn_arc(),
+            destination,
+            priority_fee_sompi,
+            payload,
+            sender_address,
+        )?;
 
         let generator = Generator::try_new(settings, Some(signer), Some(abortable))?;
 
         let mut stream = generator.stream();
         let mut ids = vec![];
+        let mut fast_summary = AccountSendFastSummary {
+            requested: fast_submit.as_ref().map(|options| options.enabled).unwrap_or(false),
+            used: false,
+            status: None,
+            reason: None,
+            basechain_submitted: true,
+        };
         while let Some(transaction) = stream.try_next().await? {
             transaction.try_sign()?;
-            ids.push(transaction.try_submit(&self.wallet().rpc_api()).await?);
+            let submit_result = transaction.try_submit_with_fast_options(&self.wallet().rpc_api(), fast_submit.as_ref()).await?;
+            fast_summary.requested |= submit_result.fast.requested;
+            fast_summary.used |= submit_result.fast.used;
+            fast_summary.basechain_submitted &= submit_result.fast.basechain_submitted;
+            if submit_result.fast.status.is_some() {
+                fast_summary.status = submit_result.fast.status.clone();
+            }
+            if submit_result.fast.reason.is_some() {
+                fast_summary.reason = submit_result.fast.reason.clone();
+            }
+            ids.push(submit_result.tx_id);
 
             if let Some(notifier) = notifier.as_ref() {
                 notifier(&transaction);
@@ -360,7 +509,7 @@ pub trait Account: AnySync + Send + Sync + 'static {
             yield_executor().await;
         }
 
-        Ok((generator.summary(), ids))
+        Ok((generator.summary(), ids, fast_summary))
     }
 
     async fn pskb_from_send_generator(
@@ -372,7 +521,8 @@ pub trait Account: AnySync + Send + Sync + 'static {
         payment_secret: Option<Secret>,
         abortable: &Abortable,
     ) -> Result<Bundle, Error> {
-        let settings = GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), destination, priority_fee_sompi, payload)?;
+        let settings =
+            GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), destination, priority_fee_sompi, payload, None)?;
         let keydata = self.prv_key_data(wallet_secret).await?;
         let signer = Arc::new(PSKBSigner::new(self.clone().as_dyn_arc(), keydata, payment_secret));
         let generator = Generator::try_new(settings, None, Some(abortable))?;
@@ -453,6 +603,7 @@ pub trait Account: AnySync + Send + Sync + 'static {
             final_transaction_destination,
             priority_fee_sompi,
             final_transaction_payload,
+            None,
         )?
         .utxo_context_transfer(destination_account.utxo_context());
 
@@ -478,9 +629,11 @@ pub trait Account: AnySync + Send + Sync + 'static {
         destination: PaymentDestination,
         priority_fee_sompi: Fees,
         payload: Option<Vec<u8>>,
+        sender_address: Option<Address>,
         abortable: &Abortable,
     ) -> Result<GeneratorSummary> {
-        let settings = GeneratorSettings::try_new_with_account(self.as_dyn_arc(), destination, priority_fee_sompi, payload)?;
+        let settings =
+            GeneratorSettings::try_new_with_account(self.as_dyn_arc(), destination, priority_fee_sompi, payload, sender_address)?;
 
         let generator = Generator::try_new(settings, None, Some(abortable))?;
 
@@ -503,7 +656,7 @@ pub trait Account: AnySync + Send + Sync + 'static {
 
 downcast_sync!(dyn Account);
 
-/// Account trait used by legacy account types (BIP32 account types with the `'972` derivation path).
+/// Account trait used by legacy account types (old web wallet derivation path).
 #[async_trait]
 pub trait AsLegacyAccount: Account {
     async fn create_private_context(
@@ -856,18 +1009,28 @@ mod tests {
         unsafe { std::str::from_utf8_unchecked(&hex) }.to_string()
     }
 
+    fn address_from_key_hex(key_hex: &str) -> Address {
+        let mut key_bytes = [0u8; 32];
+        faster_hex::hex_decode(key_hex.as_bytes(), &mut key_bytes).expect("valid test key hex");
+        let secret = SecretKey::from_slice(&key_bytes).expect("valid secp256k1 private key");
+        PubkeyDerivationManagerV0::create_address(&secret.get_public_key(), Prefix::Testnet, false).expect("valid test address")
+    }
+
     #[tokio::test]
     async fn gen0_prv_keys() {
-        let receive_addresses = gen0_receive_addresses()
+        let receive_keys = gen0_receive_keys();
+        let change_keys = gen0_change_keys();
+
+        let receive_addresses = receive_keys
             .iter()
             .enumerate()
-            .map(|(index, str)| (Address::try_from(*str).unwrap(), index as u32))
+            .map(|(index, key)| (address_from_key_hex(key), index as u32))
             .collect::<Vec<(Address, u32)>>();
 
-        let change_addresses = gen0_change_addresses()
+        let change_addresses = change_keys
             .iter()
             .enumerate()
-            .map(|(index, str)| (Address::try_from(*str).unwrap(), index as u32))
+            .map(|(index, key)| (address_from_key_hex(key), index as u32))
             .collect::<Vec<(Address, u32)>>();
 
         let receive_addresses = receive_addresses.iter().map(|(a, index)| (a, *index)).collect::<Vec<(&Address, u32)>>();
@@ -875,9 +1038,6 @@ mod tests {
 
         let key = "xprv9s21ZrQH143K2SDYtUz6dphDH3yRLAC7Jc552GYiXai3STvqgc3JBZxH2M4KaKhriaZDSS9KL7zUi5kYpggFspkiZBYWNCxbp27CCcnsJUs";
         let xkey = ExtendedPrivateKey::<SecretKey>::from_str(key).unwrap();
-
-        let receive_keys = gen0_receive_keys();
-        let change_keys = gen0_change_keys();
 
         let keys = create_private_keys(&LEGACY_ACCOUNT_KIND.into(), 0, 0, &xkey, &receive_addresses, &[]).unwrap();
         for (index, (a, key)) in keys.iter().enumerate() {

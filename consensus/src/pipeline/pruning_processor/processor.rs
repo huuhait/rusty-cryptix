@@ -8,6 +8,7 @@ use crate::{
     model::{
         services::reachability::{MTReachabilityService, ReachabilityService},
         stores::{
+            atomic_state::AtomicConsensusState,
             ghostdag::{CompactGhostdagData, GhostdagStoreReader},
             headers::HeaderStoreReader,
             past_pruning_points::PastPruningPointsStoreReader,
@@ -23,7 +24,6 @@ use crate::{
     processes::{pruning_proof::PruningProofManager, reachability::inquirer as reachability, relations},
 };
 use crossbeam_channel::Receiver as CrossbeamReceiver;
-use itertools::Itertools;
 use cryptix_consensus_core::{
     blockhash::ORIGIN,
     blockstatus::BlockStatus::StatusHeaderOnly,
@@ -35,10 +35,11 @@ use cryptix_consensus_core::{
 };
 use cryptix_consensusmanager::SessionLock;
 use cryptix_core::{debug, info, warn};
-use cryptix_database::prelude::{BatchDbWriter, MemoryWriter, StoreResultExtensions, DB};
+use cryptix_database::prelude::{BatchDbWriter, MemoryWriter, StoreError, StoreResultExtensions, DB};
 use cryptix_hashes::Hash;
 use cryptix_muhash::MuHash;
 use cryptix_utils::iter::IterExtensions;
+use itertools::Itertools;
 use parking_lot::RwLockUpgradableReadGuard;
 use rocksdb::WriteBatch;
 use std::{
@@ -222,22 +223,33 @@ impl PruningProcessor {
         drop(pruning_utxoset_write);
 
         if self.config.enable_sanity_checks {
-            info!("Performing a sanity check that the new UTXO set has the expected UTXO commitment");
+            info!("Performing a sanity check that the new UTXO/Atomic state has the expected commitment");
             self.assert_utxo_commitment(new_pruning_point);
         }
         true
     }
 
     fn assert_utxo_commitment(&self, pruning_point: Hash) {
-        info!("Verifying the new pruning point UTXO commitment (sanity test)");
-        let commitment = self.headers_store.get_header(pruning_point).unwrap().utxo_commitment;
+        info!("Verifying the new pruning point state commitment (sanity test)");
+        let header = self.headers_store.get_header(pruning_point).unwrap();
         let mut multiset = MuHash::new();
         let pruning_utxoset_read = self.pruning_utxoset_stores.read();
         for (outpoint, entry) in pruning_utxoset_read.utxo_set.iterator().map(|r| r.unwrap()) {
             multiset.add_utxo(&outpoint, &entry);
         }
-        assert_eq!(multiset.finalize(), commitment, "Updated pruning point utxo set does not match the header utxo commitment");
-        info!("Pruning point UTXO commitment was verified correctly (sanity test)");
+        let utxo_commitment = multiset.finalize();
+        let payload_hf_active = header.daa_score >= self.config.params.payload_hf_activation_daa_score;
+        let atomic_state_hash = match self.atomic_state_store.get_root_record(pruning_point) {
+            Ok(root) => root.state_hash,
+            Err(StoreError::KeyNotFound(_)) if !payload_hf_active => AtomicConsensusState::default().canonical_hash(),
+            Err(err) => panic!("Updated pruning point atomic state is unavailable for sanity check: {err}"),
+        };
+        let expected_commitment = AtomicConsensusState::header_commitment(utxo_commitment, atomic_state_hash, payload_hf_active);
+        assert_eq!(
+            expected_commitment, header.utxo_commitment,
+            "Updated pruning point state commitment does not match the header commitment"
+        );
+        info!("Pruning point state commitment was verified correctly (sanity test)");
     }
 
     fn prune(&self, new_pruning_point: Hash) {
@@ -427,6 +439,7 @@ impl PruningProcessor {
                 self.utxo_multisets_store.delete_batch(&mut batch, current).unwrap();
                 self.utxo_diffs_store.delete_batch(&mut batch, current).unwrap();
                 self.acceptance_data_store.delete_batch(&mut batch, current).unwrap();
+                self.atomic_state_store.delete_batch(&mut batch, current).unwrap();
                 self.block_transactions_store.delete_batch(&mut batch, current).unwrap();
 
                 if let Some(&affiliated_proof_level) = keep_relations.get(&current) {
@@ -558,6 +571,10 @@ impl PruningProcessor {
         assert_eq!(
             ref_data.ghostdag_blocks.iter().map(|gd| gd.hash).collect::<BlockHashSet>(),
             built_data.ghostdag_blocks.iter().map(|gd| gd.hash).collect::<BlockHashSet>()
+        );
+        assert_eq!(
+            ref_data.atomic_state.as_ref().map(|state| state.state_hash),
+            built_data.atomic_state.as_ref().map(|state| state.state_hash)
         );
         info!("Trusted data was rebuilt successfully following pruning");
     }

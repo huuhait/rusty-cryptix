@@ -3,18 +3,17 @@ mod tests {
     use crate::{
         block_template::builder::BlockTemplateBuilder,
         errors::{MiningManagerError, MiningManagerResult},
-        manager::MiningManager,
+        manager::{classify_template_invalid_transactions, MiningManager},
         mempool::{
-            config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE},
+            config::{Config, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE, DEFAULT_PAYLOAD_MAX_STANDARD_LEN},
             errors::RuleError,
-            model::frontier::selectors::TakeAllSelector,
+            model::frontier::selectors::{SequenceSelectorTransaction, TakeAllSelector},
             tx::{Orphan, Priority, RbfPolicy},
         },
         model::{tx_insert::TransactionInsertion, tx_query::TransactionQuery},
         testutils::consensus_mock::ConsensusMock,
-        MiningCounters,
+        MiningCounters, Policy,
     };
-    use itertools::Itertools;
     use cryptix_addresses::{Address, Prefix, Version};
     use cryptix_consensus_core::{
         api::ConsensusApi,
@@ -23,7 +22,7 @@ mod tests {
         constants::{MAX_TX_IN_SEQUENCE_NUM, SOMPI_PER_CRYPTIX, TX_VERSION},
         errors::tx::TxRuleError,
         mass::transaction_estimated_serialized_size,
-        subnets::SUBNETWORK_ID_NATIVE,
+        subnets::{SubnetworkId, SUBNETWORK_ID_NATIVE, SUBNETWORK_ID_PAYLOAD},
         tx::{
             scriptvec, MutableTransaction, ScriptPublicKey, Transaction, TransactionId, TransactionInput, TransactionOutpoint,
             TransactionOutput, UtxoEntry,
@@ -36,11 +35,318 @@ mod tests {
         test_helpers::{create_transaction, create_transaction_with_change, op_true_script},
     };
     use cryptix_utils::mem_size::MemSizeEstimator;
-    use std::{iter::once, sync::Arc};
+    use itertools::Itertools;
+    use std::{collections::HashMap, iter::once, sync::Arc};
     use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel};
 
     const TARGET_TIME_PER_BLOCK: u64 = 1_000;
     const MAX_BLOCK_MASS: u64 = 500_000;
+
+    #[test]
+    fn test_block_template_missing_outpoints_are_not_removed_from_mempool() {
+        let missing_tx_id = TransactionId::from_bytes([1; 32]);
+        let invalid_tx_id = TransactionId::from_bytes([2; 32]);
+        let mut invalid_transactions = HashMap::new();
+        invalid_transactions.insert(missing_tx_id, TxRuleError::MissingTxOutpoints);
+        invalid_transactions.insert(invalid_tx_id, TxRuleError::InvalidAtomicPayload("stale liquidity nonce".to_string()));
+
+        let (missing_outpoint, removable_invalid_transactions) = classify_template_invalid_transactions(&invalid_transactions);
+
+        assert_eq!(missing_outpoint, 1, "missing-outpoint template candidates must be skipped, not removed");
+        assert_eq!(removable_invalid_transactions.len(), 1, "only permanent template failures should be removable");
+        assert_eq!(removable_invalid_transactions[0].0, invalid_tx_id);
+        assert!(
+            !removable_invalid_transactions.iter().any(|(tx_id, _)| *tx_id == missing_tx_id),
+            "missing-outpoint candidates must stay in the mempool"
+        );
+    }
+
+    #[test]
+    fn get_block_template_rebuilds_cached_template_when_miner_data_changes() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, Some(60_000), counters);
+        let miner_data_1 = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let miner_data_2 = MinerData::new(miner_data_1.script_public_key.clone(), vec![0xaa, 0xbb]);
+
+        let template_1 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_1).unwrap();
+        let template_2 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+        let template_3 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+
+        assert_eq!(
+            consensus.block_template_builds(),
+            2,
+            "changing miner data must rebuild the template because coinbase tx id is part of the UTXO commitment"
+        );
+        assert_ne!(template_1.block.transactions[0].id(), template_2.block.transactions[0].id());
+        assert_eq!(template_2.block.transactions[0].id(), template_3.block.transactions[0].id());
+    }
+
+    #[test]
+    fn get_block_template_retries_when_virtual_changes_during_build() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, Some(60_000), counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+
+        consensus.set_virtual_daa_score(1);
+        consensus.set_virtual_daa_score_after_next_template_build(2);
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+
+        assert_eq!(consensus.block_template_builds(), 2, "a template built on a stale virtual state must be discarded");
+        assert_eq!(
+            template.to_virtual_state_approx_id(),
+            consensus.get_virtual_state_approx_id(),
+            "returned template must match the current virtual state identity"
+        );
+    }
+
+    #[test]
+    fn get_block_template_mixed_mempool_rebuilds_and_matches_cross_parity_shape() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, Some(60_000), counters);
+        let miner_data_1 = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let miner_data_2 = MinerData::new(miner_data_1.script_public_key.clone(), vec![0xaa, 0xbb, 0xcc]);
+        let asset_id = [0x42; 32];
+
+        let mut ready_transactions = Vec::new();
+        ready_transactions.extend((0..4).map(|i| create_transaction_with_utxo_entry(i, 0)));
+        ready_transactions.push(create_payload_transaction_with_utxo_entry(
+            10,
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            SUBNETWORK_ID_PAYLOAD,
+            b"MSG:alpha".to_vec(),
+        ));
+        ready_transactions.push(create_payload_transaction_with_utxo_entry(
+            11,
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            SUBNETWORK_ID_PAYLOAD,
+            b"MSG:beta".to_vec(),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            20,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_create_asset_payload(1),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            21,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_mint_payload(2, asset_id),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            22,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(3, asset_id),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            23,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(4, asset_id, 100),
+        ));
+        ready_transactions.push(create_cat_payload_transaction_with_utxo_entry(
+            24,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_sell_liquidity_payload(5, asset_id, 101),
+        ));
+
+        for tx in ready_transactions.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let mut orphan = create_cat_payload_transaction_with_utxo_entry(
+            90,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(6, asset_id, 102),
+        );
+        orphan.entries[0] = None;
+        let orphan_id = orphan.id();
+        mining_manager
+            .validate_and_insert_mutable_transaction(consensus.as_ref(), orphan, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("cross-parity orphan CAT should be stored without entering the ready block-candidate set");
+
+        let (ready_pool, orphan_pool) = mining_manager.get_all_transactions(TransactionQuery::All);
+        assert_eq!(ready_transactions.len(), ready_pool.len(), "ready mixed mempool size");
+        assert_eq!(1, orphan_pool.len(), "cross-parity fixture should keep one orphan outside the template");
+
+        let template_1 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_1).unwrap();
+        let template_2 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+        let template_3 = mining_manager.get_block_template(consensus.as_ref(), &miner_data_2).unwrap();
+
+        assert_eq!(
+            consensus.block_template_builds(),
+            2,
+            "mixed mempool template must rebuild when coinbase/miner data changes, then reuse only identical miner data"
+        );
+        assert_ne!(template_1.block.transactions[0].id(), template_2.block.transactions[0].id());
+        assert_eq!(template_2.block.transactions[0].id(), template_3.block.transactions[0].id());
+
+        assert_cross_parity_template_shape(&template_2.block.transactions, 4, 7, orphan_id);
+    }
+
+    #[test]
+    fn get_block_template_large_mixed_mempool_respects_block_mass_limit() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let max_block_mass = 18_000;
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, max_block_mass);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let asset_id = [0x52; 32];
+
+        let mut ready_transactions = Vec::new();
+        ready_transactions.extend((0..20).map(|i| create_transaction_with_utxo_entry(i, 0)));
+        ready_transactions.extend((20..40).map(|i| {
+            create_payload_transaction_with_utxo_entry(
+                i,
+                0,
+                100_000 + u64::from(i),
+                SUBNETWORK_ID_PAYLOAD,
+                vec![0xa5; DEFAULT_PAYLOAD_MAX_STANDARD_LEN],
+            )
+        }));
+        ready_transactions.extend((40..100).map(|i| {
+            create_cat_payload_transaction_with_utxo_entry(
+                i,
+                100_000 + u64::from(i),
+                cat_transfer_payload(u64::from(i - 39), asset_id),
+            )
+        }));
+
+        for tx in ready_transactions.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+        let selected_non_coinbase = template.block.transactions.len().saturating_sub(1);
+
+        assert!(selected_non_coinbase > 0, "large mempool template should select at least one transaction");
+        assert!(
+            selected_non_coinbase < ready_transactions.len(),
+            "template must leave a tail when the mempool is larger than one block"
+        );
+        assert_template_subnetwork_sorted(&template.block.transactions);
+        assert_template_non_coinbase_estimated_mass_at_most(&template.block.transactions, max_block_mass);
+    }
+
+    #[test]
+    fn get_block_template_max_messenger_payloads_over_block_capacity_respects_limits() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let max_block_mass = 12_000;
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, max_block_mass);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+
+        let max_payload_txs = (0..40)
+            .map(|i| {
+                create_payload_transaction_with_utxo_entry(
+                    i,
+                    0,
+                    100_000 + u64::from(i),
+                    SUBNETWORK_ID_PAYLOAD,
+                    vec![0x6d; DEFAULT_PAYLOAD_MAX_STANDARD_LEN],
+                )
+            })
+            .collect_vec();
+
+        for tx in max_payload_txs.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+        let selected = template.block.transactions.iter().skip(1).collect_vec();
+
+        assert!(!selected.is_empty(), "max-payload messenger mempool should produce non-empty templates");
+        assert!(selected.len() < max_payload_txs.len(), "one block must not absorb all max-size messenger payloads");
+        assert!(
+            selected
+                .iter()
+                .all(|tx| tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD && tx.payload.len() == DEFAULT_PAYLOAD_MAX_STANDARD_LEN),
+            "selected non-coinbase transactions should be max-size messenger payloads"
+        );
+        assert_template_non_coinbase_estimated_mass_at_most(&template.block.transactions, max_block_mass);
+    }
+
+    #[test]
+    fn get_block_template_same_asset_cat_chain_over_block_capacity_keeps_tail() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let max_block_mass = 8_000;
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, max_block_mass);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let miner_data = generate_new_coinbase(Prefix::Testnet, OpType::True);
+        let asset_id = [0x53; 32];
+
+        let cat_chain = (0..80)
+            .map(|i| {
+                create_cat_payload_transaction_with_utxo_entry(
+                    i,
+                    100_000 + u64::from(i),
+                    cat_transfer_payload(u64::from(i) + 1, asset_id),
+                )
+            })
+            .collect_vec();
+
+        for tx in cat_chain.iter().cloned() {
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), tx).unwrap();
+        }
+
+        let template = mining_manager.get_block_template(consensus.as_ref(), &miner_data).unwrap();
+        let selected = template.block.transactions.iter().skip(1).cloned().collect_vec();
+        assert!(!selected.is_empty(), "same-asset CAT queue should produce a non-empty template");
+        assert!(selected.len() < cat_chain.len(), "one block must not absorb a long same-asset CAT queue");
+        assert_template_non_coinbase_estimated_mass_at_most(&template.block.transactions, max_block_mass);
+
+        mining_manager
+            .handle_new_block_transactions(consensus.as_ref(), 1, &template.block.transactions)
+            .expect("accepted CAT template should update mempool without dropping the whole queue");
+        let (remaining, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(!remaining.is_empty(), "same-asset CAT tail should remain for later blocks");
+        for selected_tx in selected {
+            assert!(
+                mining_manager.get_transaction(&selected_tx.id(), TransactionQuery::TransactionsOnly).is_none(),
+                "accepted CAT transaction {} should be removed from mempool",
+                selected_tx.id()
+            );
+        }
+    }
+
+    #[test]
+    fn messenger_payload_standard_limit_accepts_max_and_rejects_oversize() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+
+        let max_payload = create_payload_transaction_with_utxo_entry(
+            1,
+            0,
+            100_000,
+            SUBNETWORK_ID_PAYLOAD,
+            vec![0x6d; DEFAULT_PAYLOAD_MAX_STANDARD_LEN],
+        );
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), max_payload).unwrap();
+
+        let oversized_payload = create_payload_transaction_with_utxo_entry(
+            2,
+            0,
+            100_000,
+            SUBNETWORK_ID_PAYLOAD,
+            vec![0x6d; DEFAULT_PAYLOAD_MAX_STANDARD_LEN + 1],
+        );
+        assert!(
+            validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), oversized_payload).is_err(),
+            "payloads above the standard messenger limit must not enter the mempool"
+        );
+    }
 
     // test_validate_and_insert_transaction verifies that valid transactions were successfully inserted into the mempool.
     #[test]
@@ -188,6 +494,819 @@ mod tests {
                 "({priority:?}, {orphan:?}, {rbf_policy:?}) mempool contains a transaction that should have been rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_atomic_nonce_submit_can_use_pending_mempool_context() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+
+        let first_transaction = create_transaction_with_utxo_entry(0, 0);
+        let second_transaction = create_transaction_with_utxo_entry(1, 0);
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first transaction should enter the mempool");
+
+        consensus.set_single_validation_status(
+            second_transaction.id(),
+            Err(TxRuleError::InvalidAtomicPayload(
+                "nonce baseline violation for owner `00` scope `asset` `11`: expected `1`, got `2`".to_string(),
+            )),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                second_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("future CAT nonce should validate against pending mempool context");
+
+        let (transactions_from_pool, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == first_transaction.id()));
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == second_transaction.id()));
+    }
+
+    #[test]
+    fn test_atomic_nonce_p2p_batch_can_use_pending_mempool_context() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+
+        let first_transaction = create_transaction_with_utxo_entry(0, 0);
+        let second_transaction = create_transaction_with_utxo_entry(1, 0);
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first transaction should enter the mempool");
+
+        consensus.set_transient_status(
+            second_transaction.id(),
+            Err(TxRuleError::InvalidAtomicPayload(
+                "nonce baseline violation for owner `00` scope `asset` `11`: expected `1`, got `2`".to_string(),
+            )),
+        );
+        consensus.add_utxo(
+            second_transaction.tx.inputs[0].previous_outpoint,
+            second_transaction.entries[0].as_ref().expect("test transaction entry is populated").clone(),
+        );
+
+        let results = mining_manager.validate_and_insert_transaction_batch(
+            consensus.as_ref(),
+            vec![second_transaction.tx.as_ref().clone()],
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Allowed,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok(), "P2P batch future CAT nonce should validate against pending mempool context");
+
+        let (transactions_from_pool, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == first_transaction.id()));
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == second_transaction.id()));
+    }
+
+    #[test]
+    fn test_mempool_parent_output_index_out_of_bounds_is_rejected_without_panic() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+
+        let parent_transaction = create_transaction_with_utxo_entry(0, 0);
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                parent_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("parent transaction should enter the mempool");
+
+        let mut child_transaction = create_transaction_with_utxo_entry(1, 0);
+        let invalid_parent_outpoint = TransactionOutpoint::new(parent_transaction.id(), parent_transaction.tx.outputs.len() as u32);
+        let child_tx = Arc::make_mut(&mut child_transaction.tx);
+        child_tx.inputs[0].previous_outpoint = invalid_parent_outpoint;
+        child_tx.finalize();
+        child_transaction.entries[0] = None;
+        let child_id = child_transaction.id();
+
+        let result = into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            child_transaction,
+            Priority::Low,
+            Orphan::Forbidden,
+            RbfPolicy::Forbidden,
+        ));
+
+        match result {
+            Err(RuleError::RejectDisallowedOrphan(transaction_id)) => assert_eq!(transaction_id, child_id),
+            other => panic!("expected out-of-bounds parent output to be rejected as a missing outpoint, got {other:?}"),
+        }
+        assert_transaction_count(&mining_manager, 1, "invalid child rejection");
+    }
+
+    #[test]
+    fn test_atomic_liquidity_vault_submit_can_use_pending_mempool_context() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+
+        let first_transaction = create_transaction_with_utxo_entry(0, 0);
+        let second_transaction = create_transaction_with_utxo_entry(1, 0);
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first transaction should enter the mempool");
+
+        consensus.set_single_validation_status(
+            second_transaction.id(),
+            Err(TxRuleError::InvalidAtomicPayload(format!("unknown LiquidityVault input outpoint `({}, 0)`", first_transaction.id()))),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                second_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("liquidity child transaction should validate against pending mempool context");
+
+        let (transactions_from_pool, _) = mining_manager.get_all_transactions(TransactionQuery::TransactionsOnly);
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == first_transaction.id()));
+        assert!(transactions_from_pool.iter().any(|tx| tx.id() == second_transaction.id()));
+    }
+
+    #[test]
+    fn test_atomic_mempool_rejects_duplicate_owner_nonce_slot() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x11; 32];
+        let first_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+        let second_transaction = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first CAT transaction should enter the mempool");
+
+        let result = into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            second_transaction.clone(),
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Forbidden,
+        ));
+
+        match result {
+            Err(RuleError::RejectAtomicSlotConflict(rejected_id, existing_id, slot)) => {
+                assert_eq!(second_transaction.id(), rejected_id);
+                assert_eq!(first_transaction.id(), existing_id);
+                assert!(slot.contains("nonce:asset"), "unexpected slot: {slot}");
+            }
+            other => panic!("expected duplicate owner nonce slot rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_duplicate_nonce_does_not_evict_pending_future_nonce_when_full() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 2;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x12; 32];
+
+        let first = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let future = create_cat_payload_transaction_with_utxo_entry(1, 20_000, cat_transfer_payload(2, asset_id));
+        let duplicate_first = create_cat_payload_transaction_with_utxo_entry(2, 500_000, cat_transfer_payload(1, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), first.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), future.clone()).unwrap();
+
+        let result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), duplicate_first.clone()));
+
+        match result {
+            Err(RuleError::RejectAtomicSlotConflict(rejected_id, existing_id, slot)) => {
+                assert_eq!(duplicate_first.id(), rejected_id);
+                assert_eq!(first.id(), existing_id);
+                assert!(slot.contains("nonce:asset"), "unexpected slot: {slot}");
+            }
+            other => panic!("expected duplicate owner nonce slot rejection, got {other:?}"),
+        }
+        assert!(
+            mining_manager.get_transaction(&future.id(), TransactionQuery::All).is_some(),
+            "duplicate same-nonce CAT must not evict an already pending future nonce"
+        );
+        assert_transaction_count(&mining_manager, 2, "duplicate same-nonce rejection");
+    }
+
+    #[test]
+    fn test_atomic_mempool_rejects_duplicate_liquidity_pool_nonce_slot() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x22; 32];
+        let first_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(1, asset_id, 9),
+        );
+        let second_transaction = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(2, asset_id, 9),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first liquidity CAT transaction should enter the mempool");
+
+        let result = into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            second_transaction.clone(),
+            Priority::Low,
+            Orphan::Allowed,
+            RbfPolicy::Forbidden,
+        ));
+
+        match result {
+            Err(RuleError::RejectAtomicSlotConflict(rejected_id, existing_id, slot)) => {
+                assert_eq!(second_transaction.id(), rejected_id);
+                assert_eq!(first_transaction.id(), existing_id);
+                assert!(slot.contains("liquidity-pool"), "unexpected slot: {slot}");
+            }
+            other => panic!("expected duplicate liquidity pool slot rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_atomic_mempool_removes_accepted_liquidity_pool_conflict() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x44; 32];
+        let local_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(1, asset_id, 9),
+        );
+        let accepted_transaction_from_peer = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_buy_liquidity_payload(2, asset_id, 9),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                local_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("local liquidity CAT transaction should enter the mempool");
+
+        let block_transactions = build_block_transactions(std::iter::once(accepted_transaction_from_peer.tx.as_ref()));
+        let result = mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block_transactions);
+        assert!(result.is_ok(), "handling a block with an accepted liquidity pool conflict should succeed but returned {result:?}");
+
+        assert!(
+            mining_manager.get_transaction(&local_transaction.id(), TransactionQuery::All).is_none(),
+            "local liquidity CAT transaction should be removed after another node accepted the same pool slot"
+        );
+    }
+
+    #[test]
+    fn test_atomic_mempool_keeps_future_same_asset_nonce_after_accepted_predecessor() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x4c; 32];
+        let other_asset_id = [0x4d; 32];
+        let local_future_same_asset = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(2, asset_id),
+        );
+        let local_other_asset = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, other_asset_id),
+        );
+        let accepted_from_peer = create_cat_payload_transaction_with_utxo_entry(
+            2,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), local_future_same_asset.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), local_other_asset.clone()).unwrap();
+
+        let block_transactions = build_block_transactions(std::iter::once(accepted_from_peer.tx.as_ref()));
+        let result = mining_manager.handle_new_block_transactions(consensus.as_ref(), 2, &block_transactions);
+        assert!(result.is_ok(), "handling a block with an accepted same-asset predecessor should succeed but returned {result:?}");
+
+        assert!(
+            mining_manager.get_transaction(&local_future_same_asset.id(), TransactionQuery::All).is_some(),
+            "future same-asset CAT nonce should stay in the mempool after its predecessor is accepted"
+        );
+        assert!(
+            mining_manager.get_transaction(&local_other_asset.id(), TransactionQuery::All).is_some(),
+            "local other-asset CAT transaction should stay in the mempool"
+        );
+    }
+
+    #[test]
+    fn test_atomic_low_priority_stale_tx_revalidation_evicts_invalid_payload() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x45; 32];
+        let stale_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                stale_transaction.clone(),
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("low-priority CAT transaction should enter the mempool");
+
+        consensus.set_status(stale_transaction.id(), Err(TxRuleError::InvalidAtomicPayload("stale liquidity nonce".to_string())));
+
+        let (tx, mut rx) = unbounded_channel();
+        mining_manager.revalidate_high_priority_transactions(consensus.as_ref(), tx);
+
+        assert_eq!(
+            Err(TryRecvError::Disconnected),
+            rx.try_recv(),
+            "low-priority CAT revalidation must not rebroadcast a valid-id chunk"
+        );
+        assert!(
+            mining_manager.get_transaction(&stale_transaction.id(), TransactionQuery::All).is_none(),
+            "stale low-priority CAT transaction should be evicted by periodic revalidation"
+        );
+    }
+
+    #[test]
+    fn test_atomic_low_priority_tx_expires_faster_than_standard_tx() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.transaction_expire_interval_daa_score = 1_000;
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4a; 32];
+
+        let standard_transaction = create_transaction_with_utxo_entry(0, 0);
+        let atomic_transaction = create_cat_payload_transaction_with_utxo_entry(
+            1,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), standard_transaction.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), atomic_transaction.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "before Atomic expiry");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert_transaction_count(&mining_manager, 1, "after Atomic expiry");
+        assert!(
+            mining_manager.get_transaction(&standard_transaction.id(), TransactionQuery::All).is_some(),
+            "standard low-priority transaction should keep the normal expiry window"
+        );
+        assert!(
+            mining_manager.get_transaction(&atomic_transaction.id(), TransactionQuery::All).is_none(),
+            "low-priority CAT transaction should use the shorter Atomic expiry window"
+        );
+    }
+
+    #[test]
+    fn test_atomic_low_priority_expiry_removes_redeemer_chain() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4c; 32];
+
+        let parent = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let child_base = create_transaction(parent.tx.as_ref(), DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let child = Transaction::new(
+            child_base.version,
+            child_base.inputs,
+            child_base.outputs,
+            child_base.lock_time,
+            SUBNETWORK_ID_PAYLOAD,
+            child_base.gas,
+            cat_transfer_payload(2, asset_id),
+        );
+        let child_id = child.id();
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), parent.clone()).unwrap();
+        mining_manager
+            .validate_and_insert_transaction(consensus.as_ref(), child, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("CAT child should validate against its pending mempool parent");
+        assert_transaction_count(&mining_manager, 2, "before Atomic parent expiry");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert_transaction_count(&mining_manager, 0, "expired CAT parent should remove its mempool redeemer chain");
+        assert!(mining_manager.get_transaction(&parent.id(), TransactionQuery::All).is_none());
+        assert!(mining_manager.get_transaction(&child_id, TransactionQuery::All).is_none());
+    }
+
+    #[test]
+    fn test_atomic_low_priority_expiry_timer_starts_when_redeemer_becomes_ready() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4d; 32];
+
+        let parent = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let child_base = create_transaction(parent.tx.as_ref(), DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let child = Transaction::new(
+            child_base.version,
+            child_base.inputs,
+            child_base.outputs,
+            child_base.lock_time,
+            SUBNETWORK_ID_PAYLOAD,
+            child_base.gas,
+            cat_transfer_payload(2, asset_id),
+        );
+        let child_id = child.id();
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), parent.clone()).unwrap();
+        mining_manager
+            .validate_and_insert_transaction(consensus.as_ref(), child, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("CAT child should validate against its pending mempool parent");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager
+            .handle_accepted_transactions(consensus.as_ref(), 6, &[parent.tx.as_ref().clone()])
+            .expect("accepted parent should unblock CAT child");
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        assert!(mining_manager.get_transaction(&parent.id(), TransactionQuery::All).is_none());
+        assert!(
+            mining_manager.get_transaction(&child_id, TransactionQuery::All).is_some(),
+            "CAT child should not expire immediately when it just became ready"
+        );
+
+        consensus.set_virtual_daa_score(12);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        assert!(
+            mining_manager.get_transaction(&child_id, TransactionQuery::All).is_none(),
+            "CAT child should expire only after its own ready window elapsed"
+        );
+    }
+
+    #[test]
+    fn test_atomic_total_expiry_removes_non_ready_chain_after_long_cap() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.transaction_expire_interval_daa_score = 1_000;
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.atomic_transaction_total_expire_interval_daa_score = 8;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4f; 32];
+
+        let parent = create_transaction_with_utxo_entry(0, 0);
+        let child_base = create_transaction(parent.tx.as_ref(), DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        let child = Transaction::new(
+            child_base.version,
+            child_base.inputs,
+            child_base.outputs,
+            child_base.lock_time,
+            SUBNETWORK_ID_PAYLOAD,
+            child_base.gas,
+            cat_transfer_payload(2, asset_id),
+        );
+        let child_id = child.id();
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), parent.clone()).unwrap();
+        mining_manager
+            .validate_and_insert_transaction(consensus.as_ref(), child, Priority::Low, Orphan::Allowed, RbfPolicy::Forbidden)
+            .expect("CAT child should validate against its pending mempool parent");
+
+        consensus.set_virtual_daa_score(9);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert!(
+            mining_manager.get_transaction(&parent.id(), TransactionQuery::All).is_some(),
+            "non-CAT parent should keep the normal expiry window"
+        );
+        assert!(
+            mining_manager.get_transaction(&child_id, TransactionQuery::All).is_none(),
+            "non-ready CAT child should still expire at the total CAT lifetime cap"
+        );
+    }
+
+    #[test]
+    fn test_atomic_high_priority_frontier_tx_expires() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4e; 32];
+
+        let atomic_transaction = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                atomic_transaction.clone(),
+                Priority::High,
+                Orphan::Forbidden,
+                RbfPolicy::Forbidden,
+            )
+            .expect("high-priority CAT transaction should enter the mempool");
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+
+        assert!(
+            mining_manager.get_transaction(&atomic_transaction.id(), TransactionQuery::All).is_none(),
+            "frontier CAT transaction should expire even when it entered through high-priority RPC"
+        );
+    }
+
+    #[test]
+    fn test_atomic_mempool_count_limit_preserves_pending_nonce_chain() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 2;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x46; 32];
+
+        let first = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, asset_id));
+        let second = create_cat_payload_transaction_with_utxo_entry(1, 20_000, cat_transfer_payload(2, asset_id));
+        let low_fee = create_cat_payload_transaction_with_utxo_entry(2, 1, cat_transfer_payload(3, asset_id));
+        let high_fee = create_cat_payload_transaction_with_utxo_entry(3, 500_000, cat_transfer_payload(4, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), first.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), second.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "filled CAT mempool");
+
+        let low_result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), low_fee.clone()));
+        assert_eq!(
+            Err(RuleError::RejectMempoolIsFull),
+            low_result,
+            "a lower-feerate CAT transaction should not displace the full mempool"
+        );
+        assert_transaction_count(&mining_manager, 2, "low-fee CAT rejection");
+        assert!(mining_manager.get_transaction(&first.id(), TransactionQuery::All).is_some());
+        assert!(mining_manager.get_transaction(&second.id(), TransactionQuery::All).is_some());
+
+        let high_result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), high_fee.clone()));
+        assert_eq!(
+            Err(RuleError::RejectMempoolIsFull),
+            high_result,
+            "even a higher-feerate future CAT nonce must not evict the earlier pending nonce chain it depends on"
+        );
+        assert_transaction_count(&mining_manager, 2, "high-fee CAT rejection");
+        assert!(mining_manager.get_transaction(&first.id(), TransactionQuery::All).is_some());
+        assert!(mining_manager.get_transaction(&second.id(), TransactionQuery::All).is_some());
+        assert!(mining_manager.get_transaction(&high_fee.id(), TransactionQuery::All).is_none());
+    }
+
+    #[test]
+    fn test_atomic_pending_nonce_chain_blocker_expires_then_new_cat_enters() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 1;
+        config.minimum_relay_transaction_fee = 0;
+        config.atomic_transaction_expire_interval_daa_score = 5;
+        config.transaction_expire_scan_interval_daa_score = 0;
+        config.transaction_expire_scan_interval_milliseconds = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x4b; 32];
+
+        let blocker = create_cat_payload_transaction_with_utxo_entry(0, 1, cat_transfer_payload(1, asset_id));
+        let fresh_trade = create_cat_payload_transaction_with_utxo_entry(1, 500_000, cat_transfer_payload(2, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), blocker.clone()).unwrap();
+
+        let blocked_result =
+            into_mempool_result(validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), fresh_trade.clone()));
+        assert_eq!(Err(RuleError::RejectMempoolIsFull), blocked_result, "future CAT nonce must not evict its pending predecessor");
+        assert!(mining_manager.get_transaction(&blocker.id(), TransactionQuery::All).is_some());
+
+        consensus.set_virtual_daa_score(6);
+        mining_manager.expire_low_priority_transactions(consensus.as_ref());
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), fresh_trade.clone()).unwrap();
+
+        assert!(mining_manager.get_transaction(&blocker.id(), TransactionQuery::All).is_none());
+        assert!(mining_manager.get_transaction(&fresh_trade.id(), TransactionQuery::All).is_some());
+    }
+
+    #[test]
+    fn test_atomic_mempool_count_limit_can_evict_non_atomic_transaction() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 2;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+        let asset_id = [0x47; 32];
+
+        let normal = create_transaction_with_utxo_entry(0, 0);
+        let existing_cat = create_cat_payload_transaction_with_utxo_entry(1, 20_000, cat_transfer_payload(1, asset_id));
+        let incoming_cat = create_cat_payload_transaction_with_utxo_entry(2, 500_000, cat_transfer_payload(2, asset_id));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), normal.clone()).unwrap();
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), existing_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "filled mixed mempool");
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), incoming_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 2, "incoming CAT admission after non-CAT eviction");
+        assert!(
+            mining_manager.get_transaction(&normal.id(), TransactionQuery::All).is_none(),
+            "incoming CAT may evict a normal low-priority transaction when the mempool is full"
+        );
+        assert!(
+            mining_manager.get_transaction(&existing_cat.id(), TransactionQuery::All).is_some(),
+            "incoming CAT must not evict an existing CAT transaction"
+        );
+        assert!(
+            mining_manager.get_transaction(&incoming_cat.id(), TransactionQuery::All).is_some(),
+            "incoming CAT should be admitted after evicting only a normal transaction"
+        );
+    }
+
+    #[test]
+    fn test_atomic_mempool_count_limit_can_evict_different_asset_cat() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mut config = Config::build_default(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS);
+        config.maximum_transaction_count = 1;
+        config.minimum_relay_transaction_fee = 0;
+        let mining_manager = MiningManager::with_config(config, None, counters);
+
+        let existing_asset = [0x48; 32];
+        let incoming_asset = [0x49; 32];
+        let existing_cat = create_cat_payload_transaction_with_utxo_entry(0, 10_000, cat_transfer_payload(1, existing_asset));
+        let incoming_cat = create_cat_payload_transaction_with_utxo_entry(1, 500_000, cat_transfer_payload(1, incoming_asset));
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), existing_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 1, "filled CAT mempool");
+
+        validate_and_insert_mutable_transaction(&mining_manager, consensus.as_ref(), incoming_cat.clone()).unwrap();
+        assert_transaction_count(&mining_manager, 1, "incoming different-asset CAT admission");
+        assert!(
+            mining_manager.get_transaction(&existing_cat.id(), TransactionQuery::All).is_none(),
+            "incoming CAT may evict a lower-feerate CAT from another asset"
+        );
+        assert!(
+            mining_manager.get_transaction(&incoming_cat.id(), TransactionQuery::All).is_some(),
+            "incoming different-asset CAT should be admitted"
+        );
+    }
+
+    #[test]
+    fn test_atomic_rbf_rejects_incoming_cat_replacement() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let asset_id = [0x33; 32];
+        let first_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, asset_id),
+        );
+        let replacement_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE * 2,
+            cat_transfer_payload(1, asset_id),
+        );
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first CAT transaction should enter the mempool");
+
+        let result = into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            replacement_transaction.clone(),
+            Priority::High,
+            Orphan::Allowed,
+            RbfPolicy::Mandatory,
+        ));
+
+        assert_eq!(Err(RuleError::RejectAtomicReplaceByFee(replacement_transaction.id())), result);
+    }
+
+    #[test]
+    fn test_atomic_rbf_rejects_non_cat_replacement_of_pending_cat() {
+        let consensus = Arc::new(ConsensusMock::new());
+        let counters = Arc::new(MiningCounters::default());
+        let mining_manager = MiningManager::new(TARGET_TIME_PER_BLOCK, false, MAX_BLOCK_MASS, None, counters);
+        let first_transaction = create_cat_payload_transaction_with_utxo_entry(
+            0,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            cat_transfer_payload(1, [0x44; 32]),
+        );
+        let replacement_transaction =
+            create_payload_transaction_with_utxo_entry(0, 0, DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE * 2, SUBNETWORK_ID_NATIVE, vec![]);
+
+        mining_manager
+            .validate_and_insert_mutable_transaction(
+                consensus.as_ref(),
+                first_transaction,
+                Priority::Low,
+                Orphan::Allowed,
+                RbfPolicy::Forbidden,
+            )
+            .expect("first CAT transaction should enter the mempool");
+
+        let result = into_mempool_result(mining_manager.validate_and_insert_mutable_transaction(
+            consensus.as_ref(),
+            replacement_transaction.clone(),
+            Priority::High,
+            Orphan::Allowed,
+            RbfPolicy::Allowed,
+        ));
+
+        assert_eq!(Err(RuleError::RejectAtomicReplaceByFee(replacement_transaction.id())), result);
     }
 
     /// test_insert_double_transactions_to_mempool verifies that an attempt to insert a transaction
@@ -1264,10 +2383,20 @@ mod tests {
 
         // Build a fresh template for coinbase2 as a reference
         let builder = mining_manager.block_template_builder();
+        let take_all_sequence = transactions
+            .iter()
+            .map(|tx| {
+                SequenceSelectorTransaction::new(
+                    tx.clone(),
+                    DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+                    transaction_estimated_serialized_size(tx.as_ref()),
+                )
+            })
+            .collect();
         let result = builder.build_block_template(
             consensus,
             &miner_data_2,
-            Box::new(TakeAllSelector::new(transactions)),
+            Box::new(TakeAllSelector::new(take_all_sequence, Policy::new(500_000))),
             TemplateBuildMode::Standard,
         );
         assert!(result.is_ok(), "build block template failed for miner data 2");
@@ -1336,17 +2465,37 @@ mod tests {
     }
 
     fn create_transaction_with_utxo_entry(i: u32, block_daa_score: u64) -> MutableTransaction {
+        create_payload_transaction_with_utxo_entry(
+            i,
+            block_daa_score,
+            DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            SUBNETWORK_ID_NATIVE,
+            vec![],
+        )
+    }
+
+    fn create_cat_payload_transaction_with_utxo_entry(i: u32, fee: u64, payload: Vec<u8>) -> MutableTransaction {
+        create_payload_transaction_with_utxo_entry(i, 0, fee, SUBNETWORK_ID_PAYLOAD, payload)
+    }
+
+    fn create_payload_transaction_with_utxo_entry(
+        i: u32,
+        block_daa_score: u64,
+        fee: u64,
+        subnetwork_id: SubnetworkId,
+        payload: Vec<u8>,
+    ) -> MutableTransaction {
         let previous_outpoint = TransactionOutpoint::new(Hash::default(), i);
         let (script_public_key, redeem_script) = op_true_script();
         let signature_script = pay_to_script_hash_signature_script(redeem_script, vec![]).expect("the redeem script is canonical");
 
         let input = TransactionInput::new(previous_outpoint, signature_script, MAX_TX_IN_SEQUENCE_NUM, 1);
         let entry = UtxoEntry::new(SOMPI_PER_CRYPTIX, script_public_key.clone(), block_daa_score, true);
-        let output = TransactionOutput::new(SOMPI_PER_CRYPTIX - DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE, script_public_key);
-        let transaction = Transaction::new(TX_VERSION, vec![input], vec![output], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+        let output = TransactionOutput::new(SOMPI_PER_CRYPTIX - fee, script_public_key);
+        let transaction = Transaction::new(TX_VERSION, vec![input], vec![output], 0, subnetwork_id, 0, payload);
 
         let mut mutable_tx = MutableTransaction::from_tx(transaction);
-        mutable_tx.calculated_fee = Some(DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE);
+        mutable_tx.calculated_fee = Some(fee);
         // Please note: this is the ConsensusMock version of the calculated_mass which differs from Consensus
         mutable_tx.calculated_compute_mass = Some(transaction_estimated_serialized_size(&mutable_tx.tx));
         mutable_tx.entries[0] = Some(entry);
@@ -1354,11 +2503,71 @@ mod tests {
         mutable_tx
     }
 
+    fn cat_payload_header(op: u8, nonce: u64) -> Vec<u8> {
+        let mut payload = Vec::with_capacity(3 + 1 + 1 + 1 + 2 + 8);
+        payload.extend_from_slice(b"CAT");
+        payload.push(1);
+        payload.push(op);
+        payload.push(0);
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(&nonce.to_le_bytes());
+        payload
+    }
+
+    fn cat_transfer_payload(nonce: u64, asset_id: [u8; 32]) -> Vec<u8> {
+        let mut payload = cat_payload_header(1, nonce);
+        payload.extend_from_slice(&asset_id);
+        payload.extend_from_slice(&[0x55; 32]);
+        payload.extend_from_slice(&1u128.to_le_bytes());
+        payload
+    }
+
+    fn cat_create_asset_payload(nonce: u64) -> Vec<u8> {
+        let mut payload = cat_payload_header(0, nonce);
+        payload.extend_from_slice(&[1, 0, 0]);
+        payload.extend_from_slice(&0u128.to_le_bytes());
+        payload.extend_from_slice(&[0x55; 32]);
+        payload.push(1);
+        payload.push(1);
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        payload.extend_from_slice(b"A");
+        payload.extend_from_slice(b"A");
+        payload
+    }
+
+    fn cat_mint_payload(nonce: u64, asset_id: [u8; 32]) -> Vec<u8> {
+        let mut payload = cat_payload_header(2, nonce);
+        payload.extend_from_slice(&asset_id);
+        payload.extend_from_slice(&[0x66; 32]);
+        payload.extend_from_slice(&1u128.to_le_bytes());
+        payload
+    }
+
+    fn cat_buy_liquidity_payload(nonce: u64, asset_id: [u8; 32], expected_pool_nonce: u64) -> Vec<u8> {
+        let mut payload = cat_payload_header(6, nonce);
+        payload.extend_from_slice(&asset_id);
+        payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1u128.to_le_bytes());
+        payload
+    }
+
+    fn cat_sell_liquidity_payload(nonce: u64, asset_id: [u8; 32], expected_pool_nonce: u64) -> Vec<u8> {
+        let mut payload = cat_payload_header(7, nonce);
+        payload.extend_from_slice(&asset_id);
+        payload.extend_from_slice(&expected_pool_nonce.to_le_bytes());
+        payload.extend_from_slice(&1u128.to_le_bytes());
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&1u16.to_le_bytes());
+        payload
+    }
+
     fn create_and_add_funding_transactions(consensus: &Arc<ConsensusMock>, count: usize) -> Vec<Transaction> {
         // Make the funding amounts always different so that funding txs have different ids
         (0..count)
             .map(|i| {
-                let funding_tx = create_transaction_without_input(vec![1_000 * SOMPI_PER_CRYPTIX, 2_500 * SOMPI_PER_CRYPTIX + i as u64]);
+                let funding_tx =
+                    create_transaction_without_input(vec![1_000 * SOMPI_PER_CRYPTIX, 2_500 * SOMPI_PER_CRYPTIX + i as u64]);
                 consensus.add_transaction(funding_tx.clone(), 1);
                 funding_tx
             })
@@ -1475,6 +2684,56 @@ mod tests {
         let mut block_transactions = vec![get_dummy_coinbase_tx()];
         block_transactions.extend(transactions.cloned());
         block_transactions
+    }
+
+    fn assert_cross_parity_template_shape(
+        transactions: &[Transaction],
+        expected_native_non_coinbase: usize,
+        expected_payload: usize,
+        excluded_orphan_id: TransactionId,
+    ) {
+        assert_eq!(
+            1 + expected_native_non_coinbase + expected_payload,
+            transactions.len(),
+            "cross-parity mixed template transaction count"
+        );
+        assert!(transactions[0].is_coinbase(), "first template transaction must be coinbase");
+
+        let mut native_non_coinbase = 0;
+        let mut payload = 0;
+        let mut seen_payload = false;
+        for tx in transactions.iter().skip(1) {
+            assert_ne!(excluded_orphan_id, tx.id(), "orphan CAT must not enter the block template");
+            if tx.subnetwork_id == SUBNETWORK_ID_PAYLOAD {
+                seen_payload = true;
+                payload += 1;
+            } else {
+                assert_eq!(SUBNETWORK_ID_NATIVE, tx.subnetwork_id, "cross-parity fixture only uses native and payload txs");
+                assert!(!seen_payload, "native transactions must be ordered before payload/CAT transactions");
+                native_non_coinbase += 1;
+            }
+        }
+
+        assert_eq!(expected_native_non_coinbase, native_non_coinbase, "cross-parity native count");
+        assert_eq!(expected_payload, payload, "cross-parity payload/CAT count");
+    }
+
+    fn assert_template_subnetwork_sorted(transactions: &[Transaction]) {
+        assert!(transactions.first().is_some_and(Transaction::is_coinbase), "first template transaction must be coinbase");
+        for window in transactions.iter().skip(1).tuple_windows() {
+            let (left, right) = window;
+            assert!(
+                left.subnetwork_id <= right.subnetwork_id,
+                "template transactions must be sorted by subnetwork: {:?} before {:?}",
+                left.subnetwork_id,
+                right.subnetwork_id
+            );
+        }
+    }
+
+    fn assert_template_non_coinbase_estimated_mass_at_most(transactions: &[Transaction], max_block_mass: u64) {
+        let mass: u64 = transactions.iter().skip(1).map(transaction_estimated_serialized_size).sum();
+        assert!(mass <= max_block_mass, "template non-coinbase mass {mass} exceeds block limit {max_block_mass}");
     }
 
     fn get_miner_data(prefix: Prefix) -> MinerData {

@@ -9,14 +9,14 @@ use crate::imports::*;
 // use futures::pin_mut;
 use cryptix_notify::{
     listener::ListenerId,
-    scope::{Scope, UtxosChangedScope, VirtualDaaScoreChangedScope},
+    scope::{Scope, UtxosChangedScope, VirtualChainChangedScope, VirtualDaaScoreChangedScope},
 };
 use cryptix_rpc_core::{
     api::{
         ctl::{RpcCtl, RpcState},
         ops::{RPC_API_REVISION, RPC_API_VERSION},
     },
-    message::UtxosChangedNotification,
+    message::{UtxosChangedNotification, VirtualChainChangedNotification},
     GetServerInfoResponse,
 };
 use cryptix_wrpc_client::CryptixRpcClient;
@@ -29,10 +29,23 @@ use crate::utxo::{
     Maturity, OutgoingTransaction, PendingUtxoEntryReference, SyncMonitor, UtxoContext, UtxoEntryId, UtxoEntryReference,
 };
 use crate::wallet::WalletBusMessage;
+use cryptix_consensus_core::tx::Transaction;
+use cryptix_rpc_core::RpcHash;
 use cryptix_rpc_core::{
     notify::connection::{ChannelConnection, ChannelType},
     Notification,
 };
+
+#[derive(Clone)]
+struct ConfirmedTransactionCacheEntry {
+    accepting_block_hash: RpcHash,
+    transaction: Arc<Transaction>,
+}
+
+#[derive(Clone, Default)]
+struct DecodedRpcBlockCacheEntry {
+    transactions: Vec<Transaction>,
+}
 
 pub struct Inner {
     /// Coinbase UTXOs in stasis
@@ -44,6 +57,9 @@ pub struct Inner {
     /// Address to UtxoContext map (maps all addresses used by
     /// all UtxoContexts to their respective UtxoContexts)
     address_to_utxo_context_map: DashMap<Arc<Address>, UtxoContext>,
+    /// Recently confirmed transactions indexed by txid. Used to enrich
+    /// incoming/external records with payload/subnetwork data when available.
+    confirmed_transactions: DashMap<TransactionId, ConfirmedTransactionCacheEntry>,
     // ---
     current_daa_score: Arc<AtomicU64>,
     network_id: Arc<Mutex<Option<NetworkId>>>,
@@ -75,6 +91,7 @@ impl Inner {
             pending: DashMap::new(),
             outgoing: DashMap::new(),
             address_to_utxo_context_map: DashMap::new(),
+            confirmed_transactions: DashMap::new(),
             current_daa_score: Arc::new(AtomicU64::new(0)),
             network_id: Arc::new(Mutex::new(network_id)),
             rpc: Mutex::new(rpc.clone()),
@@ -208,6 +225,10 @@ impl UtxoProcessor {
 
     pub fn address_to_utxo_context(&self, address: &Address) -> Option<UtxoContext> {
         self.inner.address_to_utxo_context_map.get(address).map(|v| v.clone())
+    }
+
+    pub fn confirmed_transaction(&self, txid: &TransactionId) -> Option<Transaction> {
+        self.inner.confirmed_transactions.get(txid).map(|entry| (*entry.transaction).clone())
     }
 
     pub async fn register_addresses(&self, addresses: Vec<Arc<Address>>, utxo_context: &UtxoContext) -> Result<()> {
@@ -427,6 +448,82 @@ impl UtxoProcessor {
         Ok(())
     }
 
+    pub async fn handle_virtual_chain_changed(&self, notification: VirtualChainChangedNotification) -> Result<()> {
+        let removed_block_hashes: HashSet<RpcHash> = notification.removed_chain_block_hashes.iter().copied().collect();
+        if !removed_block_hashes.is_empty() {
+            self.inner.confirmed_transactions.retain(|_, entry| !removed_block_hashes.contains(&entry.accepting_block_hash));
+        }
+
+        let mut decoded_block_cache = HashMap::<RpcHash, DecodedRpcBlockCacheEntry>::new();
+        for accepted in notification.accepted_transaction_ids.iter() {
+            if accepted.accepted_transaction_ids.is_empty() {
+                continue;
+            }
+
+            let block_transactions =
+                self.collect_accepting_block_transactions(accepted.accepting_block_hash, &mut decoded_block_cache).await?;
+
+            for txid in accepted.accepted_transaction_ids.iter() {
+                if let Some(transaction) = block_transactions.get(txid) {
+                    self.inner.confirmed_transactions.insert(
+                        *txid,
+                        ConfirmedTransactionCacheEntry {
+                            accepting_block_hash: accepted.accepting_block_hash,
+                            transaction: Arc::new(transaction.clone()),
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn decode_rpc_block_cached(
+        &self,
+        block_hash: RpcHash,
+        cache: &mut HashMap<RpcHash, DecodedRpcBlockCacheEntry>,
+    ) -> Result<DecodedRpcBlockCacheEntry> {
+        if let Some(entry) = cache.get(&block_hash) {
+            return Ok(entry.clone());
+        }
+
+        let block = self.rpc_api().get_block(block_hash, true).await?;
+        let mut transactions = Vec::with_capacity(block.transactions.len());
+        for rpc_transaction in block.transactions.into_iter() {
+            match Transaction::try_from(rpc_transaction) {
+                Ok(transaction) => {
+                    transactions.push(transaction);
+                }
+                Err(err) => {
+                    log_warn!("unable to decode confirmed block transaction for payload cache: {err}");
+                }
+            }
+        }
+
+        let entry = DecodedRpcBlockCacheEntry { transactions };
+        cache.insert(block_hash, entry.clone());
+        Ok(entry)
+    }
+
+    async fn collect_accepting_block_transactions(
+        &self,
+        accepting_block_hash: RpcHash,
+        cache: &mut HashMap<RpcHash, DecodedRpcBlockCacheEntry>,
+    ) -> Result<HashMap<TransactionId, Transaction>> {
+        // Keep VirtualChainChanged handling responsive.
+        // Expanding full mergesets here can stall the notification loop and delay
+        // Pending/Maturity/Daa updates under load. We cache accepting-block
+        // transactions only; missing payload attachments are recovered later via
+        // on-demand enrichment paths.
+        let decoded = self.decode_rpc_block_cached(accepting_block_hash, cache).await?;
+        let mut collected = HashMap::<TransactionId, Transaction>::new();
+        for transaction in decoded.transactions.into_iter() {
+            collected.entry(transaction.id()).or_insert(transaction);
+        }
+        Ok(collected)
+    }
+
     pub fn is_connected(&self) -> bool {
         self.inner.is_connected.load(Ordering::SeqCst)
     }
@@ -551,6 +648,7 @@ impl UtxoProcessor {
         self.inner.stasis.clear();
         self.inner.outgoing.clear();
         self.inner.address_to_utxo_context_map.clear();
+        self.inner.confirmed_transactions.clear();
         Ok(())
     }
 
@@ -562,6 +660,13 @@ impl UtxoProcessor {
         ));
         *self.inner.listener_id.lock().unwrap() = Some(listener_id);
         self.rpc_api().start_notify(listener_id, Scope::VirtualDaaScoreChanged(VirtualDaaScoreChangedScope {})).await?;
+        if let Err(err) = self
+            .rpc_api()
+            .start_notify(listener_id, Scope::VirtualChainChanged(VirtualChainChangedScope { include_accepted_transaction_ids: true }))
+            .await
+        {
+            log_warn!("unable to subscribe for VirtualChainChanged notifications (confirmed payload enrichment disabled): {err}");
+        }
         Ok(())
     }
 
@@ -575,19 +680,27 @@ impl UtxoProcessor {
     }
 
     async fn handle_notification(&self, notification: Notification) -> Result<()> {
-        let _lock = self.inner.notification_guard.write().await;
-
         match notification {
             Notification::VirtualDaaScoreChanged(virtual_daa_score_changed_notification) => {
+                let _lock = self.inner.notification_guard.write().await;
                 self.handle_daa_score_change(virtual_daa_score_changed_notification.virtual_daa_score).await?;
             }
 
             Notification::UtxosChanged(utxos_changed_notification) => {
+                let _lock = self.inner.notification_guard.write().await;
                 if !self.is_synced() {
                     self.sync_proc().track(true).await?;
                 }
 
                 self.handle_utxo_changed(utxos_changed_notification).await?;
+            }
+
+            Notification::VirtualChainChanged(virtual_chain_changed_notification) => {
+                // @ZeroBytes
+                // Keep the heavy payload-enrichment path outside notification_guard.write()
+                // so send/submit paths waiting on notification_lock() are not blocked by
+                // expensive get_block() mergeset traversal. There was a Bug before.
+                self.handle_virtual_chain_changed(virtual_chain_changed_notification).await?;
             }
 
             _ => {

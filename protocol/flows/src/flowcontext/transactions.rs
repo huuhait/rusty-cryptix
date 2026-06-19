@@ -1,18 +1,18 @@
 use super::process_queue::ProcessQueue;
-use itertools::Itertools;
 use cryptix_consensus_core::tx::TransactionId;
 use cryptix_core::debug;
 use cryptix_p2p_lib::{
     make_message,
-    pb::{cryptixd_message::Payload, InvTransactionsMessage, CryptixdMessage},
+    pb::{cryptixd_message::Payload, CryptixdMessage, InvTransactionsMessage},
     Hub,
 };
+use itertools::Itertools;
+use rand::seq::SliceRandom;
 use std::time::{Duration, Instant};
 
 /// Interval between mempool scanning tasks (in seconds)
 const SCANNING_TASK_INTERVAL: u64 = 10;
 const REBROADCAST_FREQUENCY: u64 = 3;
-const BROADCAST_INTERVAL: Duration = Duration::from_millis(500);
 pub(crate) const MAX_INV_PER_TX_INV_MSG: usize = 131_072;
 
 pub struct TransactionsSpread {
@@ -22,10 +22,11 @@ pub struct TransactionsSpread {
     scanning_job_count: u64,
     transaction_ids: ProcessQueue<TransactionId>,
     last_broadcast_time: Instant,
+    broadcast_interval: Duration,
 }
 
 impl TransactionsSpread {
-    pub fn new(hub: Hub) -> Self {
+    pub fn new(hub: Hub, broadcast_interval: Duration) -> Self {
         Self {
             hub,
             last_scanning_time: Instant::now(),
@@ -33,6 +34,7 @@ impl TransactionsSpread {
             scanning_job_count: 0,
             transaction_ids: ProcessQueue::new(),
             last_broadcast_time: Instant::now(),
+            broadcast_interval,
         }
     }
 
@@ -69,11 +71,11 @@ impl TransactionsSpread {
         self.scanning_task_running = false;
     }
 
-    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to all peers
+    /// Add the given transactions IDs to a set of IDs to broadcast. The IDs will be broadcasted to peers
     /// within transaction Inv messages.
     ///
     /// The broadcast itself may happen only during a subsequent call to this function since it is done at most
-    /// every [`BROADCAST_INTERVAL`] milliseconds or when the queue length is larger than the Inv message
+    /// every `broadcast_interval` milliseconds or when the queue length is larger than the Inv message
     /// capacity.
     ///
     /// _GO-CRYPTIXD: EnqueueTransactionIDsForPropagation_
@@ -81,7 +83,7 @@ impl TransactionsSpread {
         self.transaction_ids.enqueue_chunk(transaction_ids);
 
         let now = Instant::now();
-        if now < self.last_broadcast_time + BROADCAST_INTERVAL && self.transaction_ids.len() < MAX_INV_PER_TX_INV_MSG {
+        if now < self.last_broadcast_time + self.broadcast_interval && self.transaction_ids.len() < MAX_INV_PER_TX_INV_MSG {
             return;
         }
 
@@ -96,11 +98,14 @@ impl TransactionsSpread {
     }
 
     async fn broadcast(&self, msg: CryptixdMessage, should_throttle: bool) {
-        if should_throttle {
+        let mut peers = self.hub.active_peers().into_iter().map(|peer| peer.key()).collect_vec();
+        if should_throttle && peers.len() > 8 {
             // TODO: Figure out a better number
-            self.hub.broadcast_to_some_peers(msg, 8).await
-        } else {
-            self.hub.broadcast(msg).await
+            peers.shuffle(&mut rand::thread_rng());
+            peers.truncate(8);
+        }
+        for peer_key in peers {
+            let _ = self.hub.send(peer_key, msg.clone()).await;
         }
     }
 }

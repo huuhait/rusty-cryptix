@@ -1,5 +1,6 @@
 use crate::{flow_context::FlowContext, flow_trait::Flow};
-use cryptix_core::debug;
+use cryptix_consensus_core::blockstatus::BlockStatus;
+use cryptix_core::{debug, warn};
 use cryptix_p2p_lib::{
     common::ProtocolError,
     dequeue_with_request_id, make_message, make_response,
@@ -42,7 +43,18 @@ impl HandleRelayBlockRequests {
             let session = self.ctx.consensus().unguarded_session();
 
             for hash in hashes {
+                if matches!(
+                    session.async_get_block_status(hash).await,
+                    Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+                ) {
+                    warn!("Not serving relay block {} to peer {} because it is not UTXO/Atomic-valid", hash, self.router);
+                    continue;
+                }
+
                 let block = session.async_get_block(hash).await?;
+                for claim in self.ctx.block_producer_claims_for_hash(hash) {
+                    self.router.enqueue(make_message!(Payload::BlockProducerClaimV1, claim)).await?;
+                }
                 self.router.enqueue(make_response!(Payload::Block, (&block).into(), request_id)).await?;
                 debug!("relayed block with hash {} to peer {}", hash, self.router);
             }
@@ -50,9 +62,20 @@ impl HandleRelayBlockRequests {
     }
 
     async fn send_sink(&mut self) -> Result<(), ProtocolError> {
-        let sink = self.ctx.consensus().unguarded_session().async_get_sink().await;
+        let session = self.ctx.consensus().unguarded_session();
+        let sink = session.async_get_sink().await;
         if sink == self.ctx.config.genesis.hash {
             return Ok(());
+        }
+        if matches!(
+            session.async_get_block_status(sink).await,
+            Some(BlockStatus::StatusDisqualifiedFromChain | BlockStatus::StatusInvalid)
+        ) {
+            warn!("Not advertising sink {} to peer {} because it is not UTXO/Atomic-valid", sink, self.router);
+            return Ok(());
+        }
+        for claim in self.ctx.block_producer_claims_for_hash(sink) {
+            self.router.enqueue(make_message!(Payload::BlockProducerClaimV1, claim)).await?;
         }
         self.router.enqueue(make_message!(Payload::InvRelayBlock, InvRelayBlockMessage { hash: Some(sink.into()) })).await?;
         Ok(())

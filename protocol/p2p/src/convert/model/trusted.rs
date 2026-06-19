@@ -6,6 +6,7 @@
 use cryptix_consensus_core::{
     block::Block,
     blockhash::ORIGIN,
+    pruning::PruningPointAtomicState,
     trusted::{TrustedBlock, TrustedGhostdagData, TrustedHeader},
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
 };
@@ -17,11 +18,21 @@ use crate::common::ProtocolError;
 pub struct TrustedDataPackage {
     pub daa_window: Vec<TrustedHeader>,
     pub ghostdag_window: Vec<TrustedGhostdagData>,
+    pub atomic_state: Option<PruningPointAtomicState>,
+    pub atomic_state_hash: Option<[u8; 32]>,
+    pub atomic_state_byte_length: u64,
+    pub atomic_state_chunk_count: u64,
 }
 
 impl TrustedDataPackage {
-    pub fn new(daa_window: Vec<TrustedHeader>, ghostdag_window: Vec<TrustedGhostdagData>) -> Self {
-        Self { daa_window, ghostdag_window }
+    pub fn new(
+        daa_window: Vec<TrustedHeader>,
+        ghostdag_window: Vec<TrustedGhostdagData>,
+        atomic_state: Option<PruningPointAtomicState>,
+    ) -> Self {
+        let atomic_state_hash = atomic_state.as_ref().map(|state| state.state_hash);
+        let atomic_state_byte_length = 0;
+        Self { daa_window, ghostdag_window, atomic_state, atomic_state_hash, atomic_state_byte_length, atomic_state_chunk_count: 0 }
     }
 
     /// Returns the trusted set -- a sub-DAG in the anti-future of the pruning point which contains

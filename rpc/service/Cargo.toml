@@ -10,6 +10,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cryptix-atomicindex.workspace = true
+cryptix-alloc.workspace = true
 cryptix-addresses.workspace = true
 cryptix-consensus-core.workspace = true
 cryptix-consensus-notify.workspace = true
@@ -30,6 +32,7 @@ cryptix-utils-tower.workspace = true
 cryptix-utxoindex.workspace = true
 
 async-trait.workspace = true
+blake2b_simd.workspace = true
 log.workspace = true
 tokio.workspace = true
 triggered.workspace = true

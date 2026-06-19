@@ -23,11 +23,11 @@ use cryptix_consensus_core::network::NetworkId;
 use cryptix_core::debug;
 use cryptix_notify::subscription::Command;
 use cryptix_rpc_core::{
-    RpcContextualPeerAddress, RpcError, RpcExtraData, RpcHash, RpcIpAddress, RpcNetworkType, RpcPeerAddress, RpcResult,
-    SubmitBlockRejectReason, SubmitBlockReport,
+    RpcContextualPeerAddress, RpcError, RpcExtraData, RpcFastIntentStatus, RpcHash, RpcIpAddress, RpcNetworkType, RpcPeerAddress,
+    RpcResult, SubmitBlockRejectReason, SubmitBlockReport,
 };
 use cryptix_utils::hex::*;
-use std::str::FromStr;
+use std::{collections::HashMap, str::FromStr};
 
 macro_rules! from {
     // Response capture
@@ -122,6 +122,35 @@ macro_rules! try_from {
     };
 }
 
+fn fast_intent_status_to_proto(status: RpcFastIntentStatus) -> &'static str {
+    match status {
+        RpcFastIntentStatus::Received => "received",
+        RpcFastIntentStatus::Validated => "validated",
+        RpcFastIntentStatus::Locked => "locked",
+        RpcFastIntentStatus::FastConfirmed => "fast_confirmed",
+        RpcFastIntentStatus::Expired => "expired",
+        RpcFastIntentStatus::Dropped => "dropped",
+        RpcFastIntentStatus::Rejected => "rejected",
+        RpcFastIntentStatus::Cancelled => "cancelled",
+        RpcFastIntentStatus::UnknownIntent => "unknown_intent",
+    }
+}
+
+fn fast_intent_status_from_proto(status: &str) -> RpcResult<RpcFastIntentStatus> {
+    match status {
+        "received" => Ok(RpcFastIntentStatus::Received),
+        "validated" => Ok(RpcFastIntentStatus::Validated),
+        "locked" => Ok(RpcFastIntentStatus::Locked),
+        "fast_confirmed" => Ok(RpcFastIntentStatus::FastConfirmed),
+        "expired" => Ok(RpcFastIntentStatus::Expired),
+        "dropped" => Ok(RpcFastIntentStatus::Dropped),
+        "rejected" => Ok(RpcFastIntentStatus::Rejected),
+        "cancelled" => Ok(RpcFastIntentStatus::Cancelled),
+        "unknown_intent" => Ok(RpcFastIntentStatus::UnknownIntent),
+        _ => Err(RpcError::General(format!("invalid fast intent status: {status}"))),
+    }
+}
+
 // ----------------------------------------------------------------------------
 // rpc_core to protowire
 // ----------------------------------------------------------------------------
@@ -192,6 +221,11 @@ from!(item: &cryptix_rpc_core::NotifyNewBlockTemplateRequest, protowire::NotifyN
     Self { command: item.command.into() }
 });
 from!(RpcResult<&cryptix_rpc_core::NotifyNewBlockTemplateResponse>, protowire::NotifyNewBlockTemplateResponseMessage);
+
+from!(item: &cryptix_rpc_core::NotifyTokenEventsRequest, protowire::NotifyTokenEventsRequestMessage, {
+    Self { command: item.command.into() }
+});
+from!(RpcResult<&cryptix_rpc_core::NotifyTokenEventsResponse>, protowire::NotifyTokenEventsResponseMessage);
 
 // ~~~
 
@@ -430,6 +464,69 @@ from!(item: RpcResult<&cryptix_rpc_core::GetCurrentBlockColorResponse>, protowir
     Self { blue: item.blue, error: None }
 });
 
+from!(item: &cryptix_rpc_core::SubmitFastIntentRequest, protowire::SubmitFastIntentRequestMessage, {
+    Self {
+        base_tx: Some((&item.base_tx).into()),
+        intent_nonce: item.intent_nonce,
+        client_created_at_ms: item.client_created_at_ms,
+        max_fee: item.max_fee,
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::SubmitFastIntentResponse>, protowire::SubmitFastIntentResponseMessage, {
+    Self {
+        intent_id: item.intent_id.to_string(),
+        status: fast_intent_status_to_proto(item.status).to_string(),
+        reason: item.reason.clone().unwrap_or_default(),
+        node_epoch: item.node_epoch,
+        expires_at_ms: item.expires_at_ms.unwrap_or_default(),
+        retention_until_ms: item.retention_until_ms.unwrap_or_default(),
+        cancel_token: item.cancel_token.clone().unwrap_or_default(),
+        basechain_submitted: item.basechain_submitted,
+        base_tx_id: item.base_tx_id.as_ref().map(|id| id.to_string()).unwrap_or_default(),
+        error: None,
+    }
+});
+
+from!(item: &cryptix_rpc_core::GetFastIntentStatusRequest, protowire::GetFastIntentStatusRequestMessage, {
+    Self {
+        intent_id: item.intent_id.to_string(),
+        client_last_node_epoch: item.client_last_node_epoch.unwrap_or_default(),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetFastIntentStatusResponse>, protowire::GetFastIntentStatusResponseMessage, {
+    Self {
+        status: fast_intent_status_to_proto(item.status).to_string(),
+        reason: item.reason.clone().unwrap_or_default(),
+        node_epoch: item.node_epoch,
+        expires_at_ms: item.expires_at_ms.unwrap_or_default(),
+        retention_until_ms: item.retention_until_ms.unwrap_or_default(),
+        cancel_token: item.cancel_token.clone().unwrap_or_default(),
+        has_epoch_changed: item.epoch_changed.is_some(),
+        epoch_changed: item.epoch_changed.unwrap_or_default(),
+        base_tx_id: item.base_tx_id.as_ref().map(|id| id.to_string()).unwrap_or_default(),
+        error: None,
+    }
+});
+
+from!(item: &cryptix_rpc_core::CancelFastIntentRequest, protowire::CancelFastIntentRequestMessage, {
+    Self {
+        intent_id: item.intent_id.to_string(),
+        cancel_token: item.cancel_token.clone(),
+        node_epoch: item.node_epoch,
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::CancelFastIntentResponse>, protowire::CancelFastIntentResponseMessage, {
+    Self {
+        status: fast_intent_status_to_proto(item.status).to_string(),
+        reason: item.reason.clone().unwrap_or_default(),
+        node_epoch: item.node_epoch,
+        retention_until_ms: item.retention_until_ms.unwrap_or_default(),
+        has_epoch_changed: item.epoch_changed.is_some(),
+        epoch_changed: item.epoch_changed.unwrap_or_default(),
+        error: None,
+    }
+});
+
 from!(&cryptix_rpc_core::PingRequest, protowire::PingRequestMessage);
 from!(RpcResult<&cryptix_rpc_core::PingResponse>, protowire::PingResponseMessage);
 
@@ -451,8 +548,11 @@ from!(item: RpcResult<&cryptix_rpc_core::GetMetricsResponse>, protowire::GetMetr
         bandwidth_metrics: item.bandwidth_metrics.as_ref().map(|x| x.into()),
         consensus_metrics: item.consensus_metrics.as_ref().map(|x| x.into()),
         storage_metrics: item.storage_metrics.as_ref().map(|x| x.into()),
-        // TODO
-        // custom_metrics : None,
+        custom_metrics: item
+            .custom_metrics
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.into())).collect())
+            .unwrap_or_default(),
         error: None,
     }
 });
@@ -506,6 +606,463 @@ from!(item: RpcResult<&cryptix_rpc_core::GetSyncStatusResponse>, protowire::GetS
         error: None,
     }
 });
+from!(&cryptix_rpc_core::GetStrongNodesRequest, protowire::GetStrongNodesRequestMessage);
+from!(item: &cryptix_rpc_core::RpcStrongNodeEntry, protowire::RpcStrongNodeEntry, {
+    Self {
+        node_id: item.node_id.clone(),
+        public_key_xonly: item.public_key_xonly.clone(),
+        source: item.source.clone(),
+        claimed_blocks: item.claimed_blocks,
+        share_bps: item.share_bps,
+        last_claim_block_hash: item.last_claim_block_hash.clone(),
+        last_claim_time_ms: item.last_claim_time_ms,
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetStrongNodesResponse>, protowire::GetStrongNodesResponseMessage, {
+    Self {
+        enabled_by_config: item.enabled_by_config,
+        hardfork_active: item.hardfork_active,
+        runtime_available: item.runtime_available,
+        disabled_reason_code: item.disabled_reason_code.clone(),
+        disabled_reason_message: item.disabled_reason_message.clone(),
+        conflict_total: item.conflict_total,
+        window_size: item.window_size,
+        entries: item.entries.iter().map(Into::into).collect(),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::RpcTokenContext, protowire::RpcTokenContextMessage, {
+    Self {
+        at_block_hash: item.at_block_hash.to_string(),
+        at_daa_score: item.at_daa_score,
+        state_hash: item.state_hash.clone(),
+        is_degraded: item.is_degraded,
+    }
+});
+from!(item: &cryptix_rpc_core::RpcTokenAsset, protowire::RpcTokenAssetMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        creator_owner_id: item.creator_owner_id.clone(),
+        token_version: item.token_version,
+        mint_authority_owner_id: item.mint_authority_owner_id.clone(),
+        decimals: item.decimals,
+        supply_mode: item.supply_mode,
+        max_supply: item.max_supply.clone(),
+        total_supply: item.total_supply.clone(),
+        name: item.name.clone(),
+        symbol: item.symbol.clone(),
+        metadata_hex: item.metadata_hex.clone(),
+        created_block_hash: item.created_block_hash.map(|hash| hash.to_string()),
+        created_daa_score: item.created_daa_score,
+        created_at: item.created_at,
+        platform_tag: item.platform_tag.clone(),
+    }
+});
+from!(item: &cryptix_rpc_core::RpcTokenEvent, protowire::RpcTokenEventMessage, {
+    Self {
+        event_id: item.event_id.clone(),
+        sequence: item.sequence,
+        accepting_block_hash: item.accepting_block_hash.to_string(),
+        txid: item.txid.to_string(),
+        event_type: item.event_type,
+        apply_status: item.apply_status,
+        noop_reason: item.noop_reason,
+        ordinal: item.ordinal,
+        reorg_of_event_id: item.reorg_of_event_id.clone(),
+        op_type: item.op_type,
+        asset_id: item.asset_id.clone(),
+        from_owner_id: item.from_owner_id.clone(),
+        to_owner_id: item.to_owner_id.clone(),
+        amount: item.amount.clone(),
+    }
+});
+from!(item: &cryptix_rpc_core::RpcTokenOwnerBalance, protowire::RpcTokenOwnerBalanceMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        balance: item.balance.clone(),
+        asset: item.asset.as_ref().map(Into::into),
+    }
+});
+from!(item: &cryptix_rpc_core::RpcTokenHolder, protowire::RpcTokenHolderMessage, {
+    Self { owner_id: item.owner_id.clone(), balance: item.balance.clone() }
+});
+from!(item: &cryptix_rpc_core::RpcLiquidityFeeRecipient, protowire::RpcLiquidityFeeRecipientMessage, {
+    Self { owner_id: item.owner_id.clone(), address: item.address.clone(), unclaimed_sompi: item.unclaimed_sompi.clone() }
+});
+from!(item: &cryptix_rpc_core::RpcLiquidityPoolState, protowire::RpcLiquidityPoolStateMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        pool_nonce: item.pool_nonce,
+        curve_version: item.curve_version,
+        curve_mode: item.curve_mode,
+        curve_mode_label: item.curve_mode_label.clone(),
+        individual_virtual_cpay_reserves_sompi: item.individual_virtual_cpay_reserves_sompi.clone(),
+        individual_virtual_token_multiplier_bps: item.individual_virtual_token_multiplier_bps,
+        fee_bps: item.fee_bps,
+        max_supply: item.max_supply.clone(),
+        total_supply: item.total_supply.clone(),
+        circulating_token_supply: item.circulating_token_supply.clone(),
+        real_cpay_reserves_sompi: item.real_cpay_reserves_sompi.clone(),
+        real_token_reserves: item.real_token_reserves.clone(),
+        virtual_cpay_reserves_sompi: item.virtual_cpay_reserves_sompi.clone(),
+        virtual_token_reserves: item.virtual_token_reserves.clone(),
+        max_buy_in_sompi: item.max_buy_in_sompi.clone(),
+        max_tokens_out: item.max_tokens_out.clone(),
+        unclaimed_fee_total_sompi: item.unclaimed_fee_total_sompi.clone(),
+        vault_value_sompi: item.vault_value_sompi.clone(),
+        vault_txid: item.vault_txid.to_string(),
+        vault_output_index: item.vault_output_index,
+        fee_recipients: item.fee_recipients.iter().map(Into::into).collect(),
+        liquidity_lock_enabled: item.liquidity_lock_enabled,
+        unlock_target_sompi: item.unlock_target_sompi.clone(),
+        unlocked: item.unlocked,
+        sell_locked: item.sell_locked,
+        liquidity_cpay_sompi: item.liquidity_cpay_sompi.clone(),
+        current_spot_price_sompi: item.current_spot_price_sompi.clone(),
+        circulating_mcap_cpay_sompi: item.circulating_mcap_cpay_sompi.clone(),
+        fdv_mcap_cpay_sompi: item.fdv_mcap_cpay_sompi.clone(),
+    }
+});
+from!(item: &cryptix_rpc_core::RpcLiquidityHolder, protowire::RpcLiquidityHolderMessage, {
+    Self { address: item.address.clone(), owner_id: item.owner_id.clone(), balance: item.balance.clone() }
+});
+from!(item: &cryptix_rpc_core::SimulateTokenOpRequest, protowire::SimulateTokenOpRequestMessage, {
+    Self {
+        payload_hex: item.payload_hex.clone(),
+        owner_id: item.owner_id.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::SimulateTokenOpResponse>, protowire::SimulateTokenOpResponseMessage, {
+    Self {
+        result: item.result.clone(),
+        noop_reason: item.noop_reason,
+        expected_next_nonce: item.expected_next_nonce,
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetTokenBalanceRequest, protowire::GetTokenBalanceRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        owner_id: item.owner_id.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenBalanceResponse>, protowire::GetTokenBalanceResponseMessage, {
+    Self { balance: item.balance.clone(), context: Some((&item.context).into()), error: None }
+});
+from!(item: &cryptix_rpc_core::GetTokenNonceRequest, protowire::GetTokenNonceRequestMessage, {
+    Self {
+        owner_id: item.owner_id.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+        asset_id: item.asset_id.clone(),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenNonceResponse>, protowire::GetTokenNonceResponseMessage, {
+    Self { expected_next_nonce: item.expected_next_nonce, context: Some((&item.context).into()), error: None }
+});
+from!(item: &cryptix_rpc_core::GetTokenAssetRequest, protowire::GetTokenAssetRequestMessage, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenAssetResponse>, protowire::GetTokenAssetResponseMessage, {
+    Self { asset: item.asset.as_ref().map(Into::into), context: Some((&item.context).into()), error: None }
+});
+from!(item: &cryptix_rpc_core::GetTokenOpStatusRequest, protowire::GetTokenOpStatusRequestMessage, {
+    Self { txid: item.txid.to_string(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenOpStatusResponse>, protowire::GetTokenOpStatusResponseMessage, {
+    Self {
+        accepting_block_hash: item.accepting_block_hash.map(|hash| hash.to_string()),
+        apply_status: item.apply_status,
+        noop_reason: item.noop_reason,
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetTokenStateHashRequest, protowire::GetTokenStateHashRequestMessage, {
+    Self { at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenStateHashResponse>, protowire::GetTokenStateHashResponseMessage, {
+    Self { context: Some((&item.context).into()), error: None }
+});
+from!(item: &cryptix_rpc_core::GetTokenSpendabilityRequest, protowire::GetTokenSpendabilityRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        owner_id: item.owner_id.clone(),
+        min_daa_for_spend: item.min_daa_for_spend,
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenSpendabilityResponse>, protowire::GetTokenSpendabilityResponseMessage, {
+    Self {
+        can_spend: item.can_spend,
+        reason: item.reason.clone(),
+        balance: item.balance.clone(),
+        expected_next_nonce: item.expected_next_nonce,
+        min_daa_for_spend: item.min_daa_for_spend,
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetTokenEventsRequest, protowire::GetTokenEventsRequestMessage, {
+    Self {
+        after_sequence: item.after_sequence,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenEventsResponse>, protowire::GetTokenEventsResponseMessage, {
+    Self { events: item.events.iter().map(Into::into).collect(), context: Some((&item.context).into()), error: None }
+});
+from!(item: &cryptix_rpc_core::GetTokenAssetsRequest, protowire::GetTokenAssetsRequestMessage, {
+    Self {
+        offset: item.offset,
+        limit: item.limit,
+        query: item.query.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenAssetsResponse>, protowire::GetTokenAssetsResponseMessage, {
+    Self {
+        assets: item.assets.iter().map(Into::into).collect(),
+        total: item.total,
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetTokenBalancesByOwnerRequest, protowire::GetTokenBalancesByOwnerRequestMessage, {
+    Self {
+        owner_id: item.owner_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        include_assets: item.include_assets,
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenBalancesByOwnerResponse>, protowire::GetTokenBalancesByOwnerResponseMessage, {
+    Self {
+        balances: item.balances.iter().map(Into::into).collect(),
+        total: item.total,
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetTokenHoldersRequest, protowire::GetTokenHoldersRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenHoldersResponse>, protowire::GetTokenHoldersResponseMessage, {
+    Self {
+        holders: item.holders.iter().map(Into::into).collect(),
+        total: item.total,
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetTokenOwnerIdByAddressRequest, protowire::GetTokenOwnerIdByAddressRequestMessage, {
+    Self { address: item.address.clone(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenOwnerIdByAddressResponse>, protowire::GetTokenOwnerIdByAddressResponseMessage, {
+    Self {
+        owner_id: item.owner_id.clone(),
+        reason: item.reason.clone(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityPoolStateRequest, protowire::GetLiquidityPoolStateRequestMessage, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityPoolStateResponse>, protowire::GetLiquidityPoolStateResponseMessage, {
+    Self {
+        pool: item.pool.as_ref().map(Into::into),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityQuoteRequest, protowire::GetLiquidityQuoteRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityQuoteResponse>, protowire::GetLiquidityQuoteResponseMessage, {
+    Self {
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        fee_amount_sompi: item.fee_amount_sompi.clone(),
+        net_in_amount: item.net_in_amount.clone(),
+        amount_out: item.amount_out.clone(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityFeeStateRequest, protowire::GetLiquidityFeeStateRequestMessage, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityFeeStateResponse>, protowire::GetLiquidityFeeStateResponseMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        fee_bps: item.fee_bps,
+        total_unclaimed_sompi: item.total_unclaimed_sompi.clone(),
+        recipients: item.recipients.iter().map(Into::into).collect(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetLiquidityClaimPreviewRequest, protowire::GetLiquidityClaimPreviewRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        recipient_address: item.recipient_address.clone(),
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(
+    item: RpcResult<&cryptix_rpc_core::GetLiquidityClaimPreviewResponse>,
+    protowire::GetLiquidityClaimPreviewResponseMessage,
+    {
+        Self {
+            recipient_address: item.recipient_address.clone(),
+            owner_id: item.owner_id.clone(),
+            claimable_amount_sompi: item.claimable_amount_sompi.clone(),
+            min_payout_sompi: item.min_payout_sompi.clone(),
+            claimable_now: item.claimable_now,
+            reason: item.reason.clone(),
+            context: Some((&item.context).into()),
+            error: None,
+        }
+    }
+);
+from!(item: &cryptix_rpc_core::GetLiquidityHoldersRequest, protowire::GetLiquidityHoldersRequestMessage, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.map(|hash| hash.to_string()),
+    }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetLiquidityHoldersResponse>, protowire::GetLiquidityHoldersResponseMessage, {
+    Self {
+        holders: item.holders.iter().map(Into::into).collect(),
+        total: item.total,
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::ExportTokenSnapshotRequest, protowire::ExportTokenSnapshotRequestMessage, {
+    Self { path: item.path.clone() }
+});
+from!(item: RpcResult<&cryptix_rpc_core::ExportTokenSnapshotResponse>, protowire::ExportTokenSnapshotResponseMessage, {
+    Self { exported: item.exported, context: Some((&item.context).into()), error: None }
+});
+from!(item: &cryptix_rpc_core::ImportTokenSnapshotRequest, protowire::ImportTokenSnapshotRequestMessage, {
+    Self { path: item.path.clone() }
+});
+from!(item: RpcResult<&cryptix_rpc_core::ImportTokenSnapshotResponse>, protowire::ImportTokenSnapshotResponseMessage, {
+    Self { imported: item.imported, context: Some((&item.context).into()), error: None }
+});
+from!(item: &cryptix_rpc_core::GetTokenHealthRequest, protowire::GetTokenHealthRequestMessage, {
+    Self { at_block_hash: item.at_block_hash.map(|hash| hash.to_string()) }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetTokenHealthResponse>, protowire::GetTokenHealthResponseMessage, {
+    Self {
+        is_degraded: item.is_degraded,
+        bootstrap_in_progress: item.bootstrap_in_progress,
+        live_correct: item.live_correct,
+        token_state: item.token_state.clone(),
+        last_applied_block: item.last_applied_block.map(|hash| hash.to_string()),
+        last_sequence: item.last_sequence,
+        state_hash: item.state_hash.clone(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::RpcScBootstrapSource, protowire::RpcScBootstrapSourceMessage, {
+    Self {
+        snapshot_id: item.snapshot_id.clone(),
+        protocol_version: item.protocol_version,
+        network_id: item.network_id.clone(),
+        node_identity: item.node_identity.clone(),
+        at_block_hash: item.at_block_hash.to_string(),
+        at_daa_score: item.at_daa_score,
+        state_hash_at_fp: item.state_hash_at_fp.clone(),
+        window_start_block_hash: item.window_start_block_hash.to_string(),
+        window_end_block_hash: item.window_end_block_hash.to_string(),
+    }
+});
+from!(item: &cryptix_rpc_core::RpcScManifestSignature, protowire::RpcScManifestSignatureMessage, {
+    Self { signer_pubkey_hex: item.signer_pubkey_hex.clone(), signature_hex: item.signature_hex.clone() }
+});
+from!(&cryptix_rpc_core::GetScBootstrapSourcesRequest, protowire::GetScBootstrapSourcesRequestMessage);
+from!(item: RpcResult<&cryptix_rpc_core::GetScBootstrapSourcesResponse>, protowire::GetScBootstrapSourcesResponseMessage, {
+    Self {
+        sources: item.sources.iter().map(Into::into).collect(),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetScSnapshotManifestRequest, protowire::GetScSnapshotManifestRequestMessage, {
+    Self { snapshot_id: item.snapshot_id.clone() }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetScSnapshotManifestResponse>, protowire::GetScSnapshotManifestResponseMessage, {
+    Self {
+        snapshot_id: item.snapshot_id.clone(),
+        manifest_hex: item.manifest_hex.clone(),
+        manifest_signatures: item.manifest_signatures.iter().map(Into::into).collect(),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetScSnapshotChunkRequest, protowire::GetScSnapshotChunkRequestMessage, {
+    Self { snapshot_id: item.snapshot_id.clone(), chunk_index: item.chunk_index, chunk_size: item.chunk_size }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetScSnapshotChunkResponse>, protowire::GetScSnapshotChunkResponseMessage, {
+    Self {
+        snapshot_id: item.snapshot_id.clone(),
+        chunk_index: item.chunk_index,
+        total_chunks: item.total_chunks,
+        file_size: item.file_size,
+        chunk_hex: item.chunk_hex.clone(),
+        error: None,
+    }
+});
+from!(item: &cryptix_rpc_core::GetScReplayWindowChunkRequest, protowire::GetScReplayWindowChunkRequestMessage, {
+    Self { snapshot_id: item.snapshot_id.clone(), chunk_index: item.chunk_index, chunk_size: item.chunk_size }
+});
+from!(item: RpcResult<&cryptix_rpc_core::GetScReplayWindowChunkResponse>, protowire::GetScReplayWindowChunkResponseMessage, {
+    Self {
+        snapshot_id: item.snapshot_id.clone(),
+        chunk_index: item.chunk_index,
+        total_chunks: item.total_chunks,
+        file_size: item.file_size,
+        chunk_hex: item.chunk_hex.clone(),
+        error: None,
+    }
+});
+from!(&cryptix_rpc_core::GetScSnapshotHeadRequest, protowire::GetScSnapshotHeadRequestMessage);
+from!(item: RpcResult<&cryptix_rpc_core::GetScSnapshotHeadResponse>, protowire::GetScSnapshotHeadResponseMessage, {
+    Self {
+        head: item.head.as_ref().map(Into::into),
+        context: Some((&item.context).into()),
+        error: None,
+    }
+});
+from!(
+    item: &cryptix_rpc_core::GetConsensusAtomicStateHashRequest,
+    protowire::GetConsensusAtomicStateHashRequestMessage,
+    { Self { block_hash: item.block_hash.to_string() } }
+);
+from!(
+    item: RpcResult<&cryptix_rpc_core::GetConsensusAtomicStateHashResponse>,
+    protowire::GetConsensusAtomicStateHashResponseMessage,
+    { Self { state_hash: item.state_hash.clone(), error: None } }
+);
 
 from!(item: &cryptix_rpc_core::NotifyUtxosChangedRequest, protowire::NotifyUtxosChangedRequestMessage, {
     Self { addresses: item.addresses.iter().map(|x| x.into()).collect(), command: item.command.into() }
@@ -917,6 +1474,68 @@ try_from!(item: &protowire::GetCurrentBlockColorResponseMessage, RpcResult<crypt
     }
 });
 
+try_from!(item: &protowire::SubmitFastIntentRequestMessage, cryptix_rpc_core::SubmitFastIntentRequest, {
+    Self {
+        base_tx: item
+            .base_tx
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("SubmitFastIntentRequestMessage".to_string(), "base_tx".to_string()))?
+            .try_into()?,
+        intent_nonce: item.intent_nonce,
+        client_created_at_ms: item.client_created_at_ms,
+        max_fee: item.max_fee,
+    }
+});
+try_from!(item: &protowire::SubmitFastIntentResponseMessage, RpcResult<cryptix_rpc_core::SubmitFastIntentResponse>, {
+    Self {
+        intent_id: RpcHash::from_str(&item.intent_id)?,
+        status: fast_intent_status_from_proto(&item.status)?,
+        reason: (!item.reason.is_empty()).then(|| item.reason.clone()),
+        base_tx_id: (!item.base_tx_id.is_empty()).then(|| RpcHash::from_str(&item.base_tx_id)).transpose()?,
+        node_epoch: item.node_epoch,
+        expires_at_ms: (item.expires_at_ms != 0).then_some(item.expires_at_ms),
+        retention_until_ms: (item.retention_until_ms != 0).then_some(item.retention_until_ms),
+        cancel_token: (!item.cancel_token.is_empty()).then(|| item.cancel_token.clone()),
+        basechain_submitted: item.basechain_submitted,
+    }
+});
+
+try_from!(item: &protowire::GetFastIntentStatusRequestMessage, cryptix_rpc_core::GetFastIntentStatusRequest, {
+    Self {
+        intent_id: RpcHash::from_str(&item.intent_id)?,
+        client_last_node_epoch: (item.client_last_node_epoch != 0).then_some(item.client_last_node_epoch),
+    }
+});
+try_from!(item: &protowire::GetFastIntentStatusResponseMessage, RpcResult<cryptix_rpc_core::GetFastIntentStatusResponse>, {
+    Self {
+        status: fast_intent_status_from_proto(&item.status)?,
+        reason: (!item.reason.is_empty()).then(|| item.reason.clone()),
+        base_tx_id: (!item.base_tx_id.is_empty()).then(|| RpcHash::from_str(&item.base_tx_id)).transpose()?,
+        node_epoch: item.node_epoch,
+        expires_at_ms: (item.expires_at_ms != 0).then_some(item.expires_at_ms),
+        retention_until_ms: (item.retention_until_ms != 0).then_some(item.retention_until_ms),
+        cancel_token: (!item.cancel_token.is_empty()).then(|| item.cancel_token.clone()),
+        epoch_changed: item.has_epoch_changed.then_some(item.epoch_changed),
+    }
+});
+
+try_from!(item: &protowire::CancelFastIntentRequestMessage, cryptix_rpc_core::CancelFastIntentRequest, {
+    Self {
+        intent_id: RpcHash::from_str(&item.intent_id)?,
+        cancel_token: item.cancel_token.clone(),
+        node_epoch: item.node_epoch,
+    }
+});
+try_from!(item: &protowire::CancelFastIntentResponseMessage, RpcResult<cryptix_rpc_core::CancelFastIntentResponse>, {
+    Self {
+        status: fast_intent_status_from_proto(&item.status)?,
+        reason: (!item.reason.is_empty()).then(|| item.reason.clone()),
+        node_epoch: item.node_epoch,
+        retention_until_ms: (item.retention_until_ms != 0).then_some(item.retention_until_ms),
+        epoch_changed: item.has_epoch_changed.then_some(item.epoch_changed),
+    }
+});
+
 try_from!(&protowire::PingRequestMessage, cryptix_rpc_core::PingRequest);
 try_from!(&protowire::PingResponseMessage, RpcResult<cryptix_rpc_core::PingResponse>);
 
@@ -938,8 +1557,16 @@ try_from!(item: &protowire::GetMetricsResponseMessage, RpcResult<cryptix_rpc_cor
         bandwidth_metrics: item.bandwidth_metrics.as_ref().map(|x| x.try_into()).transpose()?,
         consensus_metrics: item.consensus_metrics.as_ref().map(|x| x.try_into()).transpose()?,
         storage_metrics: item.storage_metrics.as_ref().map(|x| x.try_into()).transpose()?,
-        // TODO
-        custom_metrics: None,
+        custom_metrics: if item.custom_metrics.is_empty() {
+            None
+        } else {
+            Some(
+                item.custom_metrics
+                    .iter()
+                    .map(|(k, v)| Ok((k.clone(), v.try_into()?)))
+                    .collect::<RpcResult<HashMap<String, cryptix_rpc_core::CustomMetricValue>>>()?,
+            )
+        },
     }
 });
 
@@ -986,6 +1613,609 @@ try_from!(item: &protowire::GetSyncStatusResponseMessage, RpcResult<cryptix_rpc_
         is_synced: item.is_synced,
     }
 });
+try_from!(&protowire::GetStrongNodesRequestMessage, cryptix_rpc_core::GetStrongNodesRequest);
+try_from!(item: &protowire::RpcStrongNodeEntry, cryptix_rpc_core::RpcStrongNodeEntry, {
+    Self {
+        node_id: item.node_id.clone(),
+        public_key_xonly: item.public_key_xonly.clone(),
+        source: item.source.clone(),
+        claimed_blocks: item.claimed_blocks,
+        share_bps: item.share_bps,
+        last_claim_block_hash: item.last_claim_block_hash.clone(),
+        last_claim_time_ms: item.last_claim_time_ms,
+    }
+});
+try_from!(item: &protowire::GetStrongNodesResponseMessage, RpcResult<cryptix_rpc_core::GetStrongNodesResponse>, {
+    Self {
+        enabled_by_config: item.enabled_by_config,
+        hardfork_active: item.hardfork_active,
+        runtime_available: item.runtime_available,
+        disabled_reason_code: item.disabled_reason_code.clone(),
+        disabled_reason_message: item.disabled_reason_message.clone(),
+        conflict_total: item.conflict_total,
+        window_size: item.window_size,
+        entries: item.entries.iter().map(|entry| entry.try_into()).collect::<RpcResult<Vec<_>>>()?,
+    }
+});
+try_from!(item: &protowire::RpcTokenContextMessage, cryptix_rpc_core::RpcTokenContext, {
+    Self {
+        at_block_hash: RpcHash::from_str(&item.at_block_hash)?,
+        at_daa_score: item.at_daa_score,
+        state_hash: item.state_hash.clone(),
+        is_degraded: item.is_degraded,
+    }
+});
+try_from!(item: &protowire::RpcTokenAssetMessage, cryptix_rpc_core::RpcTokenAsset, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        creator_owner_id: item.creator_owner_id.clone(),
+        token_version: item.token_version,
+        mint_authority_owner_id: item.mint_authority_owner_id.clone(),
+        decimals: item.decimals,
+        supply_mode: item.supply_mode,
+        max_supply: item.max_supply.clone(),
+        total_supply: item.total_supply.clone(),
+        name: item.name.clone(),
+        symbol: item.symbol.clone(),
+        metadata_hex: item.metadata_hex.clone(),
+        created_block_hash: item
+            .created_block_hash
+            .as_ref()
+            .map(|hash| RpcHash::from_str(hash))
+            .transpose()?,
+        created_daa_score: item.created_daa_score,
+        created_at: item.created_at,
+        platform_tag: item.platform_tag.clone(),
+    }
+});
+try_from!(item: &protowire::RpcTokenEventMessage, cryptix_rpc_core::RpcTokenEvent, {
+    Self {
+        event_id: item.event_id.clone(),
+        sequence: item.sequence,
+        accepting_block_hash: RpcHash::from_str(&item.accepting_block_hash)?,
+        txid: RpcHash::from_str(&item.txid)?,
+        event_type: item.event_type,
+        apply_status: item.apply_status,
+        noop_reason: item.noop_reason,
+        ordinal: item.ordinal,
+        reorg_of_event_id: item.reorg_of_event_id.clone(),
+        op_type: item.op_type,
+        asset_id: item.asset_id.clone(),
+        from_owner_id: item.from_owner_id.clone(),
+        to_owner_id: item.to_owner_id.clone(),
+        amount: item.amount.clone(),
+    }
+});
+try_from!(item: &protowire::RpcTokenOwnerBalanceMessage, cryptix_rpc_core::RpcTokenOwnerBalance, {
+    Self { asset_id: item.asset_id.clone(), balance: item.balance.clone(), asset: item.asset.as_ref().map(|a| a.try_into()).transpose()? }
+});
+try_from!(item: &protowire::RpcTokenHolderMessage, cryptix_rpc_core::RpcTokenHolder, {
+    Self { owner_id: item.owner_id.clone(), balance: item.balance.clone() }
+});
+try_from!(item: &protowire::RpcLiquidityFeeRecipientMessage, cryptix_rpc_core::RpcLiquidityFeeRecipient, {
+    Self { owner_id: item.owner_id.clone(), address: item.address.clone(), unclaimed_sompi: item.unclaimed_sompi.clone() }
+});
+try_from!(item: &protowire::RpcLiquidityPoolStateMessage, cryptix_rpc_core::RpcLiquidityPoolState, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        pool_nonce: item.pool_nonce,
+        curve_version: item.curve_version,
+        curve_mode: item.curve_mode,
+        curve_mode_label: item.curve_mode_label.clone(),
+        individual_virtual_cpay_reserves_sompi: item.individual_virtual_cpay_reserves_sompi.clone(),
+        individual_virtual_token_multiplier_bps: item.individual_virtual_token_multiplier_bps,
+        fee_bps: item.fee_bps,
+        max_supply: item.max_supply.clone(),
+        total_supply: item.total_supply.clone(),
+        circulating_token_supply: item.circulating_token_supply.clone(),
+        real_cpay_reserves_sompi: item.real_cpay_reserves_sompi.clone(),
+        real_token_reserves: item.real_token_reserves.clone(),
+        virtual_cpay_reserves_sompi: item.virtual_cpay_reserves_sompi.clone(),
+        virtual_token_reserves: item.virtual_token_reserves.clone(),
+        max_buy_in_sompi: item.max_buy_in_sompi.clone(),
+        max_tokens_out: item.max_tokens_out.clone(),
+        unclaimed_fee_total_sompi: item.unclaimed_fee_total_sompi.clone(),
+        vault_value_sompi: item.vault_value_sompi.clone(),
+        vault_txid: RpcHash::from_str(&item.vault_txid)?,
+        vault_output_index: item.vault_output_index,
+        fee_recipients: item
+            .fee_recipients
+            .iter()
+            .map(|recipient| recipient.try_into())
+            .collect::<RpcResult<Vec<_>>>()?,
+        liquidity_lock_enabled: item.liquidity_lock_enabled,
+        unlock_target_sompi: item.unlock_target_sompi.clone(),
+        unlocked: item.unlocked,
+        sell_locked: item.sell_locked,
+        liquidity_cpay_sompi: item.liquidity_cpay_sompi.clone(),
+        current_spot_price_sompi: item.current_spot_price_sompi.clone(),
+        circulating_mcap_cpay_sompi: item.circulating_mcap_cpay_sompi.clone(),
+        fdv_mcap_cpay_sompi: item.fdv_mcap_cpay_sompi.clone(),
+    }
+});
+try_from!(item: &protowire::RpcLiquidityHolderMessage, cryptix_rpc_core::RpcLiquidityHolder, {
+    Self { address: item.address.clone(), owner_id: item.owner_id.clone(), balance: item.balance.clone() }
+});
+try_from!(item: &protowire::SimulateTokenOpRequestMessage, cryptix_rpc_core::SimulateTokenOpRequest, {
+    Self {
+        payload_hex: item.payload_hex.clone(),
+        owner_id: item.owner_id.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::SimulateTokenOpResponseMessage, RpcResult<cryptix_rpc_core::SimulateTokenOpResponse>, {
+    Self {
+        result: item.result.clone(),
+        noop_reason: item.noop_reason,
+        expected_next_nonce: item.expected_next_nonce,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("SimulateTokenOpResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenBalanceRequestMessage, cryptix_rpc_core::GetTokenBalanceRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        owner_id: item.owner_id.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetTokenBalanceResponseMessage, RpcResult<cryptix_rpc_core::GetTokenBalanceResponse>, {
+    Self {
+        balance: item.balance.clone(),
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenBalanceResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenNonceRequestMessage, cryptix_rpc_core::GetTokenNonceRequest, {
+    Self {
+        owner_id: item.owner_id.clone(),
+        asset_id: item.asset_id.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetTokenNonceResponseMessage, RpcResult<cryptix_rpc_core::GetTokenNonceResponse>, {
+    Self {
+        expected_next_nonce: item.expected_next_nonce,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenNonceResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenAssetRequestMessage, cryptix_rpc_core::GetTokenAssetRequest, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(item: &protowire::GetTokenAssetResponseMessage, RpcResult<cryptix_rpc_core::GetTokenAssetResponse>, {
+    Self {
+        asset: item.asset.as_ref().map(|asset| asset.try_into()).transpose()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenAssetResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenOpStatusRequestMessage, cryptix_rpc_core::GetTokenOpStatusRequest, {
+    Self {
+        txid: RpcHash::from_str(&item.txid)?,
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetTokenOpStatusResponseMessage, RpcResult<cryptix_rpc_core::GetTokenOpStatusResponse>, {
+    Self {
+        accepting_block_hash: item.accepting_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+        apply_status: item.apply_status,
+        noop_reason: item.noop_reason,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenOpStatusResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenStateHashRequestMessage, cryptix_rpc_core::GetTokenStateHashRequest, {
+    Self { at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(item: &protowire::GetTokenStateHashResponseMessage, RpcResult<cryptix_rpc_core::GetTokenStateHashResponse>, {
+    Self {
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenStateHashResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenSpendabilityRequestMessage, cryptix_rpc_core::GetTokenSpendabilityRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        owner_id: item.owner_id.clone(),
+        min_daa_for_spend: item.min_daa_for_spend,
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(
+    item: &protowire::GetTokenSpendabilityResponseMessage,
+    RpcResult<cryptix_rpc_core::GetTokenSpendabilityResponse>,
+    {
+        Self {
+            can_spend: item.can_spend,
+            reason: item.reason.clone(),
+            balance: item.balance.clone(),
+            expected_next_nonce: item.expected_next_nonce,
+            min_daa_for_spend: item.min_daa_for_spend,
+            context: item
+                .context
+                .as_ref()
+                .ok_or_else(|| {
+                    RpcError::MissingRpcFieldError("GetTokenSpendabilityResponseMessage".to_string(), "context".to_string())
+                })?
+                .try_into()?,
+        }
+    }
+);
+try_from!(item: &protowire::GetTokenEventsRequestMessage, cryptix_rpc_core::GetTokenEventsRequest, {
+    Self {
+        after_sequence: item.after_sequence,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetTokenEventsResponseMessage, RpcResult<cryptix_rpc_core::GetTokenEventsResponse>, {
+    Self {
+        events: item.events.iter().map(|event| event.try_into()).collect::<RpcResult<Vec<_>>>()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenEventsResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenAssetsRequestMessage, cryptix_rpc_core::GetTokenAssetsRequest, {
+    Self {
+        offset: item.offset,
+        limit: item.limit,
+        query: item.query.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetTokenAssetsResponseMessage, RpcResult<cryptix_rpc_core::GetTokenAssetsResponse>, {
+    Self {
+        assets: item.assets.iter().map(|asset| asset.try_into()).collect::<RpcResult<Vec<_>>>()?,
+        total: item.total,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenAssetsResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenBalancesByOwnerRequestMessage, cryptix_rpc_core::GetTokenBalancesByOwnerRequest, {
+    Self {
+        owner_id: item.owner_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        include_assets: item.include_assets,
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(
+    item: &protowire::GetTokenBalancesByOwnerResponseMessage,
+    RpcResult<cryptix_rpc_core::GetTokenBalancesByOwnerResponse>,
+    {
+        Self {
+            balances: item.balances.iter().map(|balance| balance.try_into()).collect::<RpcResult<Vec<_>>>()?,
+            total: item.total,
+            context: item
+                .context
+                .as_ref()
+                .ok_or_else(|| {
+                    RpcError::MissingRpcFieldError("GetTokenBalancesByOwnerResponseMessage".to_string(), "context".to_string())
+                })?
+                .try_into()?,
+        }
+    }
+);
+try_from!(item: &protowire::GetTokenHoldersRequestMessage, cryptix_rpc_core::GetTokenHoldersRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetTokenHoldersResponseMessage, RpcResult<cryptix_rpc_core::GetTokenHoldersResponse>, {
+    Self {
+        holders: item.holders.iter().map(|holder| holder.try_into()).collect::<RpcResult<Vec<_>>>()?,
+        total: item.total,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenHoldersResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetTokenOwnerIdByAddressRequestMessage, cryptix_rpc_core::GetTokenOwnerIdByAddressRequest, {
+    Self { address: item.address.clone(), at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(
+    item: &protowire::GetTokenOwnerIdByAddressResponseMessage,
+    RpcResult<cryptix_rpc_core::GetTokenOwnerIdByAddressResponse>,
+    {
+        Self {
+            owner_id: item.owner_id.clone(),
+            reason: item.reason.clone(),
+            context: item
+                .context
+                .as_ref()
+                .ok_or_else(|| {
+                    RpcError::MissingRpcFieldError("GetTokenOwnerIdByAddressResponseMessage".to_string(), "context".to_string())
+                })?
+                .try_into()?,
+        }
+    }
+);
+try_from!(item: &protowire::GetLiquidityPoolStateRequestMessage, cryptix_rpc_core::GetLiquidityPoolStateRequest, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(item: &protowire::GetLiquidityPoolStateResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityPoolStateResponse>, {
+    Self {
+        pool: item.pool.as_ref().map(|pool| pool.try_into()).transpose()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityPoolStateResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityQuoteRequestMessage, cryptix_rpc_core::GetLiquidityQuoteRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityQuoteResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityQuoteResponse>, {
+    Self {
+        side: item.side,
+        exact_in_amount: item.exact_in_amount.clone(),
+        fee_amount_sompi: item.fee_amount_sompi.clone(),
+        net_in_amount: item.net_in_amount.clone(),
+        amount_out: item.amount_out.clone(),
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityQuoteResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityFeeStateRequestMessage, cryptix_rpc_core::GetLiquidityFeeStateRequest, {
+    Self { asset_id: item.asset_id.clone(), at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(item: &protowire::GetLiquidityFeeStateResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityFeeStateResponse>, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        fee_bps: item.fee_bps,
+        total_unclaimed_sompi: item.total_unclaimed_sompi.clone(),
+        recipients: item
+            .recipients
+            .iter()
+            .map(|recipient| recipient.try_into())
+            .collect::<RpcResult<Vec<_>>>()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityFeeStateResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityClaimPreviewRequestMessage, cryptix_rpc_core::GetLiquidityClaimPreviewRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        recipient_address: item.recipient_address.clone(),
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(
+    item: &protowire::GetLiquidityClaimPreviewResponseMessage,
+    RpcResult<cryptix_rpc_core::GetLiquidityClaimPreviewResponse>,
+    {
+        Self {
+            recipient_address: item.recipient_address.clone(),
+            owner_id: item.owner_id.clone(),
+            claimable_amount_sompi: item.claimable_amount_sompi.clone(),
+            min_payout_sompi: item.min_payout_sompi.clone(),
+            claimable_now: item.claimable_now,
+            reason: item.reason.clone(),
+            context: item
+                .context
+                .as_ref()
+                .ok_or_else(|| {
+                    RpcError::MissingRpcFieldError("GetLiquidityClaimPreviewResponseMessage".to_string(), "context".to_string())
+                })?
+                .try_into()?,
+        }
+    }
+);
+try_from!(item: &protowire::GetLiquidityHoldersRequestMessage, cryptix_rpc_core::GetLiquidityHoldersRequest, {
+    Self {
+        asset_id: item.asset_id.clone(),
+        offset: item.offset,
+        limit: item.limit,
+        at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+    }
+});
+try_from!(item: &protowire::GetLiquidityHoldersResponseMessage, RpcResult<cryptix_rpc_core::GetLiquidityHoldersResponse>, {
+    Self {
+        holders: item.holders.iter().map(|holder| holder.try_into()).collect::<RpcResult<Vec<_>>>()?,
+        total: item.total,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetLiquidityHoldersResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::ExportTokenSnapshotRequestMessage, cryptix_rpc_core::ExportTokenSnapshotRequest, {
+    Self { path: item.path.clone() }
+});
+try_from!(
+    item: &protowire::ExportTokenSnapshotResponseMessage,
+    RpcResult<cryptix_rpc_core::ExportTokenSnapshotResponse>,
+    {
+        Self {
+            exported: item.exported,
+            context: item
+                .context
+                .as_ref()
+                .ok_or_else(|| {
+                    RpcError::MissingRpcFieldError("ExportTokenSnapshotResponseMessage".to_string(), "context".to_string())
+                })?
+                .try_into()?,
+        }
+    }
+);
+try_from!(item: &protowire::ImportTokenSnapshotRequestMessage, cryptix_rpc_core::ImportTokenSnapshotRequest, {
+    Self { path: item.path.clone() }
+});
+try_from!(
+    item: &protowire::ImportTokenSnapshotResponseMessage,
+    RpcResult<cryptix_rpc_core::ImportTokenSnapshotResponse>,
+    {
+        Self {
+            imported: item.imported,
+            context: item
+                .context
+                .as_ref()
+                .ok_or_else(|| {
+                    RpcError::MissingRpcFieldError("ImportTokenSnapshotResponseMessage".to_string(), "context".to_string())
+                })?
+                .try_into()?,
+        }
+    }
+);
+try_from!(item: &protowire::GetTokenHealthRequestMessage, cryptix_rpc_core::GetTokenHealthRequest, {
+    Self { at_block_hash: item.at_block_hash.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()? }
+});
+try_from!(item: &protowire::GetTokenHealthResponseMessage, RpcResult<cryptix_rpc_core::GetTokenHealthResponse>, {
+    Self {
+        is_degraded: item.is_degraded,
+        bootstrap_in_progress: item.bootstrap_in_progress,
+        live_correct: item.live_correct,
+        token_state: if item.token_state.is_empty() {
+            if item.is_degraded {
+                "degraded".to_string()
+            } else if item.bootstrap_in_progress {
+                "recovering".to_string()
+            } else if item.live_correct {
+                "healthy".to_string()
+            } else {
+                "not_ready".to_string()
+            }
+        } else {
+            item.token_state.clone()
+        },
+        last_applied_block: item.last_applied_block.as_ref().map(|hash| RpcHash::from_str(hash)).transpose()?,
+        last_sequence: item.last_sequence,
+        state_hash: item.state_hash.clone(),
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetTokenHealthResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::RpcScBootstrapSourceMessage, cryptix_rpc_core::RpcScBootstrapSource, {
+    Self {
+        snapshot_id: item.snapshot_id.clone(),
+        protocol_version: item.protocol_version,
+        network_id: item.network_id.clone(),
+        node_identity: item.node_identity.clone(),
+        at_block_hash: RpcHash::from_str(&item.at_block_hash)?,
+        at_daa_score: item.at_daa_score,
+        state_hash_at_fp: item.state_hash_at_fp.clone(),
+        window_start_block_hash: RpcHash::from_str(&item.window_start_block_hash)?,
+        window_end_block_hash: RpcHash::from_str(&item.window_end_block_hash)?,
+    }
+});
+try_from!(item: &protowire::RpcScManifestSignatureMessage, cryptix_rpc_core::RpcScManifestSignature, {
+    Self { signer_pubkey_hex: item.signer_pubkey_hex.clone(), signature_hex: item.signature_hex.clone() }
+});
+try_from!(_item: &protowire::GetScBootstrapSourcesRequestMessage, cryptix_rpc_core::GetScBootstrapSourcesRequest, { Self {} });
+try_from!(item: &protowire::GetScBootstrapSourcesResponseMessage, RpcResult<cryptix_rpc_core::GetScBootstrapSourcesResponse>, {
+    Self {
+        sources: item.sources.iter().map(|source| source.try_into()).collect::<RpcResult<Vec<_>>>()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetScBootstrapSourcesResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetScSnapshotManifestRequestMessage, cryptix_rpc_core::GetScSnapshotManifestRequest, {
+    Self { snapshot_id: item.snapshot_id.clone() }
+});
+try_from!(item: &protowire::GetScSnapshotManifestResponseMessage, RpcResult<cryptix_rpc_core::GetScSnapshotManifestResponse>, {
+    Self {
+        snapshot_id: item.snapshot_id.clone(),
+        manifest_hex: item.manifest_hex.clone(),
+        manifest_signatures: item.manifest_signatures.iter().map(|signature| signature.try_into()).collect::<RpcResult<Vec<_>>>()?,
+    }
+});
+try_from!(item: &protowire::GetScSnapshotChunkRequestMessage, cryptix_rpc_core::GetScSnapshotChunkRequest, {
+    Self { snapshot_id: item.snapshot_id.clone(), chunk_index: item.chunk_index, chunk_size: item.chunk_size }
+});
+try_from!(item: &protowire::GetScSnapshotChunkResponseMessage, RpcResult<cryptix_rpc_core::GetScSnapshotChunkResponse>, {
+    Self {
+        snapshot_id: item.snapshot_id.clone(),
+        chunk_index: item.chunk_index,
+        total_chunks: item.total_chunks,
+        file_size: item.file_size,
+        chunk_hex: item.chunk_hex.clone(),
+    }
+});
+try_from!(item: &protowire::GetScReplayWindowChunkRequestMessage, cryptix_rpc_core::GetScReplayWindowChunkRequest, {
+    Self { snapshot_id: item.snapshot_id.clone(), chunk_index: item.chunk_index, chunk_size: item.chunk_size }
+});
+try_from!(
+    item: &protowire::GetScReplayWindowChunkResponseMessage,
+    RpcResult<cryptix_rpc_core::GetScReplayWindowChunkResponse>,
+    {
+        Self {
+            snapshot_id: item.snapshot_id.clone(),
+            chunk_index: item.chunk_index,
+            total_chunks: item.total_chunks,
+            file_size: item.file_size,
+            chunk_hex: item.chunk_hex.clone(),
+        }
+    }
+);
+try_from!(_item: &protowire::GetScSnapshotHeadRequestMessage, cryptix_rpc_core::GetScSnapshotHeadRequest, { Self {} });
+try_from!(item: &protowire::GetScSnapshotHeadResponseMessage, RpcResult<cryptix_rpc_core::GetScSnapshotHeadResponse>, {
+    Self {
+        head: item.head.as_ref().map(|head| head.try_into()).transpose()?,
+        context: item
+            .context
+            .as_ref()
+            .ok_or_else(|| RpcError::MissingRpcFieldError("GetScSnapshotHeadResponseMessage".to_string(), "context".to_string()))?
+            .try_into()?,
+    }
+});
+try_from!(item: &protowire::GetConsensusAtomicStateHashRequestMessage, cryptix_rpc_core::GetConsensusAtomicStateHashRequest, {
+    Self { block_hash: RpcHash::from_str(&item.block_hash)? }
+});
+try_from!(
+    item: &protowire::GetConsensusAtomicStateHashResponseMessage,
+    RpcResult<cryptix_rpc_core::GetConsensusAtomicStateHashResponse>,
+    { Self { state_hash: item.state_hash.clone() } }
+);
 
 try_from!(item: &protowire::NotifyUtxosChangedRequestMessage, cryptix_rpc_core::NotifyUtxosChangedRequest, {
     Self {
@@ -1040,6 +2270,11 @@ try_from!(item: &protowire::NotifySinkBlueScoreChangedRequestMessage, cryptix_rp
     Self { command: item.command.into() }
 });
 try_from!(&protowire::NotifySinkBlueScoreChangedResponseMessage, RpcResult<cryptix_rpc_core::NotifySinkBlueScoreChangedResponse>);
+
+try_from!(item: &protowire::NotifyTokenEventsRequestMessage, cryptix_rpc_core::NotifyTokenEventsRequest, {
+    Self { command: item.command.into() }
+});
+try_from!(&protowire::NotifyTokenEventsResponseMessage, RpcResult<cryptix_rpc_core::NotifyTokenEventsResponse>);
 
 // ----------------------------------------------------------------------------
 // Unit tests

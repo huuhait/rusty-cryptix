@@ -4,7 +4,7 @@ use super::extensions::*;
 use crate::account::descriptor::IAccountDescriptor;
 use crate::api::message::*;
 use crate::imports::*;
-use crate::tx::{Fees, PaymentDestination, PaymentOutputs};
+use crate::tx::{payment_destination_from_js_outputs, Fees};
 use crate::wasm::tx::fees::IFees;
 use crate::wasm::tx::GeneratorSummary;
 use js_sys::Array;
@@ -111,8 +111,6 @@ declare! {
     IFlushRequest,
     r#"
     /**
-     * 
-     *  
      * @category Wallet API
      */
     export interface IFlushRequest {
@@ -130,8 +128,6 @@ declare! {
     IFlushResponse,
     r#"
     /**
-     * 
-     *  
      * @category Wallet API
      */
     export interface IFlushResponse { }
@@ -445,7 +441,6 @@ try_from! ( args: WalletCreateResponse, IWalletCreateResponse, {
 // ---
 
 // ---
-// NOTE: `legacy_accounts` are disabled in JS API
 declare! {
     IWalletOpenRequest,
     r#"
@@ -457,6 +452,7 @@ declare! {
         walletSecret: string;
         filename?: string;
         accountDescriptors: boolean;
+        legacyAccounts?: boolean;
     }
     "#,
 }
@@ -465,8 +461,9 @@ try_from! ( args: IWalletOpenRequest, WalletOpenRequest, {
     let wallet_secret = args.get_secret("walletSecret")?;
     let filename = args.try_get_string("filename")?;
     let account_descriptors = args.get_value("accountDescriptors")?.as_bool().unwrap_or(false);
+    let legacy_accounts = args.try_get_value("legacyAccounts")?.and_then(|value| value.as_bool()).unwrap_or(false);
 
-    Ok(WalletOpenRequest { wallet_secret, filename, account_descriptors, legacy_accounts: None })
+    Ok(WalletOpenRequest { wallet_secret, filename, account_descriptors, legacy_accounts: legacy_accounts.then_some(true) })
 });
 
 declare! {
@@ -1019,6 +1016,126 @@ try_from! ( args: AccountsDiscoveryResponse, IAccountsDiscoveryResponse, {
 // ---
 
 declare! {
+    IAccountsScanRequest,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsScanRequest {
+        accountId: HexString;
+        walletSecret?: string;
+        depth?: number;
+        windowSize?: number;
+    }
+    "#,
+}
+
+try_from! (args: IAccountsScanRequest, AccountsScanRequest, {
+    let account_id = args.get_account_id("accountId")?;
+    let wallet_secret = args.try_get_secret("walletSecret")?;
+    let depth = args
+        .try_get_value("depth")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("depth".to_string()))
+        })
+        .transpose()?;
+    let window_size = args
+        .try_get_value("windowSize")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("windowSize".to_string()))
+        })
+        .transpose()?;
+
+    Ok(AccountsScanRequest { account_id, wallet_secret, depth, window_size })
+});
+
+declare! {
+    IAccountsScanResponse,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsScanResponse {
+        accountDescriptor: IAccountDescriptor;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsScanResponse, IAccountsScanResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
+    IAccountsScanSmartRequest,
+    r#"
+    /**
+     * Smart account scan. Leaves the legacy accountsScan API unchanged.
+     * @category Wallet API
+     */
+    export interface IAccountsScanSmartRequest {
+        accountId: HexString;
+        walletSecret?: string;
+        depth?: number;
+        windowSize?: number;
+        monitorWindowSize?: number;
+    }
+    "#,
+}
+
+try_from! (args: IAccountsScanSmartRequest, AccountsScanSmartRequest, {
+    let account_id = args.get_account_id("accountId")?;
+    let wallet_secret = args.try_get_secret("walletSecret")?;
+    let depth = args
+        .try_get_value("depth")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("depth".to_string()))
+        })
+        .transpose()?;
+    let window_size = args
+        .try_get_value("windowSize")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("windowSize".to_string()))
+        })
+        .transpose()?;
+    let monitor_window_size = args
+        .try_get_value("monitorWindowSize")?
+        .map(|value| {
+            let value = value.try_as_u64()?;
+            u32::try_from(value).map_err(|_| Error::InvalidArgument("monitorWindowSize".to_string()))
+        })
+        .transpose()?;
+
+    Ok(AccountsScanSmartRequest { account_id, wallet_secret, depth, window_size, monitor_window_size })
+});
+
+declare! {
+    IAccountsScanSmartResponse,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsScanSmartResponse {
+        accountDescriptor: IAccountDescriptor;
+        scannedAddressCount: number;
+        discoveredAddressCount: number;
+        registeredAddressCount: number;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsScanSmartResponse, IAccountsScanSmartResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
     IAccountsCreateRequest,
     r#"
     /**
@@ -1028,7 +1145,7 @@ declare! {
      */
     export type IAccountsCreateRequest = {
         walletSecret: string;
-        type: "bip32";
+        type: "bip32" | "legacy";
         accountName:string;
         accountIndex?:number;
         prvKeyDataId:string;
@@ -1060,21 +1177,24 @@ try_from! (args: IAccountsCreateRequest, AccountsCreateRequest, {
 
     let kind = AccountKind::try_from(args.try_get_value("type")?.ok_or(Error::custom("type is required"))?)?;
 
-    if kind != crate::account::BIP32_ACCOUNT_KIND {
-        return Err(Error::custom("only BIP32 accounts are currently supported"));
-    }
+    let prv_key_data_id = args.try_get_prv_key_data_id("prvKeyDataId")?.ok_or(Error::custom("prvKeyDataId is required"))?;
+    let account_create_args = if kind == crate::account::BIP32_ACCOUNT_KIND {
+        let prv_key_data_args = PrvKeyDataArgs {
+            prv_key_data_id,
+            payment_secret: args.try_get_secret("paymentSecret")?,
+        };
 
-    let prv_key_data_args = PrvKeyDataArgs {
-        prv_key_data_id: args.try_get_prv_key_data_id("prvKeyDataId")?.ok_or(Error::custom("prvKeyDataId is required"))?,
-        payment_secret: args.try_get_secret("paymentSecret")?,
+        let account_args = AccountCreateArgsBip32 {
+            account_name: args.try_get_string("accountName")?,
+            account_index: args.get_u64("accountIndex").ok(),
+        };
+
+        AccountCreateArgs::Bip32 { prv_key_data_args, account_args }
+    } else if kind == crate::account::LEGACY_ACCOUNT_KIND {
+        AccountCreateArgs::new_legacy(prv_key_data_id, args.try_get_string("accountName")?)
+    } else {
+        return Err(Error::custom("only BIP32 and legacy accounts are currently supported"));
     };
-
-    let account_args = AccountCreateArgsBip32 {
-        account_name: args.try_get_string("accountName")?,
-        account_index: args.get_u64("accountIndex").ok(),
-    };
-
-    let account_create_args = AccountCreateArgs::Bip32 { prv_key_data_args, account_args };
 
     Ok(AccountsCreateRequest { wallet_secret, account_create_args })
 });
@@ -1229,6 +1349,52 @@ try_from! ( _args: AccountsActivateResponse, IAccountsActivateResponse, {
 // ---
 
 declare! {
+    IAccountsActivateSmartRequest,
+    "IAccountsActivateSmartRequest",
+    r#"
+    /**
+     * Activates accounts using the smart scan policy.
+     * @category Wallet API
+     */
+    export interface IAccountsActivateSmartRequest {
+        accountIds?: HexString[];
+        walletSecret?: string;
+        depth?: number;
+        windowSize?: number;
+        monitorWindowSize?: number;
+        startIndex?: number;
+        relativeToCurrentIndex?: boolean;
+        knownAddresses?: Array<Address | string>;
+    }
+    "#,
+}
+
+try_from! (args: IAccountsActivateSmartRequest, AccountsActivateSmartRequest, {
+    Ok(from_value::<AccountsActivateSmartRequest>(args.into())?)
+});
+
+declare! {
+    IAccountsActivateSmartResponse,
+    r#"
+    /**
+     * @category Wallet API
+     */
+    export interface IAccountsActivateSmartResponse {
+        accountDescriptors: IAccountDescriptor[];
+        scannedAddressCount: number;
+        discoveredAddressCount: number;
+        registeredAddressCount: number;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsActivateSmartResponse, IAccountsActivateSmartResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
     IAccountsDeactivateRequest,
     "IAccountsDeactivateRequest",
     r#"
@@ -1304,6 +1470,94 @@ try_from! ( args: AccountsGetResponse, IAccountsGetResponse, {
 // ---
 
 declare! {
+    IAccountsUtxosRequest,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountsUtxosRequest {
+        accountId: HexString;
+        start: bigint;
+        end: bigint;
+        includePending?: boolean;
+    }
+    "#,
+}
+
+try_from! ( args: IAccountsUtxosRequest, AccountsUtxosRequest, {
+    let account_id = args.get_account_id("accountId")?;
+    let start = args.get_u64("start")?;
+    let end = args.get_u64("end")?;
+    let include_pending = args.try_get_bool("includePending")?.unwrap_or(true);
+
+    Ok(AccountsUtxosRequest { account_id, start, end, include_pending })
+});
+
+declare! {
+    IAccountUtxoEntry,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountUtxoEntry {
+        address?: Address;
+        index: number;
+        amount: bigint;
+        scriptPublicKey: ScriptPublicKey;
+        blockDaaScore: bigint;
+        isCoinbase: boolean;
+        status: string;
+    }
+    "#,
+}
+
+declare! {
+    IAccountUtxoTransaction,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountUtxoTransaction {
+        transactionId: HexString;
+        entries: IAccountUtxoEntry[];
+        value: bigint;
+        blockDaaScore: bigint;
+        status: string;
+        isCoinbase: boolean;
+    }
+    "#,
+}
+
+declare! {
+    IAccountsUtxosResponse,
+    r#"
+    /**
+     * 
+     *  
+     * @category Wallet API
+     */
+    export interface IAccountsUtxosResponse {
+        accountId: HexString;
+        transactions: IAccountUtxoTransaction[];
+        start: bigint;
+        total: bigint;
+    }
+    "#,
+}
+
+try_from! ( args: AccountsUtxosResponse, IAccountsUtxosResponse, {
+    Ok(to_value(&args)?.into())
+});
+
+// ---
+
+declare! {
     IAccountsCreateNewAddressRequest,
     r#"
     /**
@@ -1313,6 +1567,7 @@ declare! {
      */
     export interface IAccountsCreateNewAddressRequest {
         accountId: string;
+        walletSecret?: string;
         addressKind?: NewAddressKind | string,
     }
     "#,
@@ -1320,6 +1575,7 @@ declare! {
 
 try_from!(args: IAccountsCreateNewAddressRequest, AccountsCreateNewAddressRequest, {
     let account_id = args.get_account_id("accountId")?;
+    let wallet_secret = args.try_get_secret("walletSecret")?;
     let value = args.get_value("addressKind")?;
     let kind: NewAddressKind = if let Some(string) = value.as_string() {
         string.parse()?
@@ -1328,7 +1584,7 @@ try_from!(args: IAccountsCreateNewAddressRequest, AccountsCreateNewAddressReques
     } else {
         NewAddressKind::Receive
     };
-    Ok(AccountsCreateNewAddressRequest { account_id, kind })
+    Ok(AccountsCreateNewAddressRequest { account_id, wallet_secret, kind })
 });
 
 declare! {
@@ -1359,11 +1615,16 @@ declare! {
      *  
      * @category Wallet API
      */
-    export interface IAccountsSendRequest {
+export interface IAccountsSendRequest {
         /**
          * Hex identifier of the account.
          */
         accountId : HexString;
+        /**
+         * Optional sender address pinning for deterministic input ownership.
+         * When set, the transaction generator strictly selects inputs from this address only.
+         */
+        senderAddress? : Address | string;
         /**
          * Wallet encryption secret.
          */
@@ -1384,22 +1645,52 @@ declare! {
          * If not supplied, the destination will be the change address resulting in a UTXO compound transaction.
          */
         destination? : IPaymentOutput[];
+        /**
+         * Request fast submit path when available.
+         */
+        fastPath? : boolean;
+        /**
+         * Optional fast intent nonce.
+         */
+        fastIntentNonce? : bigint | number;
+        /**
+         * Optional client timestamp (ms) for fast intent.
+         */
+        fastClientCreatedAtMs? : bigint | number;
+        /**
+         * Optional max fee cap used by fast intent admission.
+         */
+        fastMaxFeeSompi? : bigint | number;
     }
     "#,
 }
 
 try_from! ( args: IAccountsSendRequest, AccountsSendRequest, {
     let account_id = args.get_account_id("accountId")?;
+    let sender_address = args.try_cast_into::<Address>("senderAddress")?;
     let wallet_secret = args.get_secret("walletSecret")?;
     let payment_secret = args.try_get_secret("paymentSecret")?;
     let priority_fee_sompi = args.get::<IFees>("priorityFeeSompi")?.try_into()?;
     let payload = args.try_get_value("payload")?.map(|v| v.try_as_vec_u8()).transpose()?;
 
-    let outputs = args.get_value("destination")?;
-    let destination: PaymentDestination =
-        if outputs.is_undefined() { PaymentDestination::Change } else { PaymentOutputs::try_owned_from(outputs)?.into() };
+    let destination = payment_destination_from_js_outputs(args.get_value("destination")?)?;
 
-    Ok(AccountsSendRequest { account_id, wallet_secret, payment_secret, priority_fee_sompi, destination, payload })
+    let fast_path_enabled = args.try_get_bool("fastPath")?.unwrap_or(false);
+    let fast_intent_nonce = args.try_get_value("fastIntentNonce")?.map(|v| v.try_as_u64()).transpose()?;
+    let fast_client_created_at_ms = args.try_get_value("fastClientCreatedAtMs")?.map(|v| v.try_as_u64()).transpose()?;
+    let fast_max_fee_sompi = args.try_get_value("fastMaxFeeSompi")?.map(|v| v.try_as_u64()).transpose()?;
+    let fast_path = if fast_path_enabled {
+        Some(AccountsSendFastPathOptions {
+            enabled: true,
+            intent_nonce: fast_intent_nonce,
+            client_created_at_ms: fast_client_created_at_ms,
+            max_fee_sompi: fast_max_fee_sompi,
+        })
+    } else {
+        None
+    };
+
+    Ok(AccountsSendRequest { account_id, sender_address, wallet_secret, payment_secret, priority_fee_sompi, destination, payload, fast_path })
 });
 
 declare! {
@@ -1419,6 +1710,26 @@ declare! {
          * Hex identifiers of successfully submitted transactions.
          */
         transactionIds : HexString[];
+        /**
+         * Whether fast path was requested for this send call.
+         */
+        fastPathRequested : boolean;
+        /**
+         * Whether fast path was effectively used.
+         */
+        fastPathUsed : boolean;
+        /**
+         * Fast path status string (if available).
+         */
+        fastPathStatus? : string;
+        /**
+         * Fast path reason string (if available).
+         */
+        fastPathReason? : string;
+        /**
+         * Whether basechain submission happened.
+         */
+        basechainSubmitted : boolean;
     }
     "#,
 }
@@ -1428,6 +1739,11 @@ try_from!(args: AccountsSendResponse, IAccountsSendResponse, {
     let response = IAccountsSendResponse::default();
     response.set("generatorSummary", &GeneratorSummary::from(args.generator_summary).into())?;
     response.set("transactionIds", &to_value(&args.transaction_ids)?)?;
+    response.set("fastPathRequested", &to_value(&args.fast_path_requested)?)?;
+    response.set("fastPathUsed", &to_value(&args.fast_path_used)?)?;
+    response.set("fastPathStatus", &to_value(&args.fast_path_status)?)?;
+    response.set("fastPathReason", &to_value(&args.fast_path_reason)?)?;
+    response.set("basechainSubmitted", &to_value(&args.basechain_submitted)?)?;
     Ok(response)
 });
 
@@ -1502,8 +1818,9 @@ declare! {
      *  
      * @category Wallet API
      */
-    export interface IAccountsEstimateRequest {
+export interface IAccountsEstimateRequest {
         accountId : HexString;
+        senderAddress? : Address | string;
         destination : IPaymentOutput[];
         priorityFeeSompi : IFees | bigint;
         payload? : Uint8Array | string;
@@ -1513,14 +1830,13 @@ declare! {
 
 try_from! ( args: IAccountsEstimateRequest, AccountsEstimateRequest, {
     let account_id = args.get_account_id("accountId")?;
+    let sender_address = args.try_cast_into::<Address>("senderAddress")?;
     let priority_fee_sompi = args.get::<IFees>("priorityFeeSompi")?.try_into()?;
     let payload = args.try_get_value("payload")?.map(|v| v.try_as_vec_u8()).transpose()?;
 
-    let outputs = args.get_value("destination")?;
-    let destination: PaymentDestination =
-        if outputs.is_undefined() { PaymentDestination::Change } else { PaymentOutputs::try_owned_from(outputs)?.into() };
+    let destination = payment_destination_from_js_outputs(args.get_value("destination")?)?;
 
-    Ok(AccountsEstimateRequest { account_id, priority_fee_sompi, destination, payload })
+    Ok(AccountsEstimateRequest { account_id, sender_address, priority_fee_sompi, destination, payload })
 });
 
 declare! {

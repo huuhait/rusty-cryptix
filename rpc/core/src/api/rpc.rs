@@ -7,8 +7,8 @@
 use crate::api::connection::DynRpcConnection;
 use crate::{model::*, notify::connection::ChannelConnection, RpcResult};
 use async_trait::async_trait;
-use downcast::{downcast_sync, AnySync};
 use cryptix_notify::{listener::ListenerId, scope::Scope, subscription::Command};
+use downcast::{downcast_sync, AnySync};
 use std::sync::Arc;
 
 pub const MAX_SAFE_WINDOW_SIZE: u32 = 10_000;
@@ -99,6 +99,328 @@ pub trait RpcApi: Sync + Send + AnySync {
         connection: Option<&DynRpcConnection>,
         request: GetSyncStatusRequest,
     ) -> RpcResult<GetSyncStatusResponse>;
+
+    // Get strong-nodes overlay state and announced entries.
+    async fn get_strong_nodes(&self) -> RpcResult<GetStrongNodesResponse> {
+        self.get_strong_nodes_call(None, GetStrongNodesRequest {}).await
+    }
+    async fn get_strong_nodes_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetStrongNodesRequest,
+    ) -> RpcResult<GetStrongNodesResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    // Simulate a Cryptix Atomic token operation (best-effort hint, non-mutating, not a strict 1:1 execution preflight).
+    async fn simulate_token_op(&self, request: SimulateTokenOpRequest) -> RpcResult<SimulateTokenOpResponse> {
+        self.simulate_token_op_call(None, request).await
+    }
+    async fn simulate_token_op_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: SimulateTokenOpRequest,
+    ) -> RpcResult<SimulateTokenOpResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_balance(&self, request: GetTokenBalanceRequest) -> RpcResult<GetTokenBalanceResponse> {
+        self.get_token_balance_call(None, request).await
+    }
+    async fn get_token_balance_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenBalanceRequest,
+    ) -> RpcResult<GetTokenBalanceResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_nonce(&self, request: GetTokenNonceRequest) -> RpcResult<GetTokenNonceResponse> {
+        self.get_token_nonce_call(None, request).await
+    }
+    async fn get_token_nonce_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenNonceRequest,
+    ) -> RpcResult<GetTokenNonceResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_owner_nonce(&self, request: GetOwnerNonceRequest) -> RpcResult<GetOwnerNonceResponse> {
+        self.get_owner_nonce_call(None, request).await
+    }
+    async fn get_owner_nonce_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetOwnerNonceRequest,
+    ) -> RpcResult<GetOwnerNonceResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_asset(&self, request: GetTokenAssetRequest) -> RpcResult<GetTokenAssetResponse> {
+        self.get_token_asset_call(None, request).await
+    }
+    async fn get_token_asset_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenAssetRequest,
+    ) -> RpcResult<GetTokenAssetResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_op_status(&self, request: GetTokenOpStatusRequest) -> RpcResult<GetTokenOpStatusResponse> {
+        self.get_token_op_status_call(None, request).await
+    }
+    async fn get_token_op_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenOpStatusRequest,
+    ) -> RpcResult<GetTokenOpStatusResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_state_hash(&self) -> RpcResult<GetTokenStateHashResponse> {
+        self.get_token_state_hash_call(None, GetTokenStateHashRequest { at_block_hash: None }).await
+    }
+    async fn get_token_state_hash_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenStateHashRequest,
+    ) -> RpcResult<GetTokenStateHashResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_spendability(&self, request: GetTokenSpendabilityRequest) -> RpcResult<GetTokenSpendabilityResponse> {
+        self.get_token_spendability_call(None, request).await
+    }
+    async fn get_token_spendability_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenSpendabilityRequest,
+    ) -> RpcResult<GetTokenSpendabilityResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_events(&self, request: GetTokenEventsRequest) -> RpcResult<GetTokenEventsResponse> {
+        self.get_token_events_call(None, request).await
+    }
+    async fn get_token_events_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenEventsRequest,
+    ) -> RpcResult<GetTokenEventsResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn export_token_snapshot(&self, path: String) -> RpcResult<ExportTokenSnapshotResponse> {
+        self.export_token_snapshot_call(None, ExportTokenSnapshotRequest { path }).await
+    }
+    async fn export_token_snapshot_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: ExportTokenSnapshotRequest,
+    ) -> RpcResult<ExportTokenSnapshotResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn import_token_snapshot(&self, path: String) -> RpcResult<ImportTokenSnapshotResponse> {
+        self.import_token_snapshot_call(None, ImportTokenSnapshotRequest { path }).await
+    }
+    async fn import_token_snapshot_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: ImportTokenSnapshotRequest,
+    ) -> RpcResult<ImportTokenSnapshotResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_health(&self) -> RpcResult<GetTokenHealthResponse> {
+        self.get_token_health_call(None, GetTokenHealthRequest { at_block_hash: None }).await
+    }
+    async fn get_token_health_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenHealthRequest,
+    ) -> RpcResult<GetTokenHealthResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_sc_bootstrap_sources(&self) -> RpcResult<GetScBootstrapSourcesResponse> {
+        self.get_sc_bootstrap_sources_call(None, GetScBootstrapSourcesRequest {}).await
+    }
+    async fn get_sc_bootstrap_sources_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScBootstrapSourcesRequest,
+    ) -> RpcResult<GetScBootstrapSourcesResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_sc_snapshot_manifest(&self, snapshot_id: String) -> RpcResult<GetScSnapshotManifestResponse> {
+        self.get_sc_snapshot_manifest_call(None, GetScSnapshotManifestRequest { snapshot_id }).await
+    }
+    async fn get_sc_snapshot_manifest_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScSnapshotManifestRequest,
+    ) -> RpcResult<GetScSnapshotManifestResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_sc_snapshot_chunk(&self, request: GetScSnapshotChunkRequest) -> RpcResult<GetScSnapshotChunkResponse> {
+        self.get_sc_snapshot_chunk_call(None, request).await
+    }
+    async fn get_sc_snapshot_chunk_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScSnapshotChunkRequest,
+    ) -> RpcResult<GetScSnapshotChunkResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_sc_replay_window_chunk(&self, request: GetScReplayWindowChunkRequest) -> RpcResult<GetScReplayWindowChunkResponse> {
+        self.get_sc_replay_window_chunk_call(None, request).await
+    }
+    async fn get_sc_replay_window_chunk_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScReplayWindowChunkRequest,
+    ) -> RpcResult<GetScReplayWindowChunkResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_sc_snapshot_head(&self) -> RpcResult<GetScSnapshotHeadResponse> {
+        self.get_sc_snapshot_head_call(None, GetScSnapshotHeadRequest {}).await
+    }
+    async fn get_sc_snapshot_head_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetScSnapshotHeadRequest,
+    ) -> RpcResult<GetScSnapshotHeadResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_consensus_atomic_state_hash(
+        &self,
+        request: GetConsensusAtomicStateHashRequest,
+    ) -> RpcResult<GetConsensusAtomicStateHashResponse> {
+        self.get_consensus_atomic_state_hash_call(None, request).await
+    }
+    async fn get_consensus_atomic_state_hash_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetConsensusAtomicStateHashRequest,
+    ) -> RpcResult<GetConsensusAtomicStateHashResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_assets(&self, request: GetTokenAssetsRequest) -> RpcResult<GetTokenAssetsResponse> {
+        self.get_token_assets_call(None, request).await
+    }
+    async fn get_token_assets_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenAssetsRequest,
+    ) -> RpcResult<GetTokenAssetsResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_balances_by_owner(
+        &self,
+        request: GetTokenBalancesByOwnerRequest,
+    ) -> RpcResult<GetTokenBalancesByOwnerResponse> {
+        self.get_token_balances_by_owner_call(None, request).await
+    }
+    async fn get_token_balances_by_owner_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenBalancesByOwnerRequest,
+    ) -> RpcResult<GetTokenBalancesByOwnerResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_holders(&self, request: GetTokenHoldersRequest) -> RpcResult<GetTokenHoldersResponse> {
+        self.get_token_holders_call(None, request).await
+    }
+    async fn get_token_holders_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenHoldersRequest,
+    ) -> RpcResult<GetTokenHoldersResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_token_owner_id_by_address(
+        &self,
+        request: GetTokenOwnerIdByAddressRequest,
+    ) -> RpcResult<GetTokenOwnerIdByAddressResponse> {
+        self.get_token_owner_id_by_address_call(None, request).await
+    }
+    async fn get_token_owner_id_by_address_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTokenOwnerIdByAddressRequest,
+    ) -> RpcResult<GetTokenOwnerIdByAddressResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_pool_state(&self, request: GetLiquidityPoolStateRequest) -> RpcResult<GetLiquidityPoolStateResponse> {
+        self.get_liquidity_pool_state_call(None, request).await
+    }
+    async fn get_liquidity_pool_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityPoolStateRequest,
+    ) -> RpcResult<GetLiquidityPoolStateResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_quote(&self, request: GetLiquidityQuoteRequest) -> RpcResult<GetLiquidityQuoteResponse> {
+        self.get_liquidity_quote_call(None, request).await
+    }
+    async fn get_liquidity_quote_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityQuoteRequest,
+    ) -> RpcResult<GetLiquidityQuoteResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_fee_state(&self, request: GetLiquidityFeeStateRequest) -> RpcResult<GetLiquidityFeeStateResponse> {
+        self.get_liquidity_fee_state_call(None, request).await
+    }
+    async fn get_liquidity_fee_state_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityFeeStateRequest,
+    ) -> RpcResult<GetLiquidityFeeStateResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_claim_preview(
+        &self,
+        request: GetLiquidityClaimPreviewRequest,
+    ) -> RpcResult<GetLiquidityClaimPreviewResponse> {
+        self.get_liquidity_claim_preview_call(None, request).await
+    }
+    async fn get_liquidity_claim_preview_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityClaimPreviewRequest,
+    ) -> RpcResult<GetLiquidityClaimPreviewResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    async fn get_liquidity_holders(&self, request: GetLiquidityHoldersRequest) -> RpcResult<GetLiquidityHoldersResponse> {
+        self.get_liquidity_holders_call(None, request).await
+    }
+    async fn get_liquidity_holders_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetLiquidityHoldersRequest,
+    ) -> RpcResult<GetLiquidityHoldersResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
 
     // ---
 
@@ -224,6 +546,57 @@ pub trait RpcApi: Sync + Send + AnySync {
         request: SubmitTransactionReplacementRequest,
     ) -> RpcResult<SubmitTransactionReplacementResponse>;
 
+    /// Submits a fast rail intent.
+    async fn submit_fast_intent(
+        &self,
+        base_tx: RpcTransaction,
+        intent_nonce: u64,
+        client_created_at_ms: u64,
+        max_fee: u64,
+    ) -> RpcResult<SubmitFastIntentResponse> {
+        self.submit_fast_intent_call(None, SubmitFastIntentRequest { base_tx, intent_nonce, client_created_at_ms, max_fee }).await
+    }
+    async fn submit_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: SubmitFastIntentRequest,
+    ) -> RpcResult<SubmitFastIntentResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    /// Returns the local status of a fast rail intent.
+    async fn get_fast_intent_status(
+        &self,
+        intent_id: RpcHash,
+        client_last_node_epoch: Option<u64>,
+    ) -> RpcResult<GetFastIntentStatusResponse> {
+        self.get_fast_intent_status_call(None, GetFastIntentStatusRequest { intent_id, client_last_node_epoch }).await
+    }
+    async fn get_fast_intent_status_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetFastIntentStatusRequest,
+    ) -> RpcResult<GetFastIntentStatusResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
+    /// Cancels a local fast rail intent context.
+    async fn cancel_fast_intent(
+        &self,
+        intent_id: RpcHash,
+        cancel_token: String,
+        node_epoch: u64,
+    ) -> RpcResult<CancelFastIntentResponse> {
+        self.cancel_fast_intent_call(None, CancelFastIntentRequest { intent_id, cancel_token, node_epoch }).await
+    }
+    async fn cancel_fast_intent_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: CancelFastIntentRequest,
+    ) -> RpcResult<CancelFastIntentResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
+
     /// Requests information about a specific block.
     async fn get_block(&self, hash: RpcHash, include_transactions: bool) -> RpcResult<RpcBlock> {
         Ok(self.get_block_call(None, GetBlockRequest::new(hash, include_transactions)).await?.block)
@@ -268,6 +641,21 @@ pub trait RpcApi: Sync + Send + AnySync {
         self.get_blocks_call(None, GetBlocksRequest::new(low_hash, include_blocks, include_transactions)).await
     }
     async fn get_blocks_call(&self, connection: Option<&DynRpcConnection>, request: GetBlocksRequest) -> RpcResult<GetBlocksResponse>;
+
+    /// Resolves transactions by id in a single batched request.
+    ///
+    /// The optional block DAA score hints let nodes avoid broad historical scans
+    /// when wallets need payload data for already indexed transaction records.
+    async fn get_transactions_by_ids(&self, entries: Vec<RpcTransactionLookupRequest>) -> RpcResult<GetTransactionsByIdsResponse> {
+        self.get_transactions_by_ids_call(None, GetTransactionsByIdsRequest::new(entries, true, false)).await
+    }
+    async fn get_transactions_by_ids_call(
+        &self,
+        _connection: Option<&DynRpcConnection>,
+        _request: GetTransactionsByIdsRequest,
+    ) -> RpcResult<GetTransactionsByIdsResponse> {
+        Err(crate::RpcError::NotImplemented)
+    }
 
     /// Requests the current number of blocks in this node.
     ///
@@ -321,7 +709,7 @@ pub trait RpcApi: Sync + Send + AnySync {
 
     /// Returns the total balance in unspent transactions towards a given address.
     ///
-    /// This call is only available when this node was started with `--utxoindex`.
+    /// This call is only available when this node has the UTXO index enabled.
     async fn get_balance_by_address(&self, address: RpcAddress) -> RpcResult<u64> {
         Ok(self.get_balance_by_address_call(None, GetBalanceByAddressRequest::new(address)).await?.balance)
     }
@@ -343,7 +731,7 @@ pub trait RpcApi: Sync + Send + AnySync {
 
     /// Requests all current UTXOs for the given node addresses.
     ///
-    /// This call is only available when this node was started with `--utxoindex`.
+    /// This call is only available when this node has the UTXO index enabled.
     async fn get_utxos_by_addresses(&self, addresses: Vec<RpcAddress>) -> RpcResult<Vec<RpcUtxosByAddressesEntry>> {
         Ok(self.get_utxos_by_addresses_call(None, GetUtxosByAddressesRequest::new(addresses)).await?.entries)
     }

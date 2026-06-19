@@ -1,13 +1,26 @@
 use super::VirtualStateProcessor;
 use crate::{
+    constants::{MAX_SOMPI, SOMPI_PER_CRYPTIX},
     errors::{
         BlockProcessResult,
         RuleError::{BadAcceptedIDMerkleRoot, BadCoinbaseTransaction, BadUTXOCommitment, InvalidTransactionsInUtxoContext},
     },
-    model::stores::{block_transactions::BlockTransactionsStoreReader, daa::DaaStoreReader, ghostdag::GhostdagData},
+    model::stores::{
+        atomic_state::{
+            AtomicAssetClass, AtomicAssetState, AtomicBalanceKey, AtomicConsensusState, AtomicLiquidityFeeRecipientState,
+            AtomicLiquidityPoolState, AtomicNonceKey, AtomicSupplyMode,
+        },
+        block_transactions::BlockTransactionsStoreReader,
+        daa::DaaStoreReader,
+        ghostdag::GhostdagData,
+        headers::HeaderStoreReader,
+    },
     processes::transaction_validator::{
         errors::{TxResult, TxRuleError},
-        transaction_validator_populated::TxValidationFlags,
+        transaction_validator_populated::{
+            atomic_owner_id_from_address_components, atomic_owner_id_from_script, parse_atomic_payload, AtomicPayloadOp,
+            AtomicPayloadRecipientAddress, AtomicPayloadSupplyMode, TxValidationFlags,
+        },
     },
 };
 use cryptix_consensus_core::{
@@ -18,20 +31,1177 @@ use cryptix_consensus_core::{
     header::Header,
     mass::Kip9Version,
     muhash::MuHashExtensions,
-    tx::{MutableTransaction, PopulatedTransaction, Transaction, TransactionId, ValidatedTransaction, VerifiableTransaction},
+    tx::{
+        MutableTransaction, PopulatedTransaction, Transaction, TransactionId, TransactionOutpoint, ValidatedTransaction,
+        VerifiableTransaction,
+    },
     utxo::{
         utxo_diff::UtxoDiff,
         utxo_view::{UtxoView, UtxoViewComposition},
     },
     BlockHashMap, BlockHashSet, HashMapCustomHasher,
 };
-use cryptix_core::{info, trace};
+use cryptix_core::{debug, info, trace, warn};
 use cryptix_hashes::Hash;
+use cryptix_math::Uint256;
 use cryptix_muhash::MuHash;
+use cryptix_txscript::script_class::ScriptClass;
 use cryptix_utils::refs::Refs;
 
 use rayon::prelude::*;
-use std::{iter::once, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    iter::once,
+    ops::Deref,
+};
+
+// Allow dust-sized redemptions so the final outstanding liquidity tokens can always exit.
+const LIQUIDITY_MIN_PAYOUT_SOMPI: u64 = 1;
+const LIQUIDITY_TOKEN_DECIMALS: u8 = 0;
+const MIN_LIQUIDITY_SUPPLY_RAW: u128 = 100_000;
+const LIQUIDITY_TOKEN_SUPPLY_RAW: u128 = 1_000_000;
+const MAX_LIQUIDITY_SUPPLY_RAW: u128 = 10_000_000;
+const INITIAL_REAL_CPAY_RESERVES_SOMPI: u64 = SOMPI_PER_CRYPTIX;
+const MIN_CPAY_RESERVE_SOMPI: u64 = 1;
+const MIN_REAL_TOKEN_RESERVE: u128 = 1;
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AtomicCreationContext {
+    pub source_block_hash: Hash,
+    pub source_block_daa_score: u64,
+    pub source_block_time: u64,
+}
+const LIQUIDITY_CURVE_MODE_BASIC: u8 = 0;
+const LIQUIDITY_CURVE_MODE_AGGRESSIVE: u8 = 1;
+const LIQUIDITY_CURVE_MODE_INDIVIDUAL: u8 = 2;
+const DEFAULT_LIQUIDITY_CURVE_MODE: u8 = LIQUIDITY_CURVE_MODE_BASIC;
+const INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 250_000_000_000_000;
+const INITIAL_VIRTUAL_TOKEN_RESERVES: u128 = LIQUIDITY_TOKEN_SUPPLY_RAW * 6 / 5;
+const AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 200_000_000_000_000;
+const INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 100_000_000_000_000;
+const INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI: u64 = 800_000_000_000_000;
+const INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI: u64 = 10_000_000_000_000;
+const INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 10_100;
+const INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS: u16 = 20_000;
+const INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS: u16 = 100;
+const VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR: u16 = 10_000;
+
+#[derive(Clone, Copy, Debug)]
+struct VaultTransition {
+    input_value: u64,
+    output_index: u32,
+    output_value: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct AtomicStateGrowthLimits {
+    pub max_new_assets: usize,
+    pub max_new_balance_keys: usize,
+    pub max_new_nonce_keys: usize,
+    pub max_new_pools: usize,
+    pub max_new_anchor_owner_keys: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AtomicStateGrowth {
+    new_assets: usize,
+    new_balance_keys: usize,
+    new_nonce_keys: usize,
+    new_pools: usize,
+    new_anchor_owner_keys: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct AtomicBlockStateGrowth {
+    used: AtomicStateGrowth,
+}
+
+impl AtomicBlockStateGrowth {
+    fn ensure_can_add(self, delta: AtomicStateGrowth, limits: AtomicStateGrowthLimits) -> TxResult<()> {
+        fn ensure_limit(current: usize, delta: usize, limit: usize, label: &str) -> TxResult<()> {
+            let total = current.saturating_add(delta);
+            if total > limit {
+                Err(TxRuleError::InvalidAtomicPayload(format!(
+                    "atomic state growth limit exceeded for {label}: block would create `{total}`, limit is `{limit}`"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+
+        ensure_limit(self.used.new_assets, delta.new_assets, limits.max_new_assets, "assets")?;
+        ensure_limit(self.used.new_balance_keys, delta.new_balance_keys, limits.max_new_balance_keys, "balance keys")?;
+        ensure_limit(self.used.new_nonce_keys, delta.new_nonce_keys, limits.max_new_nonce_keys, "nonce keys")?;
+        ensure_limit(self.used.new_pools, delta.new_pools, limits.max_new_pools, "liquidity pools")?;
+        ensure_limit(
+            self.used.new_anchor_owner_keys,
+            delta.new_anchor_owner_keys,
+            limits.max_new_anchor_owner_keys,
+            "anchor owner keys",
+        )?;
+        Ok(())
+    }
+
+    fn commit(&mut self, delta: AtomicStateGrowth) {
+        self.used.new_assets = self.used.new_assets.saturating_add(delta.new_assets);
+        self.used.new_balance_keys = self.used.new_balance_keys.saturating_add(delta.new_balance_keys);
+        self.used.new_nonce_keys = self.used.new_nonce_keys.saturating_add(delta.new_nonce_keys);
+        self.used.new_pools = self.used.new_pools.saturating_add(delta.new_pools);
+        self.used.new_anchor_owner_keys = self.used.new_anchor_owner_keys.saturating_add(delta.new_anchor_owner_keys);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_fee_to_pool, atomic_op_allows_liquidity_vault_output, calculate_trade_fee, cpmm_buy, cpmm_sell,
+        initial_virtual_cpay_reserves_sompi_for_curve, initial_virtual_token_reserves_for_curve, min_gross_input_for_token_out,
+        validate_liquidity_claim_authorization, validate_liquidity_creation_parameters, validate_liquidity_curve_parameters,
+        AtomicBlockStateGrowth, AtomicPayloadOp, AtomicStateGrowth, AtomicStateGrowthLimits,
+        AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, DEFAULT_LIQUIDITY_CURVE_MODE, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
+        INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+        INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS, INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI, INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS,
+        INITIAL_REAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI, INITIAL_VIRTUAL_TOKEN_RESERVES,
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE, LIQUIDITY_CURVE_MODE_BASIC, LIQUIDITY_CURVE_MODE_INDIVIDUAL, LIQUIDITY_TOKEN_SUPPLY_RAW,
+        MAX_LIQUIDITY_SUPPLY_RAW, MIN_LIQUIDITY_SUPPLY_RAW, VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR,
+    };
+    use crate::model::stores::atomic_state::AtomicLiquidityFeeRecipientState;
+
+    #[test]
+    fn atomic_state_growth_limits_reject_block_state_spam() {
+        let limits = AtomicStateGrowthLimits {
+            max_new_assets: 1,
+            max_new_balance_keys: 2,
+            max_new_nonce_keys: 2,
+            max_new_pools: 1,
+            max_new_anchor_owner_keys: 2,
+        };
+        let mut growth = AtomicBlockStateGrowth::default();
+        let first =
+            AtomicStateGrowth { new_assets: 1, new_balance_keys: 1, new_nonce_keys: 1, new_pools: 1, new_anchor_owner_keys: 1 };
+        growth.ensure_can_add(first, limits).expect("first growth fits");
+        growth.commit(first);
+
+        let second =
+            AtomicStateGrowth { new_assets: 0, new_balance_keys: 1, new_nonce_keys: 1, new_pools: 0, new_anchor_owner_keys: 1 };
+        growth.ensure_can_add(second, limits).expect("second growth fits exactly");
+        growth.commit(second);
+
+        let rejected =
+            AtomicStateGrowth { new_assets: 0, new_balance_keys: 1, new_nonce_keys: 0, new_pools: 0, new_anchor_owner_keys: 0 };
+        assert!(growth.ensure_can_add(rejected, limits).is_err());
+    }
+
+    #[test]
+    fn liquidity_claims_require_matching_recipient_owner() {
+        assert!(validate_liquidity_claim_authorization([0x22; 32], [0x22; 32]).is_ok());
+        assert!(validate_liquidity_claim_authorization([0x22; 32], [0x33; 32]).is_err());
+    }
+
+    #[test]
+    fn liquidity_trade_fee_uses_deterministic_integer_floor() {
+        let cases = [
+            ("one sompi rounds to zero", 1u64, 1_000u16, 0u64),
+            ("three point three three percent small odd fee", 100, 333, 3),
+            ("three point three three percent below denominator", 9_999, 333, 332),
+            ("three point three three percent above denominator", 10_001, 333, 333),
+            ("three point three three percent common trade", 1_000_000, 333, 33_300),
+            ("three point three three percent uneven decimal", 12_345_678, 333, 411_111),
+            ("max amount ten percent", u64::MAX, 1_000, 1_844_674_407_370_955_161),
+            ("max amount three point three three percent", u64::MAX, 333, 614_276_577_654_528_068),
+        ];
+
+        for (name, amount, fee_bps, expected) in cases {
+            let fee = calculate_trade_fee(amount, fee_bps).unwrap_or_else(|err| panic!("{name}: unexpected error {err}"));
+            assert_eq!(fee, expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn liquidity_fee_split_is_deterministic_for_one_and_two_recipients() {
+        let cases = [
+            ("zero fee leaves one recipient unchanged", 1usize, 0u64, 0u64, 0u64, 0u64),
+            ("one recipient receives all", 1, 333, 333, 333, 0),
+            ("two recipients split even fee equally", 2, 33_300, 33_300, 16_650, 16_650),
+            ("two recipients put odd remainder on canonical second recipient", 2, 333, 333, 166, 167),
+            ("two recipients tiny odd fee", 2, 3, 3, 1, 2),
+            (
+                "two recipients max rounded fee stays exact",
+                2,
+                1_844_674_407_370_955_161,
+                1_844_674_407_370_955_161,
+                922_337_203_685_477_580,
+                922_337_203_685_477_581,
+            ),
+        ];
+
+        for (name, recipient_count, fee_trade, expected_total, expected0, expected1) in cases {
+            let mut recipients = dummy_fee_recipients(recipient_count);
+            let mut total = 0u64;
+
+            apply_fee_to_pool(&mut recipients, &mut total, fee_trade).unwrap_or_else(|err| panic!("{name}: unexpected error {err}"));
+
+            assert_eq!(total, expected_total, "{name}: total");
+            if recipient_count > 0 {
+                assert_eq!(recipients[0].unclaimed_sompi, expected0, "{name}: recipient0");
+            }
+            if recipient_count > 1 {
+                assert_eq!(recipients[1].unclaimed_sompi, expected1, "{name}: recipient1");
+                assert_eq!(recipients[0].unclaimed_sompi + recipients[1].unclaimed_sompi, total, "{name}: recipient sum");
+            }
+        }
+    }
+
+    #[test]
+    fn liquidity_fee_split_repeated_rounding_is_stable() {
+        let fees = [0u64, 1, 3, 332, 333, 999, 33_300, 411_111, 614_276_577_654_528_068];
+        let mut recipients = dummy_fee_recipients(2);
+        let mut total = 0u64;
+        let mut expected0 = 0u64;
+        let mut expected1 = 0u64;
+
+        for fee_trade in fees {
+            apply_fee_to_pool(&mut recipients, &mut total, fee_trade)
+                .unwrap_or_else(|err| panic!("fee {fee_trade}: unexpected error {err}"));
+            if fee_trade == 0 {
+                continue;
+            }
+            expected0 += fee_trade / 2;
+            expected1 += fee_trade - fee_trade / 2;
+        }
+
+        assert_eq!(recipients[0].unclaimed_sompi, expected0);
+        assert_eq!(recipients[1].unclaimed_sompi, expected1);
+        assert_eq!(total, expected0 + expected1);
+    }
+
+    #[test]
+    fn liquidity_fee_split_rejects_invalid_recipient_counts_without_mutation() {
+        for count in [0usize, 3, 5] {
+            let mut recipients = dummy_fee_recipients(count);
+            for (i, recipient) in recipients.iter_mut().enumerate() {
+                recipient.unclaimed_sompi = 10 + i as u64;
+            }
+            let before_recipients = fee_recipient_amounts(&recipients);
+            let mut total = 123u64;
+
+            assert!(apply_fee_to_pool(&mut recipients, &mut total, 333).is_err(), "recipient count {count} must be rejected");
+
+            assert_eq!(total, 123, "recipient count {count}: total must not mutate on error");
+            assert_eq!(
+                fee_recipient_amounts(&recipients),
+                before_recipients,
+                "recipient count {count}: recipients must not mutate on error"
+            );
+        }
+    }
+
+    #[test]
+    fn liquidity_fee_split_overflow_is_side_effect_free() {
+        let mut recipients = dummy_fee_recipients(2);
+        recipients[0].unclaimed_sompi = u64::MAX;
+        recipients[1].unclaimed_sompi = u64::MAX;
+        let before_recipients = fee_recipient_amounts(&recipients);
+        let mut total = 42u64;
+
+        assert!(apply_fee_to_pool(&mut recipients, &mut total, 3).is_err());
+
+        assert_eq!(total, 42, "total must not mutate when a recipient overflows");
+        assert_eq!(fee_recipient_amounts(&recipients), before_recipients, "recipients must not partially mutate on overflow");
+    }
+
+    fn dummy_fee_recipients(count: usize) -> Vec<AtomicLiquidityFeeRecipientState> {
+        (0..count)
+            .map(|i| AtomicLiquidityFeeRecipientState {
+                owner_id: [i as u8; 32],
+                address_version: 0,
+                address_payload: vec![i as u8; 32],
+                unclaimed_sompi: 0,
+            })
+            .collect()
+    }
+
+    fn fee_recipient_amounts(recipients: &[AtomicLiquidityFeeRecipientState]) -> Vec<u64> {
+        recipients.iter().map(|recipient| recipient.unclaimed_sompi).collect()
+    }
+
+    #[test]
+    fn liquidity_creation_parameters_enforce_mainnet_limits() {
+        assert!(validate_liquidity_creation_parameters(0, LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_ok());
+        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_ok());
+        assert!(validate_liquidity_creation_parameters(0, MAX_LIQUIDITY_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_ok());
+        assert!(validate_liquidity_creation_parameters(1, LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, MIN_LIQUIDITY_SUPPLY_RAW - 1, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, MAX_LIQUIDITY_SUPPLY_RAW + 1, INITIAL_REAL_CPAY_RESERVES_SOMPI).is_err());
+        assert!(validate_liquidity_creation_parameters(0, LIQUIDITY_TOKEN_SUPPLY_RAW, INITIAL_REAL_CPAY_RESERVES_SOMPI - 1).is_err());
+    }
+
+    #[test]
+    fn liquidity_curve_modes_have_exact_integer_initial_reserves() {
+        let cases = [
+            (
+                "basic min supply",
+                LIQUIDITY_CURVE_MODE_BASIC,
+                MIN_LIQUIDITY_SUPPLY_RAW,
+                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                120_000u128,
+            ),
+            (
+                "basic default supply",
+                LIQUIDITY_CURVE_MODE_BASIC,
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                1_200_000u128,
+            ),
+            (
+                "basic max supply",
+                LIQUIDITY_CURVE_MODE_BASIC,
+                MAX_LIQUIDITY_SUPPLY_RAW,
+                INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                12_000_000u128,
+            ),
+            (
+                "aggressive min supply",
+                LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+                MIN_LIQUIDITY_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                105_000u128,
+            ),
+            (
+                "aggressive default supply",
+                LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                1_050_000u128,
+            ),
+            (
+                "aggressive max supply",
+                LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+                MAX_LIQUIDITY_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_500_000u128,
+            ),
+        ];
+
+        for (name, mode, max_supply, expected_cpay, expected_tokens) in cases {
+            assert_eq!(initial_virtual_cpay_reserves_sompi_for_curve(mode, 0).unwrap(), expected_cpay, "{name}: cpay");
+            assert_eq!(initial_virtual_token_reserves_for_curve(max_supply, mode, 0).unwrap(), expected_tokens, "{name}: tokens");
+        }
+    }
+
+    #[test]
+    fn individual_curve_rejects_ambiguous_non_grid_values() {
+        assert!(validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_BASIC, 0, 0).is_ok());
+        assert!(validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_AGGRESSIVE, 0, 0).is_ok());
+        assert!(validate_liquidity_curve_parameters(
+            LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+        )
+        .is_ok());
+
+        assert!(validate_liquidity_curve_parameters(
+            LIQUIDITY_CURVE_MODE_BASIC,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+        )
+        .is_err());
+        assert!(validate_liquidity_curve_parameters(
+            LIQUIDITY_CURVE_MODE_AGGRESSIVE,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+        )
+        .is_err());
+
+        let invalid_fixed_cpay = [
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI - 1,
+            INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI + 1,
+            INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI + INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI,
+        ];
+        for fixed_cpay in invalid_fixed_cpay {
+            assert!(
+                validate_liquidity_curve_parameters(
+                    LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                    fixed_cpay,
+                    INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+                )
+                .is_err(),
+                "fixed CPAY {fixed_cpay} must be rejected"
+            );
+            assert!(
+                initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).is_err(),
+                "fixed CPAY {fixed_cpay} must not produce reserves"
+            );
+        }
+
+        let invalid_multipliers = [
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS - 1,
+            INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS + 1,
+            INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS + INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS,
+        ];
+        for multiplier_bps in invalid_multipliers {
+            assert!(
+                validate_liquidity_curve_parameters(
+                    LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                    INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                    multiplier_bps,
+                )
+                .is_err(),
+                "multiplier {multiplier_bps} must be rejected"
+            );
+            assert!(
+                initial_virtual_token_reserves_for_curve(LIQUIDITY_TOKEN_SUPPLY_RAW, LIQUIDITY_CURVE_MODE_INDIVIDUAL, multiplier_bps,)
+                    .is_err(),
+                "multiplier {multiplier_bps} must not produce reserves"
+            );
+        }
+    }
+
+    #[test]
+    fn individual_curve_full_parameter_grid_is_exact_and_matches_index() {
+        use cryptix_atomicindex::liquidity_math as index_math;
+
+        let supplies = [MIN_LIQUIDITY_SUPPLY_RAW, LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW];
+        let mut fixed_cpay = INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI;
+        loop {
+            let mut multiplier_bps = INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS;
+            loop {
+                assert!(
+                    validate_liquidity_curve_parameters(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay, multiplier_bps).is_ok(),
+                    "valid grid point rejected: fixed_cpay={fixed_cpay} multiplier_bps={multiplier_bps}"
+                );
+
+                let consensus_cpay =
+                    initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).unwrap();
+                let index_cpay =
+                    index_math::initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).unwrap();
+                assert_eq!(consensus_cpay, fixed_cpay, "consensus fixed CPAY drift");
+                assert_eq!(index_cpay, fixed_cpay, "index fixed CPAY drift");
+
+                for max_supply in supplies {
+                    let expected_tokens =
+                        max_supply * u128::from(multiplier_bps) / u128::from(VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR);
+                    let consensus_tokens =
+                        initial_virtual_token_reserves_for_curve(max_supply, LIQUIDITY_CURVE_MODE_INDIVIDUAL, multiplier_bps).unwrap();
+                    let index_tokens = index_math::initial_virtual_token_reserves_for_curve(
+                        max_supply,
+                        LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                        multiplier_bps,
+                    )
+                    .unwrap();
+                    assert_eq!(consensus_tokens, expected_tokens, "consensus token reserve drift");
+                    assert_eq!(index_tokens, expected_tokens, "index token reserve drift");
+                }
+
+                if multiplier_bps == INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS {
+                    break;
+                }
+                multiplier_bps += INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS;
+            }
+
+            if fixed_cpay == INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI {
+                break;
+            }
+            fixed_cpay += INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI;
+        }
+    }
+
+    #[test]
+    fn individual_curve_trade_vectors_are_exact_in_consensus() {
+        let buy_cases = [
+            (
+                "individual_min_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_100,
+                1_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                998u128,
+                999_002u128,
+                100_099_000_000_000,
+                1_009_002u128,
+            ),
+            (
+                "individual_default_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI,
+                10_500,
+                1_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                519u128,
+                999_481u128,
+                200_099_000_000_000,
+                1_049_481u128,
+            ),
+            (
+                "individual_max_buy_1000_cpay_100bps",
+                LIQUIDITY_TOKEN_SUPPLY_RAW,
+                INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI,
+                20_000,
+                1_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                100,
+                1_000_000_000,
+                99_000_000_000,
+                247u128,
+                999_753u128,
+                800_099_000_000_000,
+                1_999_753u128,
+            ),
+            (
+                "individual_custom_buy_12345_cpay_40bps",
+                5_000_000,
+                330_000_000_000_000,
+                14_600,
+                12_345 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX,
+                40,
+                4_938_000_000,
+                1_229_562_000_000,
+                27_098u128,
+                4_972_902u128,
+                331_229_562_000_000,
+                7_272_902u128,
+            ),
+        ];
+
+        for (
+            name,
+            max_supply,
+            fixed_cpay,
+            multiplier_bps,
+            gross_in,
+            fee_bps,
+            expected_fee,
+            expected_net,
+            expected_token_out,
+            expected_real_token_reserves,
+            expected_virtual_cpay,
+            expected_virtual_tokens,
+        ) in buy_cases
+        {
+            let virtual_cpay = initial_virtual_cpay_reserves_sompi_for_curve(LIQUIDITY_CURVE_MODE_INDIVIDUAL, fixed_cpay).unwrap();
+            let virtual_tokens =
+                initial_virtual_token_reserves_for_curve(max_supply, LIQUIDITY_CURVE_MODE_INDIVIDUAL, multiplier_bps).unwrap();
+            let fee = calculate_trade_fee(gross_in, fee_bps).unwrap();
+            let net = gross_in - fee;
+            let (token_out, real_token_reserves, new_virtual_cpay, new_virtual_tokens) =
+                cpmm_buy(max_supply, virtual_cpay, virtual_tokens, net).unwrap();
+
+            assert_eq!(fee, expected_fee, "{name}: fee");
+            assert_eq!(net, expected_net, "{name}: net");
+            assert_eq!(token_out, expected_token_out, "{name}: token_out");
+            assert_eq!(real_token_reserves, expected_real_token_reserves, "{name}: real_token_reserves");
+            assert_eq!(new_virtual_cpay, expected_virtual_cpay, "{name}: virtual_cpay");
+            assert_eq!(new_virtual_tokens, expected_virtual_tokens, "{name}: virtual_tokens");
+        }
+
+        let sell_cases = [
+            (
+                "individual_min_sell_250_tokens_100bps",
+                99_100_000_000,
+                100_099_000_000_000,
+                1_009_002u128,
+                250u128,
+                100,
+                24_795_343_482,
+                247_953_434,
+                24_547_390_048,
+                74_304_656_518,
+                100_074_204_656_518,
+                1_009_252u128,
+            ),
+            (
+                "individual_max_sell_247_tokens_100bps",
+                99_100_000_000,
+                800_099_000_000_000,
+                1_999_753u128,
+                247u128,
+                100,
+                98_812_226_500,
+                988_122_265,
+                97_824_104_235,
+                287_773_500,
+                800_000_187_773_500,
+                2_000_000u128,
+            ),
+            (
+                "individual_custom_sell_7777_tokens_40bps",
+                1_229_662_000_000,
+                331_229_562_000_000,
+                7_272_902u128,
+                7_777u128,
+                40,
+                353_809_349_879,
+                1_415_237_399,
+                352_394_112_480,
+                875_852_650_121,
+                330_875_752_650_121,
+                7_280_679u128,
+            ),
+        ];
+
+        for (
+            name,
+            real_cpay,
+            virtual_cpay,
+            virtual_tokens,
+            token_in,
+            fee_bps,
+            expected_gross_out,
+            expected_fee,
+            expected_cpay_out,
+            expected_real_cpay,
+            expected_virtual_cpay,
+            expected_virtual_tokens,
+        ) in sell_cases
+        {
+            let (gross_out, new_real_cpay, new_virtual_cpay, new_virtual_tokens) =
+                cpmm_sell(real_cpay, virtual_cpay, virtual_tokens, token_in).unwrap();
+            let fee = calculate_trade_fee(gross_out, fee_bps).unwrap();
+
+            assert_eq!(gross_out, expected_gross_out, "{name}: gross_out");
+            assert_eq!(fee, expected_fee, "{name}: fee");
+            assert_eq!(gross_out - fee, expected_cpay_out, "{name}: cpay_out");
+            assert_eq!(new_real_cpay, expected_real_cpay, "{name}: real_cpay");
+            assert_eq!(new_virtual_cpay, expected_virtual_cpay, "{name}: virtual_cpay");
+            assert_eq!(new_virtual_tokens, expected_virtual_tokens, "{name}: virtual_tokens");
+        }
+    }
+
+    #[test]
+    fn only_liquidity_ops_may_create_vault_outputs() {
+        assert!(!atomic_op_allows_liquidity_vault_output(&AtomicPayloadOp::Transfer {
+            asset_id: [0x44; 32],
+            to_owner_id: [0x55; 32],
+            amount: 1,
+        }));
+        assert!(atomic_op_allows_liquidity_vault_output(&AtomicPayloadOp::BuyLiquidityExactIn {
+            asset_id: [0x44; 32],
+            expected_pool_nonce: 1,
+            cpay_in_sompi: 1,
+            min_token_out: 1,
+        }));
+    }
+
+    #[test]
+    fn consensus_liquidity_math_matches_atomicindex_reference() {
+        use cryptix_atomicindex::liquidity_math as index_math;
+
+        let fee_schedule = [0u16, 10, 100, 250, 1_000];
+        let curve_cases = [
+            (LIQUIDITY_CURVE_MODE_BASIC, 0, 0),
+            (LIQUIDITY_CURVE_MODE_AGGRESSIVE, 0, 0),
+            (LIQUIDITY_CURVE_MODE_INDIVIDUAL, INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS),
+            (LIQUIDITY_CURVE_MODE_INDIVIDUAL, INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI, INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS),
+            (
+                LIQUIDITY_CURVE_MODE_INDIVIDUAL,
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI + (4 * INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI),
+                INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS + (7 * INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS),
+            ),
+        ];
+
+        for max_supply in [MIN_LIQUIDITY_SUPPLY_RAW, LIQUIDITY_TOKEN_SUPPLY_RAW, MAX_LIQUIDITY_SUPPLY_RAW] {
+            for (mode, fixed_cpay, multiplier_bps) in curve_cases {
+                let consensus_cpay = initial_virtual_cpay_reserves_sompi_for_curve(mode, fixed_cpay).ok();
+                let index_cpay = index_math::initial_virtual_cpay_reserves_sompi_for_curve(mode, fixed_cpay).ok();
+                assert_eq!(consensus_cpay, index_cpay, "virtual CPAY drift for mode {mode}");
+
+                let consensus_tokens = initial_virtual_token_reserves_for_curve(max_supply, mode, multiplier_bps).ok();
+                let index_tokens = index_math::initial_virtual_token_reserves_for_curve(max_supply, mode, multiplier_bps).ok();
+                assert_eq!(consensus_tokens, index_tokens, "virtual token drift for mode {mode} max_supply {max_supply}");
+            }
+        }
+
+        let mut seed = 0xD1FF_E2E_C0DEC0DEu64;
+        for step in 0..5_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let real_token_reserves = 2 + u128::from(seed % 1_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let virtual_token_reserves = real_token_reserves + 1 + u128::from(seed % 2_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let virtual_cpay_reserves_sompi = 1 + (seed % 800_000_000_000_000);
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let gross_in = 1 + (seed % (10_000 * cryptix_consensus_core::constants::SOMPI_PER_CRYPTIX));
+            let fee_bps = fee_schedule[step % fee_schedule.len()];
+
+            let consensus_fee = calculate_trade_fee(gross_in, fee_bps).ok();
+            let index_fee = index_math::calculate_trade_fee(gross_in, fee_bps).ok();
+            assert_eq!(consensus_fee, index_fee, "fee drift in case {step}");
+            let Some(fee) = consensus_fee else {
+                continue;
+            };
+            let net_in = gross_in - fee;
+
+            let consensus_buy = cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net_in).ok();
+            let index_buy =
+                index_math::cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net_in).ok();
+            assert_eq!(consensus_buy, index_buy, "buy drift in case {step}");
+
+            let spendable_token_reserves = real_token_reserves - 1;
+            let target_token_out = 1 + (u128::from(seed % 1_000_000) % spendable_token_reserves);
+            let consensus_canonical = min_gross_input_for_token_out(
+                real_token_reserves,
+                virtual_cpay_reserves_sompi,
+                virtual_token_reserves,
+                target_token_out,
+                fee_bps,
+            )
+            .ok();
+            let index_canonical = index_math::min_gross_input_for_token_out(
+                real_token_reserves,
+                virtual_cpay_reserves_sompi,
+                virtual_token_reserves,
+                target_token_out,
+                fee_bps,
+            )
+            .ok();
+            assert_eq!(consensus_canonical, index_canonical, "canonical buy drift in case {step}");
+
+            let real_cpay_reserves_sompi = virtual_cpay_reserves_sompi;
+            let token_in = 1 + u128::from(seed.rotate_left(17) % 1_000_000);
+            let consensus_sell =
+                cpmm_sell(real_cpay_reserves_sompi, virtual_cpay_reserves_sompi, virtual_token_reserves, token_in).ok();
+            let index_sell =
+                index_math::cpmm_sell(real_cpay_reserves_sompi, virtual_cpay_reserves_sompi, virtual_token_reserves, token_in).ok();
+            assert_eq!(consensus_sell, index_sell, "sell drift in case {step}");
+        }
+
+        let consensus_default_tokens =
+            initial_virtual_token_reserves_for_curve(LIQUIDITY_TOKEN_SUPPLY_RAW, DEFAULT_LIQUIDITY_CURVE_MODE, 0).unwrap();
+        assert_eq!(consensus_default_tokens, INITIAL_VIRTUAL_TOKEN_RESERVES);
+        let consensus_default_cpay = initial_virtual_cpay_reserves_sompi_for_curve(DEFAULT_LIQUIDITY_CURVE_MODE, 0).unwrap();
+        assert_eq!(consensus_default_cpay, INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI);
+    }
+}
+
+fn calculate_trade_fee(amount: u64, fee_bps: u16) -> TxResult<u64> {
+    let fee = (u128::from(amount))
+        .checked_mul(u128::from(fee_bps))
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("fee multiplication overflow".to_string()))?
+        / 10_000u128;
+    u64::try_from(fee).map_err(|_| TxRuleError::InvalidAtomicPayload("fee does not fit into u64".to_string()))
+}
+
+fn apply_fee_to_pool(
+    recipients: &mut [AtomicLiquidityFeeRecipientState],
+    unclaimed_fee_total_sompi: &mut u64,
+    fee_trade: u64,
+) -> TxResult<()> {
+    if fee_trade == 0 {
+        return Ok(());
+    }
+    let next_total = unclaimed_fee_total_sompi
+        .checked_add(fee_trade)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("unclaimed_fee_total overflow".to_string()))?;
+    match recipients.len() {
+        0 => Err(TxRuleError::InvalidAtomicPayload("fee_trade > 0 but no fee recipients are configured".to_string())),
+        1 => {
+            let next_recipient = recipients[0]
+                .unclaimed_sompi
+                .checked_add(fee_trade)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient fee overflow".to_string()))?;
+            *unclaimed_fee_total_sompi = next_total;
+            recipients[0].unclaimed_sompi = next_recipient;
+            Ok(())
+        }
+        2 => {
+            let fee0 = fee_trade / 2;
+            let fee1 = fee_trade - fee0;
+            let next_recipient0 = recipients[0]
+                .unclaimed_sompi
+                .checked_add(fee0)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient0 fee overflow".to_string()))?;
+            let next_recipient1 = recipients[1]
+                .unclaimed_sompi
+                .checked_add(fee1)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("recipient1 fee overflow".to_string()))?;
+            *unclaimed_fee_total_sompi = next_total;
+            recipients[0].unclaimed_sompi = next_recipient0;
+            recipients[1].unclaimed_sompi = next_recipient1;
+            Ok(())
+        }
+        _ => Err(TxRuleError::InvalidAtomicPayload("invalid recipient count in liquidity pool state".to_string())),
+    }
+}
+
+fn min_gross_input_for_net_input(net_in: u64, fee_bps: u16) -> TxResult<u64> {
+    if net_in == 0 || fee_bps >= 10_000 {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy net input or fee_bps is invalid".to_string()));
+    }
+    if fee_bps == 0 {
+        return Ok(net_in);
+    }
+
+    let fee_denominator = 10_000u128
+        .checked_sub(u128::from(fee_bps))
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee denominator underflow".to_string()))?;
+    let mut gross = (u128::from(net_in)
+        .checked_sub(1)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy net underflow".to_string()))?)
+    .checked_mul(10_000u128)
+    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross multiplication overflow".to_string()))?
+    .checked_div(fee_denominator)
+    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee denominator is zero".to_string()))?
+    .checked_add(1)
+    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross addition overflow".to_string()))?;
+    let mut gross_u64 = u64::try_from(gross)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy gross input does not fit u64".to_string()))?;
+
+    while gross_u64 > 1 {
+        let previous = gross_u64
+            .checked_sub(1)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross decrement underflow".to_string()))?;
+        let previous_fee = calculate_trade_fee(previous, fee_bps)?;
+        if previous
+            .checked_sub(previous_fee)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy previous fee underflow".to_string()))?
+            < net_in
+        {
+            break;
+        }
+        gross_u64 = previous;
+    }
+    while {
+        let fee = calculate_trade_fee(gross_u64, fee_bps)?;
+        gross_u64.checked_sub(fee).ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee underflow".to_string()))?
+            < net_in
+    } {
+        gross = u128::from(gross_u64)
+            .checked_add(1)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy gross increment overflow".to_string()))?;
+        gross_u64 = u64::try_from(gross)
+            .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy gross input does not fit u64".to_string()))?;
+    }
+    Ok(gross_u64)
+}
+
+fn min_gross_input_for_token_out(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    token_out: u128,
+    fee_bps: u16,
+) -> TxResult<u64> {
+    if token_out == 0 || virtual_cpay_reserves_sompi == 0 || virtual_token_reserves == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy target token_out is invalid".to_string()));
+    }
+    let spendable_tokens = real_token_reserves
+        .checked_sub(MIN_REAL_TOKEN_RESERVE)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy real token reserve floor reached".to_string()))?;
+    if token_out > spendable_tokens {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy token_out drains final token".to_string()));
+    }
+    let y_after = virtual_token_reserves
+        .checked_sub(token_out)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy y_after underflow".to_string()))?;
+    if y_after == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy y_after cannot be zero".to_string()));
+    }
+
+    let x_before = Uint256::from_u64(virtual_cpay_reserves_sompi);
+    let k = x_before * Uint256::from_u128(virtual_token_reserves);
+    let x_after = ceil_div_u256(k, Uint256::from_u128(y_after));
+    if x_after <= x_before {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy produced zero net input".to_string()));
+    }
+    let net_in_u256 = x_after - x_before;
+    let net_in_u128 = u128::try_from(net_in_u256)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy net input does not fit u128".to_string()))?;
+    let net_in = u64::try_from(net_in_u128)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("canonical buy net input does not fit u64".to_string()))?;
+    let gross_in = min_gross_input_for_net_input(net_in, fee_bps)?;
+
+    let fee = calculate_trade_fee(gross_in, fee_bps)?;
+    let net = gross_in.checked_sub(fee).ok_or_else(|| TxRuleError::InvalidAtomicPayload("canonical buy fee underflow".to_string()))?;
+    let (actual_token_out, _, _, _) = cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, net)?;
+    if actual_token_out < token_out {
+        return Err(TxRuleError::InvalidAtomicPayload("canonical buy verification failed".to_string()));
+    }
+    Ok(gross_in)
+}
+
+fn cpmm_buy(
+    real_token_reserves: u128,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    cpay_net_in: u64,
+) -> TxResult<(u128, u128, u64, u128)> {
+    if real_token_reserves <= MIN_REAL_TOKEN_RESERVE {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy real token reserve floor reached".to_string()));
+    }
+    let x_after = virtual_cpay_reserves_sompi
+        .checked_add(cpay_net_in)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM x_after overflow".to_string()))?;
+    if x_after == 0 || virtual_token_reserves == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy x_after cannot be zero".to_string()));
+    }
+
+    let k = Uint256::from_u64(virtual_cpay_reserves_sompi) * Uint256::from_u128(virtual_token_reserves);
+    let y_after_u256 = ceil_div_u256(k, Uint256::from_u64(x_after));
+    let y_after = u128::try_from(y_after_u256)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM buy y_after conversion overflow".to_string()))?;
+    if y_after == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy y_after cannot be zero".to_string()));
+    }
+    if y_after > virtual_token_reserves {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy would increase y_after".to_string()));
+    }
+
+    let token_out = virtual_token_reserves
+        .checked_sub(y_after)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy token_out underflow".to_string()))?;
+    if token_out == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy produced zero token_out".to_string()));
+    }
+    let new_real_token_reserves = real_token_reserves
+        .checked_sub(token_out)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM buy real token reserve underflow".to_string()))?;
+    if new_real_token_reserves < MIN_REAL_TOKEN_RESERVE {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM buy would drain final real token".to_string()));
+    }
+
+    Ok((token_out, new_real_token_reserves, x_after, y_after))
+}
+
+fn cpmm_sell(
+    real_cpay_reserves_sompi: u64,
+    virtual_cpay_reserves_sompi: u64,
+    virtual_token_reserves: u128,
+    token_in: u128,
+) -> TxResult<(u64, u64, u64, u128)> {
+    let y_after = virtual_token_reserves
+        .checked_add(token_in)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM y_after overflow".to_string()))?;
+    if y_after == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell y_after cannot be zero".to_string()));
+    }
+
+    let x_before = virtual_cpay_reserves_sompi;
+    let k = Uint256::from_u64(x_before) * Uint256::from_u128(virtual_token_reserves);
+    let x_after_u256 = ceil_div_u256(k, Uint256::from_u128(y_after));
+    let x_after_u128 = u128::try_from(x_after_u256)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM sell x_after conversion overflow".to_string()))?;
+    let x_after = u64::try_from(x_after_u128)
+        .map_err(|_| TxRuleError::InvalidAtomicPayload("CPMM sell x_after does not fit u64".to_string()))?;
+    if x_after > x_before {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell x_after exceeds x_before".to_string()));
+    }
+
+    let gross_out =
+        x_before.checked_sub(x_after).ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM sell gross_out underflow".to_string()))?;
+    if gross_out == 0 {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell produced zero gross_out".to_string()));
+    }
+    let new_real_cpay_reserves_sompi = real_cpay_reserves_sompi
+        .checked_sub(gross_out)
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("CPMM sell real CPAY reserve underflow".to_string()))?;
+    if new_real_cpay_reserves_sompi < MIN_CPAY_RESERVE_SOMPI {
+        return Err(TxRuleError::InvalidAtomicPayload("CPMM sell would drain final real sompi".to_string()));
+    }
+    Ok((gross_out, new_real_cpay_reserves_sompi, x_after, y_after))
+}
+
+fn ceil_div_u256(numerator: Uint256, denominator: Uint256) -> Uint256 {
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.is_zero() {
+        quotient
+    } else {
+        quotient + Uint256::from_u64(1)
+    }
+}
+
+fn initial_virtual_token_reserves(max_supply: u128) -> TxResult<u128> {
+    initial_virtual_token_reserves_for_mode(max_supply, DEFAULT_LIQUIDITY_CURVE_MODE)
+}
+
+fn validate_liquidity_curve_mode(mode: u8) -> TxResult<()> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE | LIQUIDITY_CURVE_MODE_INDIVIDUAL => Ok(()),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn validate_individual_liquidity_curve_params(virtual_cpay_reserves_sompi: u64, virtual_token_multiplier_bps: u16) -> TxResult<()> {
+    if !(INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI..=INDIVIDUAL_MAX_VIRTUAL_CPAY_RESERVES_SOMPI)
+        .contains(&virtual_cpay_reserves_sompi)
+    {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is outside allowed range"
+        )));
+    }
+    if virtual_cpay_reserves_sompi % INDIVIDUAL_VIRTUAL_CPAY_STEP_SOMPI != 0 {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity fixed CPAY `{virtual_cpay_reserves_sompi}` is not on the allowed step"
+        )));
+    }
+    if !(INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS..=INDIVIDUAL_MAX_VIRTUAL_TOKEN_MULTIPLIER_BPS)
+        .contains(&virtual_token_multiplier_bps)
+    {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity multiplier `{virtual_token_multiplier_bps}` is outside allowed range"
+        )));
+    }
+    if virtual_token_multiplier_bps % INDIVIDUAL_VIRTUAL_TOKEN_MULTIPLIER_STEP_BPS != 0 {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "individual liquidity multiplier `{virtual_token_multiplier_bps}` is not on the allowed step"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_liquidity_curve_parameters(
+    mode: u8,
+    individual_virtual_cpay_reserves_sompi: u64,
+    individual_virtual_token_multiplier_bps: u16,
+) -> TxResult<()> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => {
+            if individual_virtual_cpay_reserves_sompi == 0 && individual_virtual_token_multiplier_bps == 0 {
+                Ok(())
+            } else {
+                Err(TxRuleError::InvalidAtomicPayload(
+                    "non-individual liquidity curve must not encode individual parameters".to_string(),
+                ))
+            }
+        }
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(individual_virtual_cpay_reserves_sompi, individual_virtual_token_multiplier_bps)
+        }
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn initial_virtual_cpay_reserves_sompi_for_mode(mode: u8) -> TxResult<u64> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_BASIC => Ok(INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE => Ok(AGGRESSIVE_INITIAL_VIRTUAL_CPAY_RESERVES_SOMPI),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn initial_virtual_cpay_reserves_sompi_for_curve(mode: u8, individual_virtual_cpay_reserves_sompi: u64) -> TxResult<u64> {
+    match mode {
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(
+                individual_virtual_cpay_reserves_sompi,
+                INDIVIDUAL_MIN_VIRTUAL_TOKEN_MULTIPLIER_BPS,
+            )?;
+            Ok(individual_virtual_cpay_reserves_sompi)
+        }
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => initial_virtual_cpay_reserves_sompi_for_mode(mode),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn initial_virtual_token_reserves_for_mode(max_supply: u128, mode: u8) -> TxResult<u128> {
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
+        )));
+    }
+    let (numerator, denominator) = match mode {
+        LIQUIDITY_CURVE_MODE_BASIC => (6u128, 5u128),
+        LIQUIDITY_CURVE_MODE_AGGRESSIVE => (21u128, 20u128),
+        _ => return Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    };
+    max_supply
+        .checked_mul(numerator)
+        .and_then(|value| value.checked_div(denominator))
+        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity virtual token reserve overflow".to_string()))
+}
+
+fn initial_virtual_token_reserves_for_curve(
+    max_supply: u128,
+    mode: u8,
+    individual_virtual_token_multiplier_bps: u16,
+) -> TxResult<u128> {
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
+        )));
+    }
+    match mode {
+        LIQUIDITY_CURVE_MODE_INDIVIDUAL => {
+            validate_individual_liquidity_curve_params(
+                INDIVIDUAL_MIN_VIRTUAL_CPAY_RESERVES_SOMPI,
+                individual_virtual_token_multiplier_bps,
+            )?;
+            max_supply
+                .checked_mul(u128::from(individual_virtual_token_multiplier_bps))
+                .and_then(|value| value.checked_div(u128::from(VIRTUAL_TOKEN_MULTIPLIER_BPS_DENOMINATOR)))
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("liquidity virtual token reserve overflow".to_string()))
+        }
+        LIQUIDITY_CURVE_MODE_BASIC | LIQUIDITY_CURVE_MODE_AGGRESSIVE => initial_virtual_token_reserves_for_mode(max_supply, mode),
+        _ => Err(TxRuleError::InvalidAtomicPayload(format!("unsupported liquidity curve mode `{mode}`"))),
+    }
+}
+
+fn atomic_op_allows_liquidity_vault_output(op: &AtomicPayloadOp) -> bool {
+    matches!(
+        op,
+        AtomicPayloadOp::CreateLiquidityAsset { .. }
+            | AtomicPayloadOp::BuyLiquidityExactIn { .. }
+            | AtomicPayloadOp::SellLiquidityExactIn { .. }
+            | AtomicPayloadOp::ClaimLiquidityFees { .. }
+    )
+}
+
+fn liquidity_sell_locked(pool: &AtomicLiquidityPoolState) -> bool {
+    pool.unlock_target_sompi > 0 && !pool.unlocked
+}
+
+fn validate_liquidity_unlock_target(unlock_target_sompi: u64) -> TxResult<()> {
+    if unlock_target_sompi > MAX_SOMPI {
+        Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity unlock target `{unlock_target_sompi}` exceeds MAX_SOMPI `{MAX_SOMPI}`"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_liquidity_claim_authorization(claimant_owner_id: [u8; 32], recipient_owner_id: [u8; 32]) -> TxResult<()> {
+    if claimant_owner_id == recipient_owner_id {
+        Ok(())
+    } else {
+        Err(TxRuleError::InvalidAtomicPayload("claim caller is not the configured liquidity fee recipient".to_string()))
+    }
+}
+
+fn validate_liquidity_creation_parameters(decimals: u8, max_supply: u128, seed_reserve_sompi: u64) -> TxResult<()> {
+    if decimals != LIQUIDITY_TOKEN_DECIMALS {
+        return Err(TxRuleError::InvalidAtomicPayload(format!("liquidity asset decimals must be `{}`", LIQUIDITY_TOKEN_DECIMALS)));
+    }
+    if !(MIN_LIQUIDITY_SUPPLY_RAW..=MAX_LIQUIDITY_SUPPLY_RAW).contains(&max_supply) {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset max_supply must be in `{MIN_LIQUIDITY_SUPPLY_RAW}..={MAX_LIQUIDITY_SUPPLY_RAW}`"
+        )));
+    }
+    if seed_reserve_sompi != INITIAL_REAL_CPAY_RESERVES_SOMPI {
+        return Err(TxRuleError::InvalidAtomicPayload(format!(
+            "liquidity asset seed_reserve_sompi must be `{INITIAL_REAL_CPAY_RESERVES_SOMPI}`"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn atomic_nonce_key_for_op(owner_id: [u8; 32], op: &AtomicPayloadOp) -> AtomicNonceKey {
+    match op {
+        AtomicPayloadOp::CreateAsset { .. }
+        | AtomicPayloadOp::CreateAssetWithMint { .. }
+        | AtomicPayloadOp::CreateLiquidityAsset { .. } => AtomicNonceKey::owner(owner_id),
+        AtomicPayloadOp::Transfer { asset_id, .. }
+        | AtomicPayloadOp::Mint { asset_id, .. }
+        | AtomicPayloadOp::Burn { asset_id, .. }
+        | AtomicPayloadOp::BuyLiquidityExactIn { asset_id, .. }
+        | AtomicPayloadOp::SellLiquidityExactIn { asset_id, .. }
+        | AtomicPayloadOp::ClaimLiquidityFees { asset_id, .. } => AtomicNonceKey::asset(owner_id, *asset_id),
+    }
+}
 
 /// A context for processing the UTXO state of a block with respect to its selected parent.
 /// Note this can also be the virtual block.
@@ -42,11 +1212,17 @@ pub(super) struct UtxoProcessingContext<'a> {
     pub accepted_tx_ids: Vec<TransactionId>,
     pub mergeset_acceptance_data: Vec<MergesetBlockAcceptanceData>,
     pub mergeset_rewards: BlockHashMap<BlockRewardData>,
+    pub atomic_state: AtomicConsensusState,
 }
 
 impl<'a> UtxoProcessingContext<'a> {
-    pub fn new(ghostdag_data: Refs<'a, GhostdagData>, selected_parent_multiset_hash: MuHash) -> Self {
+    pub fn new(
+        ghostdag_data: Refs<'a, GhostdagData>,
+        selected_parent_multiset_hash: MuHash,
+        mut selected_parent_atomic_state: AtomicConsensusState,
+    ) -> Self {
         let mergeset_size = ghostdag_data.mergeset_size();
+        selected_parent_atomic_state.begin_delta_tracking();
         Self {
             ghostdag_data,
             multiset_hash: selected_parent_multiset_hash,
@@ -54,6 +1230,7 @@ impl<'a> UtxoProcessingContext<'a> {
             accepted_tx_ids: Vec::with_capacity(1), // We expect at least the selected parent coinbase tx
             mergeset_rewards: BlockHashMap::with_capacity(mergeset_size),
             mergeset_acceptance_data: Vec::with_capacity(mergeset_size),
+            atomic_state: selected_parent_atomic_state,
         }
     }
 
@@ -77,6 +1254,8 @@ impl VirtualStateProcessor {
         ctx.multiset_hash.add_transaction(&validated_coinbase, pov_daa_score);
         let validated_coinbase_id = validated_coinbase.id();
         ctx.accepted_tx_ids.push(validated_coinbase_id);
+        let mut accepted_txids = HashSet::from([validated_coinbase_id]);
+        let mut accepted_spent_outpoints = HashSet::<TransactionOutpoint>::new();
 
         for (i, (merged_block, txs)) in once((ctx.selected_parent(), selected_parent_transactions))
             .chain(
@@ -91,18 +1270,67 @@ impl VirtualStateProcessor {
 
             // The first block in the mergeset is always the selected parent
             let is_selected_parent = i == 0;
+            let source_header = self.headers_store.get_header(merged_block).unwrap();
+            let atomic_creation_context = AtomicCreationContext {
+                source_block_hash: merged_block,
+                source_block_daa_score: source_header.daa_score,
+                source_block_time: source_header.timestamp,
+            };
 
             // No need to fully validate selected parent transactions since selected parent txs were already validated
             // as part of selected parent UTXO state verification with the exact same UTXO context.
             let validation_flags = if is_selected_parent { TxValidationFlags::SkipScriptChecks } else { TxValidationFlags::Full };
-            let validated_transactions = self.validate_transactions_in_parallel(&txs, &composed_view, pov_daa_score, validation_flags);
+            let mut validated_transactions =
+                self.validate_transactions_in_parallel(&txs, &composed_view, pov_daa_score, validation_flags);
+            validated_transactions.sort_by_key(|(_, tx_index)| *tx_index);
 
             let mut block_fee = 0u64;
-            for (validated_tx, _) in validated_transactions.iter() {
-                ctx.mergeset_diff.add_transaction(validated_tx, pov_daa_score).unwrap();
-                ctx.multiset_hash.add_transaction(validated_tx, pov_daa_score);
-                ctx.accepted_tx_ids.push(validated_tx.id());
+            let mut accepted_transactions = Vec::with_capacity(validated_transactions.len());
+            let mut growth = AtomicBlockStateGrowth::default();
+            for (validated_tx, tx_idx) in validated_transactions.into_iter() {
+                let txid = validated_tx.id();
+                if accepted_txids.contains(&txid) {
+                    debug!(
+                        "Consensus skipped duplicate accepted transaction before Atomic replay: txid={}, source_block={}, tx_index={}, reason=duplicate_txid_already_accepted_in_virtual_mergeset",
+                        txid,
+                        merged_block,
+                        tx_idx
+                    );
+                    continue;
+                }
+                if let Some(conflicting_input) =
+                    validated_tx.inputs().iter().find(|input| accepted_spent_outpoints.contains(&input.previous_outpoint))
+                {
+                    warn!(
+                        "Consensus skipped UTXO-conflicting accepted transaction before Atomic replay: txid={}, source_block={}, tx_index={}, previous_outpoint={}, reason=input_already_spent_in_virtual_mergeset",
+                        txid,
+                        merged_block,
+                        tx_idx,
+                        conflicting_input.previous_outpoint
+                    );
+                    continue;
+                }
+                match self.validate_and_apply_atomic_state_transition_with_growth(
+                    &validated_tx,
+                    pov_daa_score,
+                    atomic_creation_context,
+                    &mut ctx.atomic_state,
+                    &mut growth,
+                ) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        info!("Rejecting transaction {} due to transaction rule error at block tx index {}: {}", txid, tx_idx, err);
+                        continue;
+                    }
+                }
+
+                ctx.mergeset_diff.add_transaction(&validated_tx, pov_daa_score).unwrap();
+                ctx.multiset_hash.add_transaction(&validated_tx, pov_daa_score);
+                ctx.accepted_tx_ids.push(txid);
+                accepted_txids.insert(txid);
+                accepted_spent_outpoints.extend(validated_tx.inputs().iter().map(|input| input.previous_outpoint));
                 block_fee += validated_tx.calculated_fee;
+                accepted_transactions.push(AcceptedTxEntry { transaction_id: txid, index_within_block: tx_idx });
             }
 
             if is_selected_parent {
@@ -110,21 +1338,11 @@ impl VirtualStateProcessor {
                 ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData {
                     block_hash: merged_block,
                     accepted_transactions: once(AcceptedTxEntry { transaction_id: validated_coinbase_id, index_within_block: 0 })
-                        .chain(
-                            validated_transactions
-                                .into_iter()
-                                .map(|(tx, tx_idx)| AcceptedTxEntry { transaction_id: tx.id(), index_within_block: tx_idx }),
-                        )
+                        .chain(accepted_transactions.into_iter())
                         .collect(),
                 });
             } else {
-                ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData {
-                    block_hash: merged_block,
-                    accepted_transactions: validated_transactions
-                        .into_iter()
-                        .map(|(tx, tx_idx)| AcceptedTxEntry { transaction_id: tx.id(), index_within_block: tx_idx })
-                        .collect(),
-                });
+                ctx.mergeset_acceptance_data.push(MergesetBlockAcceptanceData { block_hash: merged_block, accepted_transactions });
             }
 
             let coinbase_data = self.coinbase_manager.deserialize_coinbase_payload(&txs[0].payload).unwrap();
@@ -141,7 +1359,7 @@ impl VirtualStateProcessor {
 
     /// Verify that the current block fully respects its own UTXO view. We define a block as
     /// UTXO valid if all the following conditions hold:
-    ///     1. The block header includes the expected `utxo_commitment`.
+    ///     1. The block header includes the expected state commitment in `utxo_commitment`.
     ///     2. The block header includes the expected `accepted_id_merkle_root`.
     ///     3. The block coinbase transaction rewards the mergeset blocks correctly.
     ///     4. All non-coinbase block transactions are valid against its own UTXO view.
@@ -151,9 +1369,29 @@ impl VirtualStateProcessor {
         selected_parent_utxo_view: &V,
         header: &Header,
     ) -> BlockProcessResult<()> {
-        // Verify header UTXO commitment
-        let expected_commitment = ctx.multiset_hash.finalize();
+        // Verify header state commitment. Before the payload HF this is the raw UTXO commitment;
+        // after the HF it commits to both UTXO and Atomic consensus state.
+        let utxo_commitment = ctx.multiset_hash.finalize();
+        let atomic_state_hash = ctx.atomic_state.canonical_hash();
+        let payload_hf_active = self.transaction_validator.is_payload_hf_active(header.daa_score);
+        let expected_commitment = ctx.atomic_state.header_commitment_for_state(utxo_commitment, payload_hf_active);
         if expected_commitment != header.utxo_commitment {
+            let pre_hf_commitment = AtomicConsensusState::header_commitment(utxo_commitment, atomic_state_hash, false);
+            let post_hf_commitment = AtomicConsensusState::header_commitment(utxo_commitment, atomic_state_hash, true);
+            warn!(
+                "UTXO commitment mismatch diagnostics for block {}: daa={}, payload_hf_active={}, header={}, raw_utxo={}, atomic_state_hash={}, pre_hf_commitment={}, post_hf_commitment={}, header_matches_raw={}, header_matches_pre_hf={}, header_matches_post_hf={}",
+                header.hash,
+                header.daa_score,
+                payload_hf_active,
+                header.utxo_commitment,
+                utxo_commitment,
+                faster_hex::hex_string(&atomic_state_hash),
+                pre_hf_commitment,
+                post_hf_commitment,
+                header.utxo_commitment == utxo_commitment,
+                header.utxo_commitment == pre_hf_commitment,
+                header.utxo_commitment == post_hf_commitment
+            );
             return Err(BadUTXOCommitment(header.hash, header.utxo_commitment, expected_commitment));
         }
         trace!("correct commitment: {}, {}", header.hash, expected_commitment);
@@ -177,8 +1415,20 @@ impl VirtualStateProcessor {
 
         // Verify all transactions are valid in context
         let current_utxo_view = selected_parent_utxo_view.compose(&ctx.mergeset_diff);
-        let validated_transactions =
+        let mut validated_transactions =
             self.validate_transactions_in_parallel(&txs, &current_utxo_view, header.daa_score, TxValidationFlags::Full);
+        let mut atomic_state = ctx.atomic_state.clone();
+        let atomic_creation_context = AtomicCreationContext {
+            source_block_hash: header.hash,
+            source_block_daa_score: header.daa_score,
+            source_block_time: header.timestamp,
+        };
+        validated_transactions = self.filter_validated_transactions_by_atomic_state(
+            validated_transactions,
+            header.daa_score,
+            atomic_creation_context,
+            &mut atomic_state,
+        );
         if validated_transactions.len() < txs.len() - 1 {
             // Some non-coinbase transactions are invalid
             return Err(InvalidTransactionsInUtxoContext(txs.len() - 1 - validated_transactions.len(), txs.len() - 1));
@@ -227,6 +1477,1279 @@ impl VirtualStateProcessor {
                 .filter_map(|(i, tx)| self.validate_transaction_in_utxo_context(tx, &utxo_view, pov_daa_score, flags).ok().map(|vtx| (vtx, i as u32)))
                 .collect()
         })
+    }
+
+    fn filter_validated_transactions_by_atomic_state<'a>(
+        &self,
+        mut validated_transactions: Vec<(ValidatedTransaction<'a>, u32)>,
+        pov_daa_score: u64,
+        creation_context: AtomicCreationContext,
+        atomic_state: &mut AtomicConsensusState,
+    ) -> Vec<(ValidatedTransaction<'a>, u32)> {
+        validated_transactions.sort_by_key(|(_, tx_index)| *tx_index);
+
+        let mut growth = AtomicBlockStateGrowth::default();
+        let mut seen_txids = HashSet::new();
+        let mut spent_outpoints = HashSet::<TransactionOutpoint>::new();
+        let mut filtered = Vec::with_capacity(validated_transactions.len());
+        for (validated_tx, tx_index) in validated_transactions.into_iter() {
+            let tx_id = validated_tx.id();
+            if !seen_txids.insert(tx_id) {
+                warn!(
+                    "Rejecting duplicate transaction before Atomic validation: txid={}, tx_index={}, reason=duplicate_txid_in_candidate_set",
+                    tx_id, tx_index
+                );
+                continue;
+            }
+            if let Some(conflicting_input) =
+                validated_tx.inputs().iter().find(|input| spent_outpoints.contains(&input.previous_outpoint))
+            {
+                warn!(
+                    "Rejecting UTXO-conflicting transaction before Atomic validation: txid={}, tx_index={}, previous_outpoint={}, reason=input_already_spent_in_candidate_set",
+                    tx_id, tx_index, conflicting_input.previous_outpoint
+                );
+                continue;
+            }
+            match self.validate_and_apply_atomic_state_transition_with_growth(
+                &validated_tx,
+                pov_daa_score,
+                creation_context,
+                atomic_state,
+                &mut growth,
+            ) {
+                Ok(()) => {
+                    spent_outpoints.extend(validated_tx.inputs().iter().map(|input| input.previous_outpoint));
+                    filtered.push((validated_tx, tx_index));
+                }
+                Err(err) => {
+                    info!("Rejecting transaction {} due to transaction rule error at block tx index {}: {}", tx_id, tx_index, err);
+                }
+            }
+        }
+
+        filtered
+    }
+
+    pub(super) fn atomic_state_growth_limits(&self) -> AtomicStateGrowthLimits {
+        AtomicStateGrowthLimits {
+            max_new_assets: self.atomic_max_new_assets_per_block,
+            max_new_balance_keys: self.atomic_max_new_balance_keys_per_block,
+            max_new_nonce_keys: self.atomic_max_new_nonce_keys_per_block,
+            max_new_pools: self.atomic_max_new_pools_per_block,
+            max_new_anchor_owner_keys: self.atomic_max_new_anchor_owner_keys_per_block,
+        }
+    }
+
+    pub(super) fn validate_and_apply_atomic_state_transition_with_growth(
+        &self,
+        tx: &impl VerifiableTransaction,
+        pov_daa_score: u64,
+        creation_context: AtomicCreationContext,
+        atomic_state: &mut AtomicConsensusState,
+        growth: &mut AtomicBlockStateGrowth,
+    ) -> TxResult<()> {
+        let delta = self.estimate_atomic_state_growth_for_tx(tx, pov_daa_score, atomic_state)?;
+        growth.ensure_can_add(delta, self.atomic_state_growth_limits())?;
+        self.validate_and_apply_atomic_state_transition(tx, pov_daa_score, creation_context, atomic_state)?;
+        growth.commit(delta);
+        Ok(())
+    }
+
+    fn estimate_atomic_state_growth_for_tx(
+        &self,
+        tx: &impl VerifiableTransaction,
+        pov_daa_score: u64,
+        atomic_state: &AtomicConsensusState,
+    ) -> TxResult<AtomicStateGrowth> {
+        let mut growth = AtomicStateGrowth::default();
+        let tx_ref = tx.tx();
+
+        let mut new_anchor_owner_ids = HashSet::new();
+        for output in tx_ref.outputs.iter() {
+            let Some(owner_id) = atomic_owner_id_from_script(&output.script_public_key) else {
+                continue;
+            };
+            if !atomic_state.has_anchor_count(&owner_id) {
+                new_anchor_owner_ids.insert(owner_id);
+            }
+        }
+        growth.new_anchor_owner_keys = new_anchor_owner_ids.len();
+
+        if !self.transaction_validator.is_payload_hf_active(pov_daa_score)
+            || !tx_ref.subnetwork_id.is_payload()
+            || tx_ref.payload.is_empty()
+        {
+            return Ok(growth);
+        }
+
+        let Some(parsed_payload) = parse_atomic_payload(tx_ref.payload.as_slice()).map_err(TxRuleError::InvalidAtomicPayload)? else {
+            return Ok(growth);
+        };
+
+        let owner_id = self.resolve_atomic_owner_from_populated_tx(tx, parsed_payload.auth_input_index)?;
+        let nonce_key = atomic_nonce_key_for_op(owner_id, &parsed_payload.op);
+        if !atomic_state.has_nonce(&nonce_key) {
+            growth.new_nonce_keys = 1;
+        }
+
+        match &parsed_payload.op {
+            AtomicPayloadOp::CreateAsset { .. } => {
+                let asset_id = tx_ref.id().as_bytes();
+                if !atomic_state.has_asset(&asset_id) {
+                    growth.new_assets = 1;
+                }
+            }
+            AtomicPayloadOp::CreateAssetWithMint { initial_mint_amount, initial_mint_to_owner_id, .. } => {
+                let asset_id = tx_ref.id().as_bytes();
+                if !atomic_state.has_asset(&asset_id) {
+                    growth.new_assets = 1;
+                }
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id: *initial_mint_to_owner_id };
+                if *initial_mint_amount > 0 && !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::CreateLiquidityAsset { launch_buy_sompi, .. } => {
+                let asset_id = tx_ref.id().as_bytes();
+                if !atomic_state.has_asset(&asset_id) {
+                    growth.new_assets = 1;
+                    growth.new_pools = 1;
+                }
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id };
+                if *launch_buy_sompi > 0 && !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount } => {
+                let from_key = AtomicBalanceKey { asset_id: *asset_id, owner_id };
+                let to_key = AtomicBalanceKey { asset_id: *asset_id, owner_id: *to_owner_id };
+                if *amount > 0 && from_key != to_key && !atomic_state.has_balance(&to_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::Mint { asset_id, to_owner_id, amount } => {
+                let receiver_key = AtomicBalanceKey { asset_id: *asset_id, owner_id: *to_owner_id };
+                if *amount > 0 && !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::BuyLiquidityExactIn { asset_id, .. } => {
+                let receiver_key = AtomicBalanceKey { asset_id: *asset_id, owner_id };
+                if !atomic_state.has_balance(&receiver_key) {
+                    growth.new_balance_keys = growth.new_balance_keys.saturating_add(1);
+                }
+            }
+            AtomicPayloadOp::Burn { .. }
+            | AtomicPayloadOp::SellLiquidityExactIn { .. }
+            | AtomicPayloadOp::ClaimLiquidityFees { .. } => {}
+        }
+
+        Ok(growth)
+    }
+
+    fn validate_and_apply_atomic_state_transition(
+        &self,
+        tx: &impl VerifiableTransaction,
+        pov_daa_score: u64,
+        creation_context: AtomicCreationContext,
+        atomic_state: &mut AtomicConsensusState,
+    ) -> TxResult<()> {
+        let payload_hf_active = self.transaction_validator.is_payload_hf_active(pov_daa_score);
+
+        let tx_ref = tx.tx();
+        let liquidity_vault_output_count = tx_ref
+            .outputs
+            .iter()
+            .filter(|output| matches!(ScriptClass::from_script(&output.script_public_key), ScriptClass::LiquidityVault))
+            .count();
+        let spent_vault_inputs = self.collect_spent_liquidity_vault_inputs(tx, atomic_state)?;
+
+        if !payload_hf_active || !tx_ref.subnetwork_id.is_payload() || tx_ref.payload.is_empty() {
+            if !spent_vault_inputs.is_empty() || liquidity_vault_output_count > 0 {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "reserved LiquidityVault scripts require a CAT liquidity payload".to_string(),
+                ));
+            }
+            self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
+            return Ok(());
+        }
+
+        let Some(parsed_payload) = parse_atomic_payload(tx_ref.payload.as_slice()).map_err(TxRuleError::InvalidAtomicPayload)? else {
+            if !spent_vault_inputs.is_empty() || liquidity_vault_output_count > 0 {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "reserved LiquidityVault scripts require a CAT liquidity payload".to_string(),
+                ));
+            }
+            self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
+            return Ok(());
+        };
+        let owner_id = self.resolve_atomic_owner_from_populated_tx(tx, parsed_payload.auth_input_index)?;
+
+        let nonce_key = atomic_nonce_key_for_op(owner_id, &parsed_payload.op);
+        let expected_nonce = atomic_state.next_nonce(&nonce_key);
+        if parsed_payload.nonce != expected_nonce {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "nonce baseline violation for owner `{}` scope `{}` `{}`: expected `{}`, got `{}`",
+                faster_hex::hex_string(&nonce_key.owner_id),
+                nonce_key.scope_kind,
+                faster_hex::hex_string(&nonce_key.scope_id),
+                expected_nonce,
+                parsed_payload.nonce
+            )));
+        }
+        let Some(next_nonce) = expected_nonce.checked_add(1) else {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "nonce progression overflow for owner `{}` scope `{}` `{}`",
+                faster_hex::hex_string(&nonce_key.owner_id),
+                nonce_key.scope_kind,
+                faster_hex::hex_string(&nonce_key.scope_id)
+            )));
+        };
+
+        if !spent_vault_inputs.is_empty() {
+            match &parsed_payload.op {
+                AtomicPayloadOp::BuyLiquidityExactIn { .. }
+                | AtomicPayloadOp::SellLiquidityExactIn { .. }
+                | AtomicPayloadOp::ClaimLiquidityFees { .. } => {}
+                _ => {
+                    return Err(TxRuleError::InvalidAtomicPayload(
+                        "spending a LiquidityVault input is only valid for buy/sell/claim liquidity ops".to_string(),
+                    ))
+                }
+            }
+        }
+        if liquidity_vault_output_count > 0 && !atomic_op_allows_liquidity_vault_output(&parsed_payload.op) {
+            return Err(TxRuleError::InvalidAtomicPayload(
+                "creating a LiquidityVault output is only valid for create/buy/sell/claim liquidity ops".to_string(),
+            ));
+        }
+        if matches!(parsed_payload.op, AtomicPayloadOp::CreateLiquidityAsset { .. }) && !spent_vault_inputs.is_empty() {
+            return Err(TxRuleError::InvalidAtomicPayload("create-liquidity must not spend any LiquidityVault input".to_string()));
+        }
+
+        self.validate_replacement_anchor(tx, owner_id, atomic_state)?;
+        self.apply_atomic_op_to_state(tx, tx.tx().id().as_bytes(), owner_id, parsed_payload.op, creation_context, atomic_state)?;
+
+        atomic_state.set_next_nonce(nonce_key, next_nonce);
+        self.apply_anchor_deltas_to_atomic_state(tx, atomic_state);
+        Ok(())
+    }
+
+    fn resolve_atomic_owner_from_populated_tx(&self, tx: &impl VerifiableTransaction, auth_input_index: u16) -> TxResult<[u8; 32]> {
+        let auth_input_index = auth_input_index as usize;
+        let (_, auth_entry) = tx.populated_inputs().nth(auth_input_index).ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(format!(
+                "auth_input_index `{auth_input_index}` has no populated UTXO entry in contextual validation"
+            ))
+        })?;
+        atomic_owner_id_from_script(&auth_entry.script_public_key).ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(
+                "auth input script public key is not a supported CAT owner authorization scheme (expected PubKey, PubKeyECDSA, or ScriptHash)"
+                    .to_string(),
+            )
+        })
+    }
+
+    fn validate_replacement_anchor(
+        &self,
+        tx: &impl VerifiableTransaction,
+        owner_id: [u8; 32],
+        atomic_state: &AtomicConsensusState,
+    ) -> TxResult<()> {
+        let before_count = atomic_state.anchor_count(&owner_id);
+        let mut spent_for_owner = 0u64;
+        for (_, entry) in tx.populated_inputs() {
+            if atomic_owner_id_from_script(&entry.script_public_key) == Some(owner_id) {
+                spent_for_owner = spent_for_owner.saturating_add(1);
+            }
+        }
+
+        if before_count.saturating_sub(spent_for_owner) > 0 {
+            return Ok(());
+        }
+
+        let has_replacement_anchor =
+            tx.tx().outputs.iter().any(|output| atomic_owner_id_from_script(&output.script_public_key) == Some(owner_id));
+        if has_replacement_anchor {
+            Ok(())
+        } else {
+            Err(TxRuleError::InvalidAtomicPayload(
+                "auth owner would lose the final anchor UTXO without a replacement owner output".to_string(),
+            ))
+        }
+    }
+
+    fn apply_anchor_deltas_to_atomic_state(&self, tx: &impl VerifiableTransaction, atomic_state: &mut AtomicConsensusState) {
+        let mut spent_counts: HashMap<[u8; 32], u64> = HashMap::new();
+        for (_, entry) in tx.populated_inputs() {
+            let Some(owner_id) = atomic_owner_id_from_script(&entry.script_public_key) else {
+                continue;
+            };
+            *spent_counts.entry(owner_id).or_insert(0) += 1;
+        }
+
+        let mut created_counts: HashMap<[u8; 32], u64> = HashMap::new();
+        for output in tx.tx().outputs.iter() {
+            let Some(owner_id) = atomic_owner_id_from_script(&output.script_public_key) else {
+                continue;
+            };
+            *created_counts.entry(owner_id).or_insert(0) += 1;
+        }
+
+        let owners: HashSet<[u8; 32]> = spent_counts.keys().copied().chain(created_counts.keys().copied()).collect();
+        for owner_id in owners {
+            let old_count = atomic_state.anchor_count(&owner_id);
+            let spent = spent_counts.get(&owner_id).copied().unwrap_or(0);
+            let created = created_counts.get(&owner_id).copied().unwrap_or(0);
+            let new_count = old_count.saturating_sub(spent).saturating_add(created);
+            atomic_state.set_anchor_count(owner_id, new_count);
+        }
+    }
+
+    fn apply_atomic_op_to_state(
+        &self,
+        tx: &impl VerifiableTransaction,
+        tx_id_bytes: [u8; 32],
+        owner_id: [u8; 32],
+        op: AtomicPayloadOp,
+        creation_context: AtomicCreationContext,
+        atomic_state: &mut AtomicConsensusState,
+    ) -> TxResult<()> {
+        match op {
+            AtomicPayloadOp::CreateAsset {
+                token_version,
+                decimals,
+                supply_mode,
+                max_supply,
+                mint_authority_owner_id,
+                name,
+                symbol,
+                metadata,
+                platform_tag,
+            } => {
+                let asset_id = tx_id_bytes;
+                if atomic_state.has_asset(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "asset `{}` already exists",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let supply_mode = match supply_mode {
+                    AtomicPayloadSupplyMode::Uncapped => AtomicSupplyMode::Uncapped,
+                    AtomicPayloadSupplyMode::Capped => AtomicSupplyMode::Capped,
+                };
+                self.insert_atomic_asset_state(
+                    atomic_state,
+                    asset_id,
+                    AtomicAssetState {
+                        creator_owner_id: owner_id,
+                        asset_class: AtomicAssetClass::Standard,
+                        token_version,
+                        mint_authority_owner_id,
+                        decimals,
+                        supply_mode,
+                        max_supply,
+                        total_supply: 0,
+                        name,
+                        symbol,
+                        metadata,
+                        platform_tag,
+                        created_block_hash: Some(creation_context.source_block_hash.as_bytes()),
+                        created_daa_score: Some(creation_context.source_block_daa_score),
+                        created_at: Some(creation_context.source_block_time),
+                        liquidity: None,
+                    },
+                )?;
+            }
+            AtomicPayloadOp::CreateAssetWithMint {
+                token_version,
+                decimals,
+                supply_mode,
+                max_supply,
+                mint_authority_owner_id,
+                name,
+                symbol,
+                metadata,
+                initial_mint_amount,
+                initial_mint_to_owner_id,
+                platform_tag,
+            } => {
+                let asset_id = tx_id_bytes;
+                if atomic_state.has_asset(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "asset `{}` already exists",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let supply_mode = match supply_mode {
+                    AtomicPayloadSupplyMode::Uncapped => AtomicSupplyMode::Uncapped,
+                    AtomicPayloadSupplyMode::Capped => AtomicSupplyMode::Capped,
+                };
+                let mut total_supply = 0u128;
+                let mut initial_mint_balance: Option<(AtomicBalanceKey, u128)> = None;
+                if initial_mint_amount > 0 {
+                    if matches!(supply_mode, AtomicSupplyMode::Capped) && initial_mint_amount > max_supply {
+                        return Err(TxRuleError::InvalidAtomicPayload(format!(
+                            "initial mint exceeds cap for asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        )));
+                    }
+                    let receiver_key = AtomicBalanceKey { asset_id, owner_id: initial_mint_to_owner_id };
+                    let receiver_balance = atomic_state.balance(&receiver_key);
+                    let receiver_after = receiver_balance.checked_add(initial_mint_amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "balance overflow while create-and-mint asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                    initial_mint_balance = Some((receiver_key, receiver_after));
+                    total_supply = initial_mint_amount;
+                }
+                self.insert_atomic_asset_state(
+                    atomic_state,
+                    asset_id,
+                    AtomicAssetState {
+                        creator_owner_id: owner_id,
+                        asset_class: AtomicAssetClass::Standard,
+                        token_version,
+                        mint_authority_owner_id,
+                        decimals,
+                        supply_mode,
+                        max_supply,
+                        total_supply,
+                        name,
+                        symbol,
+                        metadata,
+                        platform_tag,
+                        created_block_hash: Some(creation_context.source_block_hash.as_bytes()),
+                        created_daa_score: Some(creation_context.source_block_daa_score),
+                        created_at: Some(creation_context.source_block_time),
+                        liquidity: None,
+                    },
+                )?;
+                if let Some((receiver_key, receiver_after)) = initial_mint_balance {
+                    atomic_state.set_balance(receiver_key, receiver_after);
+                }
+            }
+            AtomicPayloadOp::CreateLiquidityAsset {
+                token_version,
+                curve_version,
+                curve_mode,
+                individual_virtual_cpay_reserves_sompi,
+                individual_virtual_token_multiplier_bps,
+                decimals,
+                max_supply,
+                name,
+                symbol,
+                metadata,
+                seed_reserve_sompi,
+                fee_bps,
+                recipients,
+                launch_buy_sompi,
+                launch_buy_min_token_out,
+                platform_tag,
+                liquidity_unlock_target_sompi,
+            } => {
+                let asset_id = tx_id_bytes;
+                if atomic_state.has_asset(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "asset `{}` already exists",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                validate_liquidity_creation_parameters(decimals, max_supply, seed_reserve_sompi)?;
+                validate_liquidity_curve_mode(curve_mode)?;
+                validate_liquidity_curve_parameters(
+                    curve_mode,
+                    individual_virtual_cpay_reserves_sompi,
+                    individual_virtual_token_multiplier_bps,
+                )?;
+                validate_liquidity_unlock_target(liquidity_unlock_target_sompi)?;
+                let (vault_output_index, vault_output_value) = self.resolve_create_liquidity_vault_output(tx)?;
+                let expected_vault_value = seed_reserve_sompi
+                    .checked_add(launch_buy_sompi)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("vault value overflow on create".to_string()))?;
+                if vault_output_value != expected_vault_value {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "create liquidity vault output mismatch: expected `{expected_vault_value}`, got `{vault_output_value}`"
+                    )));
+                }
+
+                let mut fee_recipients = self.build_fee_recipient_state(recipients)?;
+                if fee_bps > 0 && fee_recipients.is_empty() {
+                    return Err(TxRuleError::InvalidAtomicPayload("fee_bps > 0 requires at least one recipient".to_string()));
+                }
+
+                let mut real_cpay_reserves_sompi = INITIAL_REAL_CPAY_RESERVES_SOMPI;
+                let mut real_token_reserves = max_supply;
+                let mut virtual_cpay_reserves_sompi =
+                    initial_virtual_cpay_reserves_sompi_for_curve(curve_mode, individual_virtual_cpay_reserves_sompi)?;
+                let mut virtual_token_reserves =
+                    initial_virtual_token_reserves_for_curve(max_supply, curve_mode, individual_virtual_token_multiplier_bps)?;
+                let mut unclaimed_fee_total_sompi = 0u64;
+                let mut total_supply = 0u128;
+                let mut launch_receiver_after: Option<(AtomicBalanceKey, u128)> = None;
+
+                if launch_buy_sompi > 0 {
+                    let fee_trade = calculate_trade_fee(launch_buy_sompi, fee_bps)?;
+                    let launch_buy_net = launch_buy_sompi
+                        .checked_sub(fee_trade)
+                        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("launch buy fee underflow".to_string()))?;
+                    let (token_out, new_real_token_reserves, new_virtual_cpay_reserves_sompi, new_virtual_token_reserves) =
+                        cpmm_buy(real_token_reserves, virtual_cpay_reserves_sompi, virtual_token_reserves, launch_buy_net)?;
+                    if token_out < launch_buy_min_token_out {
+                        return Err(TxRuleError::InvalidAtomicPayload(format!(
+                            "launch buy min_token_out violated: expected at least `{}`, got `{}`",
+                            launch_buy_min_token_out, token_out
+                        )));
+                    }
+                    let canonical_launch_buy = min_gross_input_for_token_out(
+                        real_token_reserves,
+                        virtual_cpay_reserves_sompi,
+                        virtual_token_reserves,
+                        token_out,
+                        fee_bps,
+                    )?;
+                    if launch_buy_sompi != canonical_launch_buy {
+                        return Err(TxRuleError::InvalidAtomicPayload(format!(
+                            "launch buy CPAY input is not canonical: expected `{}`, got `{}`",
+                            canonical_launch_buy, launch_buy_sompi
+                        )));
+                    }
+                    if token_out == 0 {
+                        return Err(TxRuleError::InvalidAtomicPayload("launch buy produced zero token_out".to_string()));
+                    }
+                    real_cpay_reserves_sompi = real_cpay_reserves_sompi
+                        .checked_add(launch_buy_net)
+                        .ok_or_else(|| TxRuleError::InvalidAtomicPayload("launch buy real CPAY reserve overflow".to_string()))?;
+                    real_token_reserves = new_real_token_reserves;
+                    virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
+                    virtual_token_reserves = new_virtual_token_reserves;
+                    apply_fee_to_pool(&mut fee_recipients, &mut unclaimed_fee_total_sompi, fee_trade)?;
+                    total_supply = token_out;
+
+                    let receiver_key = AtomicBalanceKey { asset_id, owner_id };
+                    let receiver_balance = atomic_state.balance(&receiver_key);
+                    let receiver_after = receiver_balance.checked_add(token_out).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "balance overflow while launch-buy minting liquidity asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                    launch_receiver_after = Some((receiver_key, receiver_after));
+                }
+
+                let vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_output_index);
+                let unlocked = liquidity_unlock_target_sompi == 0 || real_cpay_reserves_sompi >= liquidity_unlock_target_sompi;
+                let asset = AtomicAssetState {
+                    creator_owner_id: owner_id,
+                    asset_class: AtomicAssetClass::Liquidity,
+                    token_version,
+                    mint_authority_owner_id: [0u8; 32],
+                    decimals,
+                    supply_mode: AtomicSupplyMode::Capped,
+                    max_supply,
+                    total_supply,
+                    name,
+                    symbol,
+                    metadata,
+                    platform_tag,
+                    created_block_hash: Some(creation_context.source_block_hash.as_bytes()),
+                    created_daa_score: Some(creation_context.source_block_daa_score),
+                    created_at: Some(creation_context.source_block_time),
+                    liquidity: Some(AtomicLiquidityPoolState {
+                        pool_nonce: 1,
+                        curve_version,
+                        curve_mode,
+                        individual_virtual_cpay_reserves_sompi,
+                        individual_virtual_token_multiplier_bps,
+                        real_cpay_reserves_sompi,
+                        real_token_reserves,
+                        virtual_cpay_reserves_sompi,
+                        virtual_token_reserves,
+                        unclaimed_fee_total_sompi,
+                        fee_bps,
+                        fee_recipients,
+                        vault_outpoint,
+                        vault_value_sompi: vault_output_value,
+                        unlock_target_sompi: liquidity_unlock_target_sompi,
+                        unlocked,
+                    }),
+                };
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+                if let Some((receiver_key, receiver_after)) = launch_receiver_after {
+                    atomic_state.set_balance(receiver_key, receiver_after);
+                }
+            }
+            AtomicPayloadOp::Transfer { asset_id, to_owner_id, amount } => {
+                if !atomic_state.has_asset(&asset_id) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "transfer references unknown asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+
+                let from_key = AtomicBalanceKey { asset_id, owner_id };
+                let to_key = AtomicBalanceKey { asset_id, owner_id: to_owner_id };
+
+                let sender_balance = atomic_state.balance(&from_key);
+                if from_key == to_key {
+                    sender_balance.checked_sub(amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "insufficient balance for self-transfer of asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                } else {
+                    let receiver_balance = atomic_state.balance(&to_key);
+                    let sender_after = sender_balance.checked_sub(amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "insufficient balance for transfer of asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+                    let receiver_after = receiver_balance.checked_add(amount).ok_or_else(|| {
+                        TxRuleError::InvalidAtomicPayload(format!(
+                            "balance overflow for transfer receiver in asset `{}`",
+                            faster_hex::hex_string(&asset_id)
+                        ))
+                    })?;
+
+                    if sender_after == 0 {
+                        atomic_state.set_balance(from_key, 0);
+                    } else {
+                        atomic_state.set_balance(from_key, sender_after);
+                    }
+                    atomic_state.set_balance(to_key, receiver_after);
+                }
+            }
+            AtomicPayloadOp::Mint { asset_id, to_owner_id, amount } => {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("mint references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "legacy mint is invalid for liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                if asset.mint_authority_owner_id != owner_id {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "owner `{}` is not mint authority for asset `{}`",
+                        faster_hex::hex_string(&owner_id),
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+
+                let new_total_supply = asset.total_supply.checked_add(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "supply overflow while minting asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if matches!(asset.supply_mode, AtomicSupplyMode::Capped) && new_total_supply > asset.max_supply {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "mint would exceed cap for asset `{}`: cap `{}`, attempted total `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        asset.max_supply,
+                        new_total_supply
+                    )));
+                }
+
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id: to_owner_id };
+                let receiver_balance = atomic_state.balance(&receiver_key);
+                let receiver_after = receiver_balance.checked_add(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "balance overflow while minting asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+
+                asset.total_supply = new_total_supply;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+                atomic_state.set_balance(receiver_key, receiver_after);
+            }
+            AtomicPayloadOp::Burn { asset_id, amount } => {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("burn references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                if matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "legacy burn is invalid for liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let sender_key = AtomicBalanceKey { asset_id, owner_id };
+                let sender_balance = atomic_state.balance(&sender_key);
+
+                let sender_after = sender_balance.checked_sub(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "insufficient balance for burn in asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                let supply_after = asset.total_supply.checked_sub(amount).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "supply underflow while burning asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+
+                asset.total_supply = supply_after;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+                if sender_after == 0 {
+                    atomic_state.set_balance(sender_key, 0);
+                } else {
+                    atomic_state.set_balance(sender_key, sender_after);
+                }
+            }
+            AtomicPayloadOp::BuyLiquidityExactIn { asset_id, expected_pool_nonce, cpay_in_sompi, min_token_out } => {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("buy references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy is only valid for liquidity assets (`{}` is standard)",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let mut pool = asset.liquidity.clone().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity state missing for asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if pool.pool_nonce != expected_pool_nonce {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "stale liquidity nonce for asset `{}`: expected `{}`, got `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        pool.pool_nonce,
+                        expected_pool_nonce
+                    )));
+                }
+
+                let vault_transition = self.resolve_liquidity_vault_transition(tx, pool.vault_outpoint)?;
+                let vault_delta = vault_transition
+                    .output_value
+                    .checked_sub(vault_transition.input_value)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("buy requires vault_value to increase".to_string()))?;
+                if vault_delta != cpay_in_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy vault delta mismatch: expected `{}`, got `{}`",
+                        cpay_in_sompi, vault_delta
+                    )));
+                }
+
+                let fee_trade = calculate_trade_fee(cpay_in_sompi, pool.fee_bps)?;
+                let net_in = cpay_in_sompi
+                    .checked_sub(fee_trade)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("buy fee underflow".to_string()))?;
+                let (token_out, new_real_token_reserves, new_virtual_cpay_reserves_sompi, new_virtual_token_reserves) =
+                    cpmm_buy(pool.real_token_reserves, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, net_in)?;
+                if token_out < min_token_out {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy min_token_out violated: expected at least `{}`, got `{}`",
+                        min_token_out, token_out
+                    )));
+                }
+                let canonical_cpay_in = min_gross_input_for_token_out(
+                    pool.real_token_reserves,
+                    pool.virtual_cpay_reserves_sompi,
+                    pool.virtual_token_reserves,
+                    token_out,
+                    pool.fee_bps,
+                )?;
+                if cpay_in_sompi != canonical_cpay_in {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "buy CPAY input is not canonical: expected `{}`, got `{}`",
+                        canonical_cpay_in, cpay_in_sompi
+                    )));
+                }
+                if token_out == 0 {
+                    return Err(TxRuleError::InvalidAtomicPayload("buy produced zero token_out".to_string()));
+                }
+
+                pool.real_cpay_reserves_sompi = pool
+                    .real_cpay_reserves_sompi
+                    .checked_add(net_in)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("buy real CPAY reserve overflow".to_string()))?;
+                pool.real_token_reserves = new_real_token_reserves;
+                pool.virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
+                pool.virtual_token_reserves = new_virtual_token_reserves;
+                if pool.unlock_target_sompi > 0 && pool.real_cpay_reserves_sompi >= pool.unlock_target_sompi {
+                    pool.unlocked = true;
+                }
+                apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+                pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
+                pool.vault_value_sompi = vault_transition.output_value;
+                pool.pool_nonce = pool
+                    .pool_nonce
+                    .checked_add(1)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
+
+                let receiver_key = AtomicBalanceKey { asset_id, owner_id };
+                let receiver_balance = atomic_state.balance(&receiver_key);
+                let receiver_after = receiver_balance.checked_add(token_out).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "receiver balance overflow while buying liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                let new_total_supply = asset.total_supply.checked_add(token_out).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "total_supply overflow while buying liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                asset.total_supply = new_total_supply;
+                asset.liquidity = Some(pool);
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+                atomic_state.set_balance(receiver_key, receiver_after);
+            }
+            AtomicPayloadOp::SellLiquidityExactIn {
+                asset_id,
+                expected_pool_nonce,
+                token_in,
+                min_cpay_out_sompi,
+                cpay_receive_output_index,
+            } => {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!("sell references unknown asset `{}`", faster_hex::hex_string(&asset_id)))
+                })?;
+                if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell is only valid for liquidity assets (`{}` is standard)",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let mut pool = asset.liquidity.clone().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity state missing for asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if pool.pool_nonce != expected_pool_nonce {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "stale liquidity nonce for asset `{}`: expected `{}`, got `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        pool.pool_nonce,
+                        expected_pool_nonce
+                    )));
+                }
+                if liquidity_sell_locked(&pool) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity sell locked for asset `{}` until real CPAY reserve reaches `{}` sompi",
+                        faster_hex::hex_string(&asset_id),
+                        pool.unlock_target_sompi
+                    )));
+                }
+                let sender_key = AtomicBalanceKey { asset_id, owner_id };
+                let sender_balance = atomic_state.balance(&sender_key);
+                let sender_after = sender_balance.checked_sub(token_in).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "insufficient balance for sell in liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                let supply_after = asset.total_supply.checked_sub(token_in).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "total_supply underflow while selling liquidity asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+
+                let (gross_out, new_real_cpay_reserves_sompi, new_virtual_cpay_reserves_sompi, new_virtual_token_reserves) =
+                    cpmm_sell(pool.real_cpay_reserves_sompi, pool.virtual_cpay_reserves_sompi, pool.virtual_token_reserves, token_in)?;
+                let fee_trade = calculate_trade_fee(gross_out, pool.fee_bps)?;
+                let cpay_out = gross_out
+                    .checked_sub(fee_trade)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("sell fee underflow".to_string()))?;
+                if cpay_out == 0 {
+                    return Err(TxRuleError::InvalidAtomicPayload("sell produced zero cpay_out".to_string()));
+                }
+                if cpay_out < min_cpay_out_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell min_cpay_out violated: expected at least `{}`, got `{}`",
+                        min_cpay_out_sompi, cpay_out
+                    )));
+                }
+                if cpay_out < LIQUIDITY_MIN_PAYOUT_SOMPI {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell payout `{}` below liquidity_min_payout_sompi `{}`",
+                        cpay_out, LIQUIDITY_MIN_PAYOUT_SOMPI
+                    )));
+                }
+                self.validate_payout_output(tx, cpay_receive_output_index, cpay_out, None)?;
+                let vault_transition = self.resolve_liquidity_vault_transition(tx, pool.vault_outpoint)?;
+                let vault_delta = vault_transition
+                    .input_value
+                    .checked_sub(vault_transition.output_value)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("sell requires vault_value to decrease".to_string()))?;
+                if vault_delta != cpay_out {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "sell vault delta mismatch: expected `{}`, got `{}`",
+                        cpay_out, vault_delta
+                    )));
+                }
+
+                pool.real_cpay_reserves_sompi = new_real_cpay_reserves_sompi;
+                pool.real_token_reserves = pool
+                    .real_token_reserves
+                    .checked_add(token_in)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("sell real token reserve overflow".to_string()))?;
+                pool.virtual_cpay_reserves_sompi = new_virtual_cpay_reserves_sompi;
+                pool.virtual_token_reserves = new_virtual_token_reserves;
+                apply_fee_to_pool(&mut pool.fee_recipients, &mut pool.unclaimed_fee_total_sompi, fee_trade)?;
+                pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
+                pool.vault_value_sompi = vault_transition.output_value;
+                pool.pool_nonce = pool
+                    .pool_nonce
+                    .checked_add(1)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
+
+                asset.total_supply = supply_after;
+                asset.liquidity = Some(pool);
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+                if sender_after == 0 {
+                    atomic_state.set_balance(sender_key, 0);
+                } else {
+                    atomic_state.set_balance(sender_key, sender_after);
+                }
+            }
+            AtomicPayloadOp::ClaimLiquidityFees {
+                asset_id,
+                expected_pool_nonce,
+                recipient_index,
+                claim_amount_sompi,
+                claim_receive_output_index,
+            } => {
+                let mut asset = atomic_state.cloned_asset(&asset_id).ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "claim references unknown asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim is only valid for liquidity assets (`{}` is standard)",
+                        faster_hex::hex_string(&asset_id)
+                    )));
+                }
+                let mut pool = asset.liquidity.clone().ok_or_else(|| {
+                    TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity state missing for asset `{}`",
+                        faster_hex::hex_string(&asset_id)
+                    ))
+                })?;
+                if pool.pool_nonce != expected_pool_nonce {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "stale liquidity nonce for asset `{}`: expected `{}`, got `{}`",
+                        faster_hex::hex_string(&asset_id),
+                        pool.pool_nonce,
+                        expected_pool_nonce
+                    )));
+                }
+                if liquidity_sell_locked(&pool) {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "liquidity fee claim locked for asset `{}` until curve reserve reaches `{}` sompi",
+                        faster_hex::hex_string(&asset_id),
+                        pool.unlock_target_sompi
+                    )));
+                }
+                if claim_amount_sompi < LIQUIDITY_MIN_PAYOUT_SOMPI {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim amount `{}` below liquidity_min_payout_sompi `{}`",
+                        claim_amount_sompi, LIQUIDITY_MIN_PAYOUT_SOMPI
+                    )));
+                }
+                let recipient_index = usize::from(recipient_index);
+                if recipient_index >= pool.fee_recipients.len() {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!("claim recipient_index `{recipient_index}` out of range")));
+                }
+                let recipient_owner_id = pool.fee_recipients[recipient_index].owner_id;
+                let recipient_unclaimed = pool.fee_recipients[recipient_index].unclaimed_sompi;
+                if recipient_unclaimed < claim_amount_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim amount `{}` exceeds unclaimed recipient fees `{}`",
+                        claim_amount_sompi, recipient_unclaimed
+                    )));
+                }
+                validate_liquidity_claim_authorization(owner_id, recipient_owner_id)?;
+
+                self.validate_payout_output(tx, claim_receive_output_index, claim_amount_sompi, Some(recipient_owner_id))?;
+                let vault_transition = self.resolve_liquidity_vault_transition(tx, pool.vault_outpoint)?;
+                let vault_delta = vault_transition
+                    .input_value
+                    .checked_sub(vault_transition.output_value)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("claim requires vault_value to decrease".to_string()))?;
+                if vault_delta != claim_amount_sompi {
+                    return Err(TxRuleError::InvalidAtomicPayload(format!(
+                        "claim vault delta mismatch: expected `{}`, got `{}`",
+                        claim_amount_sompi, vault_delta
+                    )));
+                }
+
+                pool.fee_recipients[recipient_index].unclaimed_sompi = recipient_unclaimed - claim_amount_sompi;
+                pool.unclaimed_fee_total_sompi = pool
+                    .unclaimed_fee_total_sompi
+                    .checked_sub(claim_amount_sompi)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("claim unclaimed_fee_total underflow".to_string()))?;
+                pool.vault_outpoint = TransactionOutpoint::new(tx.tx().id(), vault_transition.output_index);
+                pool.vault_value_sompi = vault_transition.output_value;
+                pool.pool_nonce = pool
+                    .pool_nonce
+                    .checked_add(1)
+                    .ok_or_else(|| TxRuleError::InvalidAtomicPayload("pool nonce overflow".to_string()))?;
+
+                asset.liquidity = Some(pool);
+                self.validate_liquidity_invariants(asset_id, &asset)?;
+                self.insert_atomic_asset_state(atomic_state, asset_id, asset)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_atomic_asset_state(
+        &self,
+        atomic_state: &mut AtomicConsensusState,
+        asset_id: [u8; 32],
+        asset: AtomicAssetState,
+    ) -> TxResult<()> {
+        atomic_state.set_asset(asset_id, asset).map_err(TxRuleError::InvalidAtomicPayload)
+    }
+
+    fn collect_spent_liquidity_vault_inputs(
+        &self,
+        tx: &impl VerifiableTransaction,
+        atomic_state: &AtomicConsensusState,
+    ) -> TxResult<Vec<([u8; 32], TransactionOutpoint)>> {
+        let mut spent = Vec::new();
+        for (input, entry) in tx.populated_inputs() {
+            if !matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            let Some(asset_id) = self.find_liquidity_asset_by_vault_outpoint(atomic_state, input.previous_outpoint)? else {
+                return Err(TxRuleError::InvalidAtomicPayload(format!(
+                    "unknown LiquidityVault input outpoint `{}`",
+                    input.previous_outpoint,
+                )));
+            };
+            spent.push((asset_id, input.previous_outpoint));
+        }
+        Ok(spent)
+    }
+
+    fn find_liquidity_asset_by_vault_outpoint(
+        &self,
+        atomic_state: &AtomicConsensusState,
+        outpoint: TransactionOutpoint,
+    ) -> TxResult<Option<[u8; 32]>> {
+        atomic_state.liquidity_asset_by_vault_outpoint(outpoint).map_err(TxRuleError::InvalidAtomicPayload)
+    }
+
+    fn resolve_create_liquidity_vault_output(&self, tx: &impl VerifiableTransaction) -> TxResult<(u32, u64)> {
+        for (_, entry) in tx.populated_inputs() {
+            if matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                return Err(TxRuleError::InvalidAtomicPayload("create-liquidity must not spend any LiquidityVault input".to_string()));
+            }
+        }
+
+        let mut found: Option<(u32, u64)> = None;
+        for (index, output) in tx.tx().outputs.iter().enumerate() {
+            if !matches!(ScriptClass::from_script(&output.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            let out_index =
+                u32::try_from(index).map_err(|_| TxRuleError::InvalidAtomicPayload("vault output index overflow".to_string()))?;
+            if found.is_some() {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "create-liquidity must have exactly one LiquidityVault output".to_string(),
+                ));
+            }
+            found = Some((out_index, output.value));
+        }
+        found.ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload("create-liquidity must have exactly one LiquidityVault output".to_string())
+        })
+    }
+
+    fn resolve_liquidity_vault_transition(
+        &self,
+        tx: &impl VerifiableTransaction,
+        expected_vault_outpoint: TransactionOutpoint,
+    ) -> TxResult<VaultTransition> {
+        let mut input_value = None;
+        for (input, entry) in tx.populated_inputs() {
+            if !matches!(ScriptClass::from_script(&entry.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            if input_value.is_some() {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "liquidity transition must have exactly one LiquidityVault input".to_string(),
+                ));
+            }
+            if input.previous_outpoint != expected_vault_outpoint {
+                return Err(TxRuleError::InvalidAtomicPayload(format!(
+                    "liquidity vault outpoint mismatch: expected `{}`, got `{}`",
+                    expected_vault_outpoint, input.previous_outpoint
+                )));
+            }
+            input_value = Some(entry.amount);
+        }
+        let input_value = input_value.ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload("liquidity transition must have exactly one LiquidityVault input".to_string())
+        })?;
+
+        let mut output = None;
+        for (index, tx_output) in tx.tx().outputs.iter().enumerate() {
+            if !matches!(ScriptClass::from_script(&tx_output.script_public_key), ScriptClass::LiquidityVault) {
+                continue;
+            }
+            if output.is_some() {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "liquidity transition must have exactly one LiquidityVault output".to_string(),
+                ));
+            }
+            let out_index =
+                u32::try_from(index).map_err(|_| TxRuleError::InvalidAtomicPayload("vault output index overflow".to_string()))?;
+            output = Some((out_index, tx_output.value));
+        }
+        let (output_index, output_value) = output.ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload("liquidity transition must have exactly one LiquidityVault output".to_string())
+        })?;
+
+        Ok(VaultTransition { input_value, output_index, output_value })
+    }
+
+    fn build_fee_recipient_state(
+        &self,
+        recipients: Vec<AtomicPayloadRecipientAddress>,
+    ) -> TxResult<Vec<AtomicLiquidityFeeRecipientState>> {
+        let mut out = Vec::with_capacity(recipients.len());
+        for recipient in recipients {
+            let owner_id = atomic_owner_id_from_address_components(recipient.address_version, &recipient.address_payload)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("invalid liquidity fee recipient address encoding".to_string()))?;
+            out.push(AtomicLiquidityFeeRecipientState {
+                owner_id,
+                address_version: recipient.address_version,
+                address_payload: recipient.address_payload,
+                unclaimed_sompi: 0,
+            });
+        }
+        Ok(out)
+    }
+
+    fn validate_liquidity_invariants(&self, asset_id: [u8; 32], asset: &AtomicAssetState) -> TxResult<()> {
+        if !matches!(asset.asset_class, AtomicAssetClass::Liquidity) {
+            return Ok(());
+        }
+        let pool = asset.liquidity.as_ref().ok_or_else(|| {
+            TxRuleError::InvalidAtomicPayload(format!("liquidity state missing for asset `{}`", faster_hex::hex_string(&asset_id)))
+        })?;
+        if !matches!(asset.supply_mode, AtomicSupplyMode::Capped) {
+            return Err(TxRuleError::InvalidAtomicPayload("liquidity assets must always use capped supply mode".to_string()));
+        }
+        validate_liquidity_curve_mode(pool.curve_mode)?;
+        validate_liquidity_curve_parameters(
+            pool.curve_mode,
+            pool.individual_virtual_cpay_reserves_sompi,
+            pool.individual_virtual_token_multiplier_bps,
+        )?;
+        validate_liquidity_unlock_target(pool.unlock_target_sompi)?;
+        if pool.unlock_target_sompi == 0 && !pool.unlocked {
+            return Err(TxRuleError::InvalidAtomicPayload("liquidity lock disabled pools must be marked unlocked".to_string()));
+        }
+        if pool.unlock_target_sompi > 0 && pool.real_cpay_reserves_sompi >= pool.unlock_target_sompi && !pool.unlocked {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "liquidity lock target reached for asset `{}` but pool is still locked",
+                faster_hex::hex_string(&asset_id)
+            )));
+        }
+        if pool.real_cpay_reserves_sompi < MIN_CPAY_RESERVE_SOMPI {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "real CPAY reserve floor violation for asset `{}`",
+                faster_hex::hex_string(&asset_id)
+            )));
+        }
+        if pool.real_token_reserves < MIN_REAL_TOKEN_RESERVE {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "real token reserve floor violation for asset `{}`",
+                faster_hex::hex_string(&asset_id)
+            )));
+        }
+        if pool.virtual_cpay_reserves_sompi == 0 || pool.virtual_token_reserves == 0 {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "virtual reserve invariant violation for asset `{}`",
+                faster_hex::hex_string(&asset_id)
+            )));
+        }
+        let expected_vault = pool
+            .real_cpay_reserves_sompi
+            .checked_add(pool.unclaimed_fee_total_sompi)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("vault invariant overflow".to_string()))?;
+        if pool.vault_value_sompi != expected_vault {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "vault invariant violation for asset `{}`: vault_value `{}` != real reserve `{}` + fees `{}`",
+                faster_hex::hex_string(&asset_id),
+                pool.vault_value_sompi,
+                pool.real_cpay_reserves_sompi,
+                pool.unclaimed_fee_total_sompi
+            )));
+        }
+        let expected_total = asset
+            .total_supply
+            .checked_add(pool.real_token_reserves)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload("supply invariant overflow".to_string()))?;
+        if expected_total != asset.max_supply {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "supply invariant violation for asset `{}`: circulating `{}` + real token reserves `{}` != max `{}`",
+                faster_hex::hex_string(&asset_id),
+                asset.total_supply,
+                pool.real_token_reserves,
+                asset.max_supply
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_payout_output(
+        &self,
+        tx: &impl VerifiableTransaction,
+        output_index: u16,
+        expected_value: u64,
+        expected_owner_id: Option<[u8; 32]>,
+    ) -> TxResult<()> {
+        let output = tx
+            .tx()
+            .outputs
+            .get(output_index as usize)
+            .ok_or_else(|| TxRuleError::InvalidAtomicPayload(format!("payout output index `{}` out of range", output_index)))?;
+        if output.value != expected_value {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "payout output value mismatch at index `{}`: expected `{}`, got `{}`",
+                output_index, expected_value, output.value
+            )));
+        }
+        let class = ScriptClass::from_script(&output.script_public_key);
+        if !matches!(class, ScriptClass::PubKey | ScriptClass::PubKeyECDSA | ScriptClass::ScriptHash) {
+            return Err(TxRuleError::InvalidAtomicPayload(format!(
+                "payout script class `{}` at index `{}` is not allowed",
+                class, output_index
+            )));
+        }
+        if let Some(owner_id) = expected_owner_id {
+            let output_owner_id = atomic_owner_id_from_script(&output.script_public_key)
+                .ok_or_else(|| TxRuleError::InvalidAtomicPayload("payout output owner id cannot be derived".to_string()))?;
+            if output_owner_id != owner_id {
+                return Err(TxRuleError::InvalidAtomicPayload(
+                    "payout output owner does not match configured fee recipient".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Attempts to populate the transaction with UTXO entries and performs all utxo-related tx validations
@@ -292,8 +2815,8 @@ impl VirtualStateProcessor {
     ) -> TxResult<()> {
         self.populate_mempool_transaction_in_utxo_context(mutable_tx, utxo_view)?;
 
-        // For non-activated nets (mainnet, TN10) we can update mempool rules to KIP9 beta asap. For
-        // TN11 we need to hard-fork consensus first (since the new beta rules are more permissive)
+        // For networks without storage-mass activation we can keep KIP9 beta mempool rules.
+        // For activated networks we keep alpha until consensus activation catches up.
         let kip9_version = if self.storage_mass_activation_daa_score == u64::MAX { Kip9Version::Beta } else { Kip9Version::Alpha };
 
         // Calc the full contextual mass including storage mass

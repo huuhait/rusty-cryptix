@@ -6,7 +6,7 @@
 use crate::events::Events;
 use crate::imports::*;
 use crate::result::Result;
-use crate::tx::{Fees, PaymentDestination};
+use crate::tx::{validate_wallet_payload, Fees, PaymentDestination};
 use crate::utxo::{UtxoContext, UtxoEntryReference, UtxoIterator};
 use cryptix_addresses::Address;
 use workflow_core::channel::Multiplexer;
@@ -62,14 +62,93 @@ impl GeneratorSettings {
         final_transaction_destination: PaymentDestination,
         final_priority_fee: Fees,
         final_transaction_payload: Option<Vec<u8>>,
+        sender_address: Option<Address>,
     ) -> Result<Self> {
+        Self::try_new_with_account_and_priority(
+            account,
+            final_transaction_destination,
+            final_priority_fee,
+            final_transaction_payload,
+            sender_address,
+            None,
+        )
+    }
+
+    pub fn try_new_with_account_and_priority(
+        account: Arc<dyn Account>,
+        final_transaction_destination: PaymentDestination,
+        final_priority_fee: Fees,
+        final_transaction_payload: Option<Vec<u8>>,
+        sender_address: Option<Address>,
+        priority_utxo_entries: Option<Vec<UtxoEntryReference>>,
+    ) -> Result<Self> {
+        Self::try_new_with_account_and_priority_impl(
+            account,
+            final_transaction_destination,
+            final_priority_fee,
+            final_transaction_payload,
+            sender_address,
+            priority_utxo_entries,
+            true,
+        )
+    }
+
+    pub fn try_new_with_account_and_priority_untracked(
+        account: Arc<dyn Account>,
+        final_transaction_destination: PaymentDestination,
+        final_priority_fee: Fees,
+        final_transaction_payload: Option<Vec<u8>>,
+        sender_address: Option<Address>,
+        priority_utxo_entries: Option<Vec<UtxoEntryReference>>,
+    ) -> Result<Self> {
+        Self::try_new_with_account_and_priority_impl(
+            account,
+            final_transaction_destination,
+            final_priority_fee,
+            final_transaction_payload,
+            sender_address,
+            priority_utxo_entries,
+            false,
+        )
+    }
+
+    fn try_new_with_account_and_priority_impl(
+        account: Arc<dyn Account>,
+        final_transaction_destination: PaymentDestination,
+        final_priority_fee: Fees,
+        final_transaction_payload: Option<Vec<u8>>,
+        sender_address: Option<Address>,
+        priority_utxo_entries: Option<Vec<UtxoEntryReference>>,
+        track_source_context: bool,
+    ) -> Result<Self> {
+        validate_wallet_payload(final_transaction_payload.as_deref())?;
+
         let network_id = account.utxo_context().processor().network_id()?;
-        let change_address = account.change_address()?;
+        let (change_address, utxo_iterator) = if let Some(sender_address) = sender_address {
+            let sender_utxos = {
+                let context = account.utxo_context().context();
+                context.mature.iter().filter(|entry| entry.address().as_ref() == Some(&sender_address)).cloned().collect::<Vec<_>>()
+            };
+            if sender_utxos.is_empty() {
+                return Err(Error::custom(format!(
+                    "senderAddress {sender_address} has no spendable mature UTXOs in the selected account"
+                )));
+            }
+
+            // senderAddress is strict: only UTXOs from the selected sender are allowed as inputs.
+            let sender_utxo_iterator: Box<dyn Iterator<Item = UtxoEntryReference> + Send + Sync + 'static> =
+                Box::new(sender_utxos.into_iter());
+            (sender_address, sender_utxo_iterator)
+        } else {
+            (
+                account.change_address()?,
+                Box::new(UtxoIterator::new(account.utxo_context()))
+                    as Box<dyn Iterator<Item = UtxoEntryReference> + Send + Sync + 'static>,
+            )
+        };
         let multiplexer = account.wallet().multiplexer().clone();
         let sig_op_count = account.sig_op_count();
         let minimum_signatures = account.minimum_signatures();
-
-        let utxo_iterator = UtxoIterator::new(account.utxo_context());
 
         let settings = GeneratorSettings {
             network_id,
@@ -77,9 +156,9 @@ impl GeneratorSettings {
             sig_op_count,
             minimum_signatures,
             change_address,
-            utxo_iterator: Box::new(utxo_iterator),
-            source_utxo_context: Some(account.utxo_context().clone()),
-            priority_utxo_entries: None,
+            utxo_iterator,
+            source_utxo_context: track_source_context.then(|| account.utxo_context().clone()),
+            priority_utxo_entries,
 
             final_transaction_priority_fee: final_priority_fee,
             final_transaction_destination,
@@ -101,6 +180,8 @@ impl GeneratorSettings {
         final_transaction_payload: Option<Vec<u8>>,
         multiplexer: Option<Multiplexer<Box<Events>>>,
     ) -> Result<Self> {
+        validate_wallet_payload(final_transaction_payload.as_deref())?;
+
         let network_id = utxo_context.processor().network_id()?;
         let utxo_iterator = UtxoIterator::new(&utxo_context);
 
@@ -135,6 +216,8 @@ impl GeneratorSettings {
         final_transaction_payload: Option<Vec<u8>>,
         multiplexer: Option<Multiplexer<Box<Events>>>,
     ) -> Result<Self> {
+        validate_wallet_payload(final_transaction_payload.as_deref())?;
+
         let settings = GeneratorSettings {
             network_id,
             multiplexer,

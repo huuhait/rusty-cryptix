@@ -48,14 +48,19 @@ impl ConsensusMonitor {
             // Subtract the snapshots
             let delta = &snapshot - &last_snapshot;
             let now = Instant::now();
+            let virtual_lag_daa = snapshot.highest_body_daa_score.saturating_sub(snapshot.virtual_daa_score);
 
             info!(
-                "Processed {} blocks and {} headers in the last {:.2}s ({} transactions; {} UTXO-validated blocks; {:.2} parents; {:.2} mergeset; {:.2} TPB; {:.1} mass)", 
+                "Processed {} blocks and {} headers in the last {:.2}s ({} transactions; {} fastchain submit events (local); {} UTXO-validated blocks; virtual_lag_daa={} body_tip_daa={} virtual_daa={}; {:.2} parents; {:.2} mergeset; {:.2} TPB; {:.1} mass)",
                 delta.body_counts,
                 delta.header_counts,
                 (now - last_log_time).as_secs_f64(),
                 delta.txs_counts,
+                delta.fast_txs_counts,
                 delta.chain_block_counts,
+                virtual_lag_daa,
+                snapshot.highest_body_daa_score,
+                snapshot.virtual_daa_score,
                 if delta.header_counts != 0 { delta.dep_counts as f64 / delta.header_counts as f64 } else { 0f64 },
                 if delta.header_counts != 0 { delta.mergeset_counts as f64 / delta.header_counts as f64 } else { 0f64 },
                 if delta.body_counts != 0 { delta.txs_counts as f64 / delta.body_counts as f64 } else{ 0f64 },
@@ -64,7 +69,7 @@ impl ConsensusMonitor {
 
             if delta.chain_disqualified_counts > 0 {
                 warn!(
-                    "Consensus detected UTXO-invalid blocks which are disqualified from the virtual selected chain (possibly due to inheritance): {} disqualified vs. {} valid chain blocks",
+                    "Consensus marked UTXO-invalid blocks as disqualified from the virtual selected chain (new or inherited): {} newly disqualified vs. {} valid chain blocks",
                     delta.chain_disqualified_counts, delta.chain_block_counts
                 );
             }

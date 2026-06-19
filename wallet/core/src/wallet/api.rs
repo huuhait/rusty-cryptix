@@ -8,15 +8,78 @@ use crate::result::Result;
 use crate::storage::interface::TransactionRangeResult;
 use crate::storage::Binding;
 use crate::tx::Fees;
-use workflow_core::channel::Receiver;
+use workflow_core::{
+    channel::{DuplexChannel, Sender},
+    task::spawn,
+};
+
+fn smart_scan_count(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
+fn summarize_smart_scans(summaries: &[SmartScanSummary]) -> (u32, u32, u32) {
+    let scanned = summaries.iter().map(|summary| summary.scanned_address_count).sum::<usize>();
+    let discovered = summaries.iter().map(|summary| summary.discovered_address_count).sum::<usize>();
+    let registered = summaries.iter().map(|summary| summary.registered_address_count).sum::<usize>();
+    (smart_scan_count(scanned), smart_scan_count(discovered), smart_scan_count(registered))
+}
 
 #[async_trait]
 impl WalletApi for super::Wallet {
-    async fn register_notifications(self: Arc<Self>, _channel: Receiver<WalletNotification>) -> Result<u64> {
-        todo!()
+    async fn register_notifications(self: Arc<Self>, channel: Sender<WalletNotification>) -> Result<u64> {
+        let channel_id = self.inner.next_notification_relay_id.fetch_add(1, Ordering::SeqCst);
+        let relay_ctl = DuplexChannel::oneshot();
+
+        self.inner.notification_relays.lock().unwrap().insert(channel_id, super::NotificationRelay { task_ctl: relay_ctl.clone() });
+
+        let events = self.multiplexer().channel();
+        let relay_ctl_receiver = relay_ctl.request.receiver.clone();
+        let relay_ctl_sender = relay_ctl.response.sender.clone();
+        let this = self.clone();
+        spawn(async move {
+            loop {
+                select! {
+                    _ = relay_ctl_receiver.recv().fuse() => {
+                        break;
+                    },
+                    msg = events.receiver.recv().fuse() => {
+                        match msg {
+                            Ok(event) => {
+                                let notification = WalletNotification {
+                                    kind: event.kind(),
+                                    event_json: serde_json::to_string(event.as_ref()).unwrap_or_else(|_| "{}".to_string()),
+                                };
+                                if channel.send(notification).await.is_err() {
+                                    break;
+                                }
+                            },
+                            Err(_) => {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            this.inner.notification_relays.lock().unwrap().remove(&channel_id);
+            let _ = relay_ctl_sender.send(()).await;
+        });
+
+        Ok(channel_id)
     }
-    async fn unregister_notifications(self: Arc<Self>, _channel_id: u64) -> Result<()> {
-        todo!()
+
+    async fn unregister_notifications(self: Arc<Self>, channel_id: u64) -> Result<()> {
+        let relay = self
+            .inner
+            .notification_relays
+            .lock()
+            .unwrap()
+            .remove(&channel_id)
+            .ok_or_else(|| Error::Custom(format!("wallet notification channel id `{channel_id}` is not registered")))?;
+
+        relay.task_ctl.signal(()).await.map_err(|err| Error::Custom(format!("wallet notification channel shutdown failed: {err}")))?;
+
+        Ok(())
     }
 
     async fn get_status_call(self: Arc<Self>, request: GetStatusRequest) -> Result<GetStatusResponse> {
@@ -313,6 +376,132 @@ impl WalletApi for super::Wallet {
         Ok(AccountsDiscoveryResponse { last_account_index_found })
     }
 
+    async fn accounts_scan_call(self: Arc<Self>, request: AccountsScanRequest) -> Result<AccountsScanResponse> {
+        let AccountsScanRequest { account_id, wallet_secret, depth, window_size } = request;
+
+        let guard = self.guard();
+        let guard = guard.lock().await;
+
+        let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
+
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let wallet_secret =
+                wallet_secret.as_ref().ok_or_else(|| Error::Custom("walletSecret is required to scan legacy accounts".to_string()))?;
+            legacy_account.create_private_context(wallet_secret, None, None).await?;
+        }
+
+        let scan_result = account.clone().scan(window_size.map(|value| value as usize), depth).await;
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if scan_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after scan error: {err}");
+            }
+        }
+        scan_result?;
+
+        if let Some(metadata) = account.metadata()? {
+            self.store().as_account_store()?.update_metadata(vec![metadata]).await?;
+        }
+
+        let account_descriptor = account.descriptor()?;
+        self.notify(Events::AccountUpdate { account_descriptor: account_descriptor.clone() }).await?;
+
+        Ok(AccountsScanResponse { account_descriptor })
+    }
+
+    async fn accounts_scan_smart_call(self: Arc<Self>, request: AccountsScanSmartRequest) -> Result<AccountsScanSmartResponse> {
+        let AccountsScanSmartRequest { account_id, wallet_secret, depth, window_size, monitor_window_size } = request;
+
+        let guard = self.guard();
+        let guard = guard.lock().await;
+
+        let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
+
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let wallet_secret = wallet_secret
+                .as_ref()
+                .ok_or_else(|| Error::Custom("walletSecret is required to smart-scan legacy accounts".to_string()))?;
+            legacy_account.create_private_context(wallet_secret, None, None).await?;
+        }
+
+        let scan_result = account
+            .clone()
+            .scan_smart(
+                window_size.map(|value| value as usize),
+                monitor_window_size.map(|value| value as usize),
+                depth,
+                None,
+                false,
+                None,
+            )
+            .await;
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if scan_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after smart scan error: {err}");
+            }
+        }
+        let summaries = scan_result?;
+
+        if let Some(metadata) = account.metadata()? {
+            self.store().as_account_store()?.update_metadata(vec![metadata]).await?;
+        }
+
+        let account_descriptor = account.descriptor()?;
+        self.notify(Events::AccountUpdate { account_descriptor: account_descriptor.clone() }).await?;
+
+        let (scanned_address_count, discovered_address_count, registered_address_count) = summarize_smart_scans(&summaries);
+
+        Ok(AccountsScanSmartResponse { account_descriptor, scanned_address_count, discovered_address_count, registered_address_count })
+    }
+
+    async fn accounts_activate_smart_call(
+        self: Arc<Self>,
+        request: AccountsActivateSmartRequest,
+    ) -> Result<AccountsActivateSmartResponse> {
+        let AccountsActivateSmartRequest {
+            account_ids,
+            wallet_secret,
+            depth,
+            window_size,
+            monitor_window_size,
+            start_index,
+            relative_to_current_index,
+            known_addresses,
+        } = request;
+
+        let guard = self.guard();
+        let guard = guard.lock().await;
+
+        let (account_descriptors, summaries) = self
+            .activate_accounts_smart(
+                account_ids.as_deref(),
+                wallet_secret.as_ref(),
+                window_size.map(|value| value as usize),
+                monitor_window_size.map(|value| value as usize),
+                depth,
+                start_index,
+                relative_to_current_index.unwrap_or(false),
+                known_addresses,
+                &guard,
+            )
+            .await?;
+        let (scanned_address_count, discovered_address_count, registered_address_count) = summarize_smart_scans(&summaries);
+
+        Ok(AccountsActivateSmartResponse {
+            account_descriptors,
+            scanned_address_count,
+            discovered_address_count,
+            registered_address_count,
+        })
+    }
+
     async fn accounts_create_call(self: Arc<Self>, request: AccountsCreateRequest) -> Result<AccountsCreateResponse> {
         let AccountsCreateRequest { wallet_secret, account_create_args } = request;
 
@@ -357,37 +546,161 @@ impl WalletApi for super::Wallet {
         Ok(AccountsGetResponse { account_descriptor })
     }
 
+    async fn accounts_utxos_call(self: Arc<Self>, request: AccountsUtxosRequest) -> Result<AccountsUtxosResponse> {
+        let AccountsUtxosRequest { account_id, start, end, include_pending } = request;
+
+        if start > end {
+            return Err(Error::InvalidRange(start, end));
+        }
+
+        let guard = self.guard();
+        let _guard = guard.lock().await;
+
+        let account =
+            self.active_accounts().get(&account_id).ok_or_else(|| Error::custom(format!("account {account_id} is not active")))?;
+
+        let mut groups = HashMap::<TransactionId, AccountUtxoTransaction>::new();
+        {
+            let context = account.utxo_context().context();
+
+            for utxo in context.mature.iter() {
+                let transaction_id = utxo.transaction_id();
+                let entry = AccountUtxoEntry::from_reference(utxo, "mature");
+                groups.entry(transaction_id).or_insert_with(|| AccountUtxoTransaction::new(transaction_id, "mature")).push(entry);
+            }
+
+            if include_pending {
+                for utxo in context.pending.values() {
+                    let transaction_id = utxo.transaction_id();
+                    let entry = AccountUtxoEntry::from_reference(utxo, "pending");
+                    groups.entry(transaction_id).or_insert_with(|| AccountUtxoTransaction::new(transaction_id, "pending")).push(entry);
+                }
+
+                for utxo in context.stasis.values() {
+                    let transaction_id = utxo.transaction_id();
+                    let entry = AccountUtxoEntry::from_reference(utxo, "stasis");
+                    groups.entry(transaction_id).or_insert_with(|| AccountUtxoTransaction::new(transaction_id, "stasis")).push(entry);
+                }
+            }
+        }
+
+        let mut transactions = groups.into_values().collect::<Vec<_>>();
+        transactions.sort_by(|left, right| {
+            right
+                .block_daa_score
+                .cmp(&left.block_daa_score)
+                .then_with(|| right.transaction_id.to_string().cmp(&left.transaction_id.to_string()))
+        });
+
+        let total = transactions.len() as u64;
+        let range_start = start.min(total) as usize;
+        let range_end = end.min(total) as usize;
+        let transactions = transactions[range_start..range_end].to_vec();
+
+        Ok(AccountsUtxosResponse { account_id, transactions, start, total })
+    }
+
     async fn accounts_create_new_address_call(
         self: Arc<Self>,
         request: AccountsCreateNewAddressRequest,
     ) -> Result<AccountsCreateNewAddressResponse> {
-        let AccountsCreateNewAddressRequest { account_id, kind } = request;
+        let AccountsCreateNewAddressRequest { account_id, wallet_secret, kind } = request;
 
         let guard = self.guard();
         let guard = guard.lock().await;
 
         let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
 
-        let address = match kind {
-            NewAddressKind::Receive => account.as_derivation_capable()?.new_receive_address().await?,
-            NewAddressKind::Change => account.as_derivation_capable()?.new_change_address().await?,
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let wallet_secret = wallet_secret
+                .as_ref()
+                .ok_or_else(|| Error::Custom("walletSecret is required to create legacy addresses".to_string()))?;
+            legacy_account.create_private_context(wallet_secret, None, None).await?;
+        }
+
+        let address_result = match kind {
+            NewAddressKind::Receive => account.clone().as_derivation_capable()?.new_receive_address().await,
+            NewAddressKind::Change => account.clone().as_derivation_capable()?.new_change_address().await,
         };
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if address_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after address creation error: {err}");
+            }
+        }
+        let address = address_result?;
 
         Ok(AccountsCreateNewAddressResponse { address })
     }
 
     async fn accounts_send_call(self: Arc<Self>, request: AccountsSendRequest) -> Result<AccountsSendResponse> {
-        let AccountsSendRequest { account_id, wallet_secret, payment_secret, destination, priority_fee_sompi, payload } = request;
+        let AccountsSendRequest {
+            account_id,
+            sender_address,
+            wallet_secret,
+            payment_secret,
+            destination,
+            priority_fee_sompi,
+            payload,
+            fast_path,
+        } = request;
 
         let guard = self.guard();
         let guard = guard.lock().await;
         let account = self.get_account_by_id(&account_id, &guard).await?.ok_or(Error::AccountNotFound(account_id))?;
+        let legacy_account = account.clone().as_legacy_account().ok();
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            legacy_account.create_private_context(&wallet_secret, payment_secret.as_ref(), None).await?;
+        }
 
         let abortable = Abortable::new();
-        let (generator_summary, transaction_ids) =
-            account.send(destination, priority_fee_sompi, payload, wallet_secret, payment_secret, &abortable, None).await?;
+        let fast_submit = fast_path.and_then(|fast_path| {
+            if fast_path.enabled {
+                Some(crate::tx::FastSubmitOptions {
+                    enabled: true,
+                    intent_nonce: fast_path.intent_nonce,
+                    client_created_at_ms: fast_path.client_created_at_ms,
+                    max_fee_sompi: fast_path.max_fee_sompi,
+                })
+            } else {
+                None
+            }
+        });
+        let send_result = account
+            .send(
+                destination,
+                priority_fee_sompi,
+                payload,
+                sender_address,
+                fast_submit,
+                wallet_secret,
+                payment_secret,
+                &abortable,
+                None,
+            )
+            .await;
+        if let Some(legacy_account) = legacy_account.as_ref() {
+            let clear_result = legacy_account.clear_private_context().await;
+            if send_result.is_ok() {
+                clear_result?;
+            } else if let Err(err) = clear_result {
+                log_warn!("failed to clear legacy private context after send error: {err}");
+            }
+        }
+        let (generator_summary, transaction_ids, fast_summary) = send_result?;
 
-        Ok(AccountsSendResponse { generator_summary, transaction_ids })
+        Ok(AccountsSendResponse {
+            generator_summary,
+            transaction_ids,
+            fast_path_requested: fast_summary.requested,
+            fast_path_used: fast_summary.used,
+            fast_path_status: fast_summary.status,
+            fast_path_reason: fast_summary.reason,
+            basechain_submitted: fast_summary.basechain_submitted,
+        })
     }
 
     async fn accounts_transfer_call(self: Arc<Self>, request: AccountsTransferRequest) -> Result<AccountsTransferResponse> {
@@ -424,7 +737,7 @@ impl WalletApi for super::Wallet {
     }
 
     async fn accounts_estimate_call(self: Arc<Self>, request: AccountsEstimateRequest) -> Result<AccountsEstimateResponse> {
-        let AccountsEstimateRequest { account_id, destination, priority_fee_sompi, payload } = request;
+        let AccountsEstimateRequest { account_id, sender_address, destination, priority_fee_sompi, payload } = request;
 
         let guard = self.guard();
         let guard = guard.lock().await;
@@ -443,7 +756,7 @@ impl WalletApi for super::Wallet {
 
         let abortable = Abortable::new();
         self.inner.estimation_abortables.lock().unwrap().insert(account_id, abortable.clone());
-        let result = account.estimate(destination, priority_fee_sompi, payload, &abortable).await;
+        let result = account.estimate(destination, priority_fee_sompi, payload, sender_address, &abortable).await;
         self.inner.estimation_abortables.lock().unwrap().remove(&account_id);
 
         Ok(AccountsEstimateResponse { generator_summary: result? })
@@ -460,8 +773,72 @@ impl WalletApi for super::Wallet {
         let store = self.store().as_transaction_record_store()?;
         let TransactionRangeResult { transactions, total } =
             store.load_range(&binding, &network_id, filter, start as usize..end as usize).await?;
+        let current_daa_score = self.current_daa_score();
+        let mut records = transactions
+            .into_iter()
+            .map(|record| {
+                let mut record = (*record).clone();
+                record.refresh_payload_availability(current_daa_score);
+                record
+            })
+            .collect::<Vec<_>>();
+        let mut records_to_persist = Vec::<TransactionRecord>::new();
 
-        Ok(TransactionsDataGetResponse { transactions, total, account_id, start })
+        // Refresh records with missing embedded tx data at query time so payload
+        // availability can recover from "missing" once the tx is resolvable.
+        // New nodes support one batched lookup, avoiding hundreds of per-record
+        // header scans when a wallet has a long payload/messenger history.
+        let enrichment_indices = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                (!record.has_embedded_transaction() && Self::needs_transaction_enrichment(record)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+
+        let mut batch_lookup_available = false;
+        if !enrichment_indices.is_empty() {
+            if let Ok(resolved_transactions) = self.resolve_records_transactions_by_ids(&records, &enrichment_indices).await {
+                batch_lookup_available = true;
+                for index in enrichment_indices.iter().copied() {
+                    let Some(transaction) = resolved_transactions.get(records[index].id()).cloned() else {
+                        continue;
+                    };
+                    if records[index].try_attach_transaction(transaction) {
+                        records[index].refresh_payload_availability(current_daa_score);
+                        records_to_persist.push(records[index].clone());
+                    }
+                }
+            }
+        }
+
+        let unresolved_indices = records
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| {
+                (!record.has_embedded_transaction() && Self::needs_transaction_enrichment(record)).then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let allow_legacy_lookup = !batch_lookup_available || unresolved_indices.len() <= super::TX_ENRICH_LEGACY_RESIDUAL_LIMIT;
+        if allow_legacy_lookup {
+            for index in unresolved_indices {
+                if let Ok(enriched) = self.enrich_record_transaction(&records[index], true).await {
+                    if enriched.has_embedded_transaction() {
+                        records_to_persist.push(enriched.clone());
+                    }
+                    records[index] = enriched;
+                }
+            }
+        }
+
+        let resolved = records.into_iter().map(Arc::new).collect::<Vec<_>>();
+
+        if !records_to_persist.is_empty() {
+            let record_refs: Vec<&TransactionRecord> = records_to_persist.iter().collect();
+            store.store(&record_refs).await?;
+        }
+
+        Ok(TransactionsDataGetResponse { transactions: resolved, total, account_id, start })
     }
 
     async fn transactions_replace_note_call(

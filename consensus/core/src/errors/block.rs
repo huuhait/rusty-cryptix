@@ -6,8 +6,8 @@ use crate::{
     tx::{TransactionId, TransactionOutpoint},
     BlueWorkType,
 };
-use itertools::Itertools;
 use cryptix_hashes::Hash;
+use itertools::Itertools;
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -90,6 +90,9 @@ pub enum RuleError {
 
     #[error("block has second coinbase transaction as index {0}")]
     MultipleCoinbases(usize),
+
+    #[error("transactions must be sorted by subnetwork")]
+    TransactionsNotSorted,
 
     #[error("bad coinbase payload: {0}")]
     BadCoinbasePayload(CoinbaseError),

@@ -256,6 +256,7 @@ mod mockery {
                 gas: mock(),
                 payload: Hash::mock().as_bytes().to_vec(),
                 mass: mock(),
+                fast_path: mock(),
                 verbose_data: mock(),
             }
         }
@@ -301,8 +302,14 @@ mod mockery {
                 time_offset: mock(),
                 user_agent: "0.4.2".to_string(),
                 advertised_protocol_version: mock(),
+                advertised_services: mock(),
+                is_hfa_fastchain: mock(),
+                is_cryptix_atomic: mock(),
+                is_strong_node_claims: mock(),
+                is_archival: mock(),
                 time_connected: mock(),
                 is_ibd_peer: mock(),
+                unified_node_id: Some("00".repeat(32)),
             }
         }
     }
@@ -680,6 +687,44 @@ mod mockery {
 
     test!(GetBlocksResponse);
 
+    impl Mock for RpcTransactionLookupRequest {
+        fn mock() -> Self {
+            RpcTransactionLookupRequest { transaction_id: mock(), block_daa_score: Some(mock()) }
+        }
+    }
+
+    test!(RpcTransactionLookupRequest);
+
+    impl Mock for GetTransactionsByIdsRequest {
+        fn mock() -> Self {
+            GetTransactionsByIdsRequest { entries: mock(), include_orphan_pool: true, filter_transaction_pool: false }
+        }
+    }
+
+    test!(GetTransactionsByIdsRequest);
+
+    impl Mock for RpcTransactionLookupResult {
+        fn mock() -> Self {
+            RpcTransactionLookupResult {
+                transaction_id: mock(),
+                transaction: Some(mock()),
+                block_hash: Some(mock()),
+                block_daa_score: Some(mock()),
+                source: "chain".to_string(),
+            }
+        }
+    }
+
+    test!(RpcTransactionLookupResult);
+
+    impl Mock for GetTransactionsByIdsResponse {
+        fn mock() -> Self {
+            GetTransactionsByIdsResponse { entries: mock() }
+        }
+    }
+
+    test!(GetTransactionsByIdsResponse);
+
     impl Mock for GetBlockCountRequest {
         fn mock() -> Self {
             GetBlockCountRequest {}
@@ -1048,6 +1093,47 @@ mod mockery {
 
     test!(GetSyncStatusResponse);
 
+    impl Mock for GetStrongNodesRequest {
+        fn mock() -> Self {
+            GetStrongNodesRequest {}
+        }
+    }
+
+    test!(GetStrongNodesRequest);
+
+    impl Mock for RpcStrongNodeEntry {
+        fn mock() -> Self {
+            RpcStrongNodeEntry {
+                node_id: "00".repeat(32),
+                public_key_xonly: "11".repeat(32),
+                source: "claimant-v1".to_string(),
+                claimed_blocks: mock(),
+                share_bps: mock(),
+                last_claim_block_hash: Some("22".repeat(32)),
+                last_claim_time_ms: mock(),
+            }
+        }
+    }
+
+    test!(RpcStrongNodeEntry);
+
+    impl Mock for GetStrongNodesResponse {
+        fn mock() -> Self {
+            GetStrongNodesResponse {
+                enabled_by_config: true,
+                hardfork_active: true,
+                runtime_available: true,
+                disabled_reason_code: None,
+                disabled_reason_message: None,
+                conflict_total: mock(),
+                window_size: mock(),
+                entries: vec![mock()],
+            }
+        }
+    }
+
+    test!(GetStrongNodesResponse);
+
     impl Mock for GetDaaScoreTimestampEstimateRequest {
         fn mock() -> Self {
             GetDaaScoreTimestampEstimateRequest { daa_scores: mock() }
@@ -1283,6 +1369,30 @@ mod mockery {
     }
 
     test!(NewBlockTemplateNotification);
+
+    impl Mock for NotifyTokenEventsRequest {
+        fn mock() -> Self {
+            NotifyTokenEventsRequest { command: Command::Start }
+        }
+    }
+
+    test!(NotifyTokenEventsRequest);
+
+    impl Mock for NotifyTokenEventsResponse {
+        fn mock() -> Self {
+            NotifyTokenEventsResponse {}
+        }
+    }
+
+    test!(NotifyTokenEventsResponse);
+
+    impl Mock for TokenEventsChangedNotification {
+        fn mock() -> Self {
+            TokenEventsChangedNotification { from_sequence: mock(), to_sequence: mock(), event_count: mock() }
+        }
+    }
+
+    test!(TokenEventsChangedNotification);
 
     impl Mock for SubscribeResponse {
         fn mock() -> Self {

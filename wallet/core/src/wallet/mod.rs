@@ -22,6 +22,7 @@ use cryptix_notify::{
     listener::ListenerId,
     scope::{Scope, VirtualDaaScoreChangedScope},
 };
+use cryptix_rpc_core::RpcTransactionLookupRequest;
 use cryptix_wallet_keys::xpub::NetworkTaggedXpub;
 use cryptix_wrpc_client::{CryptixRpcClient, Resolver, WrpcEncoding};
 use workflow_core::task::spawn;
@@ -81,6 +82,11 @@ pub enum WalletBusMessage {
     Discovery { record: TransactionRecord },
 }
 
+#[derive(Clone)]
+struct NotificationRelay {
+    task_ctl: DuplexChannel,
+}
+
 pub struct Inner {
     active_accounts: ActiveAccountMap,
     legacy_accounts: ActiveAccountMap,
@@ -90,10 +96,14 @@ pub struct Inner {
     store: Arc<dyn Interface>,
     settings: SettingsStore<WalletSettings>,
     utxo_processor: Arc<UtxoProcessor>,
+    ingress_multiplexer: Multiplexer<Box<Events>>,
     multiplexer: Multiplexer<Box<Events>>,
     wallet_bus: Channel<WalletBusMessage>,
+    messenger_dedup_indexes: AsyncMutex<HashMap<String, crate::tx::MessengerDedupIndex>>,
     estimation_abortables: Mutex<HashMap<AccountId, Abortable>>,
     retained_contexts: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    notification_relays: Mutex<HashMap<u64, NotificationRelay>>,
+    next_notification_relay_id: AtomicU64,
     // Mutex used to protect concurrent access to accounts at the wallet api level
     guard: Arc<AsyncMutex<()>>,
     account_guard: Arc<AsyncMutex<()>>,
@@ -110,6 +120,14 @@ pub struct Inner {
 pub struct Wallet {
     inner: Arc<Inner>,
 }
+
+const TX_ENRICH_LOOKBACK_MARGIN_DAA: u64 = 64;
+const TX_ENRICH_LOOKBACK_MIN_HEADERS: u64 = 256;
+const TX_ENRICH_LOOKBACK_MAX_HEADERS: u64 = 8192;
+const TX_ENRICH_DAA_WINDOW: u64 = 16;
+const TX_ENRICH_MAX_CANDIDATE_BLOCKS: usize = 64;
+const TX_ENRICH_MAX_MERGESET_BLOCKS_PER_CANDIDATE: usize = 256;
+const TX_ENRICH_LEGACY_RESIDUAL_LIMIT: usize = 8;
 
 impl Default for Wallet {
     fn default() -> Self {
@@ -132,8 +150,13 @@ impl Wallet {
     }
 
     pub fn try_with_wrpc(store: Arc<dyn Interface>, resolver: Option<Resolver>, network_id: Option<NetworkId>) -> Result<Wallet> {
-        let rpc_client =
-            Arc::new(CryptixRpcClient::new_with_args(WrpcEncoding::Borsh, Some("wrpc://127.0.0.1:19301"), resolver, network_id, None)?);
+        let rpc_client = Arc::new(CryptixRpcClient::new_with_args(
+            WrpcEncoding::Borsh,
+            Some("wrpc://127.0.0.1:19301"),
+            resolver,
+            network_id,
+            None,
+        )?);
 
         let rpc_ctl = rpc_client.ctl().clone();
         let rpc_api: Arc<DynRpcApi> = rpc_client;
@@ -142,13 +165,15 @@ impl Wallet {
     }
 
     pub fn try_with_rpc(rpc: Option<Rpc>, store: Arc<dyn Interface>, network_id: Option<NetworkId>) -> Result<Wallet> {
+        let ingress_multiplexer = Multiplexer::<Box<Events>>::new();
         let multiplexer = Multiplexer::<Box<Events>>::new();
         let wallet_bus = Channel::unbounded();
         let utxo_processor =
-            Arc::new(UtxoProcessor::new(rpc.clone(), network_id, Some(multiplexer.clone()), Some(wallet_bus.clone())));
+            Arc::new(UtxoProcessor::new(rpc.clone(), network_id, Some(ingress_multiplexer.clone()), Some(wallet_bus.clone())));
 
         let wallet = Wallet {
             inner: Arc::new(Inner {
+                ingress_multiplexer,
                 multiplexer,
                 store,
                 active_accounts: ActiveAccountMap::default(),
@@ -159,8 +184,11 @@ impl Wallet {
                 settings: SettingsStore::new_with_storage(Storage::default_settings_store()),
                 utxo_processor: utxo_processor.clone(),
                 wallet_bus,
+                messenger_dedup_indexes: AsyncMutex::new(HashMap::new()),
                 estimation_abortables: Mutex::new(HashMap::new()),
                 retained_contexts: Mutex::new(HashMap::new()),
+                notification_relays: Mutex::new(HashMap::new()),
+                next_notification_relay_id: AtomicU64::new(1),
                 guard: Arc::new(AsyncMutex::new(())),
                 account_guard: Arc::new(AsyncMutex::new(())),
             }),
@@ -448,6 +476,83 @@ impl Wallet {
         Ok(ids)
     }
 
+    async fn activate_accounts_smart_impl(
+        self: &Arc<Wallet>,
+        account_ids: Option<&[AccountId]>,
+        wallet_secret: Option<&Secret>,
+        window_size: Option<usize>,
+        monitor_window_size: Option<usize>,
+        extent: Option<u32>,
+        start_index: Option<u32>,
+        relative_to_current_index: bool,
+        known_addresses: Option<Vec<Address>>,
+    ) -> Result<(Vec<AccountId>, Vec<AccountDescriptor>, Vec<SmartScanSummary>)> {
+        let stored_accounts = if let Some(ids) = account_ids {
+            self.inner.store.as_account_store().unwrap().load_multiple(ids).await?
+        } else {
+            self.inner.store.as_account_store().unwrap().iter(None).await?.try_collect::<Vec<_>>().await?
+        };
+
+        let ids = stored_accounts.iter().map(|(account, _)| *account.id()).collect::<Vec<_>>();
+        let mut account_descriptors = Vec::new();
+        let mut summaries = Vec::new();
+
+        for (account_storage, meta) in stored_accounts.into_iter() {
+            let account = if account_storage.kind.as_ref() == LEGACY_ACCOUNT_KIND {
+                self.legacy_accounts().get(account_storage.id()).ok_or_else(|| Error::LegacyAccountNotInitialized)?
+            } else {
+                try_load_account(self, account_storage, meta).await?
+            };
+
+            let legacy_account = account.clone().as_legacy_account().ok();
+            if let Some(legacy_account) = legacy_account.as_ref() {
+                let wallet_secret = wallet_secret
+                    .ok_or_else(|| Error::Custom("walletSecret is required to smart-activate legacy accounts".to_string()))?;
+                legacy_account.create_private_context(wallet_secret, None, None).await?;
+            }
+
+            self.active_accounts().insert(account.clone());
+
+            let scan_result = if self.is_connected() {
+                account
+                    .clone()
+                    .scan_smart(
+                        window_size,
+                        monitor_window_size,
+                        extent,
+                        start_index,
+                        relative_to_current_index,
+                        known_addresses.clone(),
+                    )
+                    .await
+            } else {
+                Ok(Vec::new())
+            };
+
+            if let Some(legacy_account) = legacy_account.as_ref() {
+                let clear_result = legacy_account.clear_private_context().await;
+                if scan_result.is_ok() {
+                    clear_result?;
+                } else if let Err(err) = clear_result {
+                    log_warn!("failed to clear legacy private context after smart activation scan error: {err}");
+                }
+            }
+            summaries.extend(scan_result?);
+
+            if let Some(metadata) = account.metadata()? {
+                self.inner.store.as_account_store()?.update_metadata(vec![metadata]).await?;
+            }
+
+            let account_descriptor = account.descriptor()?;
+            self.notify(Events::AccountUpdate { account_descriptor: account_descriptor.clone() }).await?;
+            account_descriptors.push(account_descriptor);
+        }
+
+        self.notify(Events::AccountActivation { ids: ids.clone() }).await?;
+
+        Ok((ids, account_descriptors, summaries))
+    }
+
     /// Activates accounts (performs account address space counts, initializes balance tracking, etc.)
     pub async fn activate_accounts(self: &Arc<Wallet>, account_ids: Option<&[AccountId]>, _guard: &WalletGuard<'_>) -> Result<()> {
         // This is a wrapper of activate_accounts_impl() that catches errors and notifies the UI
@@ -456,6 +561,39 @@ impl Wallet {
             Err(err)
         } else {
             Ok(())
+        }
+    }
+
+    pub async fn activate_accounts_smart(
+        self: &Arc<Wallet>,
+        account_ids: Option<&[AccountId]>,
+        wallet_secret: Option<&Secret>,
+        window_size: Option<usize>,
+        monitor_window_size: Option<usize>,
+        extent: Option<u32>,
+        start_index: Option<u32>,
+        relative_to_current_index: bool,
+        known_addresses: Option<Vec<Address>>,
+        _guard: &WalletGuard<'_>,
+    ) -> Result<(Vec<AccountDescriptor>, Vec<SmartScanSummary>)> {
+        match self
+            .activate_accounts_smart_impl(
+                account_ids,
+                wallet_secret,
+                window_size,
+                monitor_window_size,
+                extent,
+                start_index,
+                relative_to_current_index,
+                known_addresses,
+            )
+            .await
+        {
+            Ok((_ids, account_descriptors, summaries)) => Ok((account_descriptors, summaries)),
+            Err(err) => {
+                self.notify(Events::WalletError { message: err.to_string() }).await?;
+                Err(err)
+            }
         }
     }
 
@@ -557,6 +695,10 @@ impl Wallet {
         &self.inner.multiplexer
     }
 
+    fn ingress_multiplexer(&self) -> &Multiplexer<Box<Events>> {
+        &self.inner.ingress_multiplexer
+    }
+
     pub(crate) fn wallet_bus(&self) -> &Channel<WalletBusMessage> {
         &self.inner.wallet_bus
     }
@@ -605,6 +747,10 @@ impl Wallet {
     // intended for stopping async management task
     pub async fn stop(&self) -> Result<()> {
         self.utxo_processor().stop().await?;
+        let relays = self.inner.notification_relays.lock().unwrap().drain().map(|(_, relay)| relay).collect::<Vec<_>>();
+        for relay in relays {
+            let _ = relay.task_ctl.signal(()).await;
+        }
         self.stop_task().await?;
         Ok(())
     }
@@ -994,6 +1140,10 @@ impl Wallet {
     }
 
     pub(crate) async fn handle_discovery(&self, record: TransactionRecord) -> Result<()> {
+        let record = self.enrich_record_transaction(&record, true).await?;
+        if !self.should_persist_record_after_messenger_dedup(&record).await {
+            return Ok(());
+        }
         let transaction_store = self.store().as_transaction_record_store()?;
 
         if let Err(_err) = transaction_store.load_single(record.binding(), &self.network_id()?, record.id()).await {
@@ -1025,6 +1175,224 @@ impl Wallet {
         Ok(())
     }
 
+    fn needs_transaction_enrichment(record: &TransactionRecord) -> bool {
+        if record.has_embedded_transaction() {
+            return false;
+        }
+
+        matches!(
+            record.transaction_data(),
+            TransactionData::Incoming { .. }
+                | TransactionData::External { .. }
+                | TransactionData::Reorg { .. }
+                | TransactionData::Stasis { .. }
+        )
+    }
+
+    fn transaction_enrichment_header_limit(&self, target_block_daa_score: u64) -> u64 {
+        let current_daa_score = self.current_daa_score().unwrap_or(target_block_daa_score);
+        current_daa_score
+            .saturating_sub(target_block_daa_score)
+            .saturating_add(TX_ENRICH_LOOKBACK_MARGIN_DAA)
+            .clamp(TX_ENRICH_LOOKBACK_MIN_HEADERS, TX_ENRICH_LOOKBACK_MAX_HEADERS)
+    }
+
+    async fn resolve_record_transaction_from_chain(
+        &self,
+        record: &TransactionRecord,
+    ) -> Option<cryptix_consensus_core::tx::Transaction> {
+        let target_txid = *record.id();
+        let target_block_daa_score = record.block_daa_score();
+        let header_limit = self.transaction_enrichment_header_limit(target_block_daa_score);
+
+        let dag_info = self.rpc_api().get_block_dag_info().await.ok()?;
+        let headers = self.rpc_api().get_headers(dag_info.sink, header_limit, false).await.ok()?;
+        if headers.is_empty() {
+            return None;
+        }
+
+        let mut exact_matches = Vec::new();
+        let mut near_matches = Vec::new();
+        for header in headers.into_iter() {
+            if header.daa_score == target_block_daa_score {
+                exact_matches.push(header.hash);
+            } else if header.daa_score.abs_diff(target_block_daa_score) <= TX_ENRICH_DAA_WINDOW {
+                near_matches.push(header.hash);
+            }
+        }
+
+        let candidate_hashes = if exact_matches.is_empty() { near_matches } else { exact_matches };
+        if candidate_hashes.is_empty() {
+            return None;
+        }
+
+        for block_hash in candidate_hashes.into_iter().take(TX_ENRICH_MAX_CANDIDATE_BLOCKS) {
+            if let Some(transaction) = self.find_transaction_in_block_or_mergeset(block_hash, target_txid).await {
+                return Some(transaction);
+            }
+        }
+
+        None
+    }
+
+    async fn find_transaction_in_block_or_mergeset(
+        &self,
+        candidate_block_hash: cryptix_hashes::Hash,
+        target_txid: TransactionId,
+    ) -> Option<cryptix_consensus_core::tx::Transaction> {
+        let mut pending = vec![candidate_block_hash];
+        let mut visited = HashSet::new();
+        let mut scanned_blocks = 0usize;
+
+        while let Some(block_hash) = pending.pop() {
+            if scanned_blocks >= TX_ENRICH_MAX_MERGESET_BLOCKS_PER_CANDIDATE {
+                break;
+            }
+            if !visited.insert(block_hash) {
+                continue;
+            }
+
+            let block = match self.rpc_api().get_block(block_hash, true).await {
+                Ok(block) => block,
+                Err(_) => continue,
+            };
+            scanned_blocks = scanned_blocks.saturating_add(1);
+
+            for rpc_transaction in block.transactions.into_iter() {
+                let Ok(transaction) = cryptix_consensus_core::tx::Transaction::try_from(rpc_transaction) else {
+                    continue;
+                };
+
+                if transaction.id() == target_txid {
+                    return Some(transaction);
+                }
+            }
+
+            if let Some(verbose_data) = block.verbose_data {
+                for merged_hash in
+                    verbose_data.merge_set_blues_hashes.into_iter().chain(verbose_data.merge_set_reds_hashes.into_iter())
+                {
+                    if visited.contains(&merged_hash) {
+                        continue;
+                    }
+                    if pending.len().saturating_add(scanned_blocks) >= TX_ENRICH_MAX_MERGESET_BLOCKS_PER_CANDIDATE {
+                        break;
+                    }
+                    pending.push(merged_hash);
+                }
+            }
+        }
+
+        None
+    }
+
+    async fn resolve_record_transaction(
+        &self,
+        record: &TransactionRecord,
+        allow_chain_lookup: bool,
+    ) -> Option<cryptix_consensus_core::tx::Transaction> {
+        if let Some(transaction) = self.utxo_processor().confirmed_transaction(record.id()) {
+            return Some(transaction);
+        }
+
+        if let Ok(mempool_entry) = self.rpc_api().get_mempool_entry(*record.id(), true, false).await {
+            if let Ok(transaction) = cryptix_consensus_core::tx::Transaction::try_from(mempool_entry.transaction) {
+                return Some(transaction);
+            }
+        }
+
+        if allow_chain_lookup {
+            self.resolve_record_transaction_from_chain(record).await
+        } else {
+            None
+        }
+    }
+
+    async fn resolve_records_transactions_by_ids(
+        &self,
+        records: &[TransactionRecord],
+        indices: &[usize],
+    ) -> std::result::Result<HashMap<TransactionId, cryptix_consensus_core::tx::Transaction>, String> {
+        if indices.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let entries = indices
+            .iter()
+            .filter_map(|index| records.get(*index))
+            .map(|record| RpcTransactionLookupRequest {
+                transaction_id: *record.id(),
+                block_daa_score: Some(record.block_daa_score()),
+            })
+            .collect::<Vec<_>>();
+
+        let response = self.rpc_api().get_transactions_by_ids(entries).await.map_err(|err| err.to_string())?;
+        let mut resolved = HashMap::new();
+        for entry in response.entries.into_iter() {
+            let Some(rpc_transaction) = entry.transaction else {
+                continue;
+            };
+            match cryptix_consensus_core::tx::Transaction::try_from(rpc_transaction) {
+                Ok(transaction) => {
+                    resolved.insert(entry.transaction_id, transaction);
+                }
+                Err(err) => {
+                    log_warn!("unable to decode batched transaction lookup result {}: {err}", entry.transaction_id);
+                }
+            }
+        }
+        Ok(resolved)
+    }
+
+    async fn enrich_record_transaction(&self, record: &TransactionRecord, allow_chain_lookup: bool) -> Result<TransactionRecord> {
+        let mut enriched = record.clone();
+        if !Self::needs_transaction_enrichment(&enriched) {
+            enriched.refresh_payload_availability(self.current_daa_score());
+            return Ok(enriched);
+        }
+
+        if let Some(transaction) = self.resolve_record_transaction(&enriched, allow_chain_lookup).await {
+            let _ = enriched.try_attach_transaction(transaction);
+        }
+
+        enriched.refresh_payload_availability(self.current_daa_score());
+
+        Ok(enriched)
+    }
+
+    fn messenger_scope_key(record: &TransactionRecord) -> String {
+        format!("{}:{}", record.binding().to_hex(), record.network_id())
+    }
+
+    fn messenger_secondary_key(record: &TransactionRecord) -> Option<cryptix_hashes::Hash> {
+        let transaction = record.transaction()?;
+        let classified = crate::tx::classify_messenger_payload(transaction.payload.as_slice()).ok()?;
+        match classified {
+            crate::tx::MessengerPayloadClass::MessengerV1(envelope) => envelope.secondary_dedup_key().ok(),
+            _ => None,
+        }
+    }
+
+    async fn mark_messenger_detached(&self, record: &TransactionRecord) {
+        let key = Self::messenger_scope_key(record);
+        let mut indexes = self.inner.messenger_dedup_indexes.lock().await;
+        if let Some(index) = indexes.get_mut(&key) {
+            index.mark_detached(*record.id());
+        }
+    }
+
+    async fn should_persist_record_after_messenger_dedup(&self, record: &TransactionRecord) -> bool {
+        let Some(secondary_key) = Self::messenger_secondary_key(record) else {
+            return true;
+        };
+
+        let key = Self::messenger_scope_key(record);
+        let mut indexes = self.inner.messenger_dedup_indexes.lock().await;
+        let index = indexes.entry(key).or_default();
+        index.observe_chain_message(*record.id(), secondary_key);
+        index.canonical_txid(&secondary_key) == Some(*record.id())
+    }
+
     async fn handle_wallet_bus(self: &Arc<Self>, message: WalletBusMessage) -> Result<()> {
         match message {
             WalletBusMessage::Discovery { record } => {
@@ -1034,25 +1402,48 @@ impl Wallet {
         Ok(())
     }
 
-    async fn handle_event(self: &Arc<Self>, event: Box<Events>) -> Result<()> {
+    async fn handle_event(self: &Arc<Self>, event: Box<Events>) -> Result<Option<Events>> {
         match &*event {
-            Events::Pending { record } | Events::Maturity { record } | Events::Reorg { record } => {
-                if !record.is_change() {
-                    self.store().as_transaction_record_store()?.store(&[record]).await?;
+            Events::Pending { record } | Events::Maturity { record } => {
+                // Keep realtime notifications responsive: avoid heavy chain lookups on live events.
+                let enriched_record = self.enrich_record_transaction(record, false).await?;
+                if enriched_record.is_change() {
+                    return Ok(None);
                 }
+
+                if !self.should_persist_record_after_messenger_dedup(&enriched_record).await {
+                    return Ok(None);
+                }
+
+                self.store().as_transaction_record_store()?.store(&[&enriched_record]).await?;
+
+                let normalized = match &*event {
+                    Events::Pending { .. } => Events::Pending { record: enriched_record },
+                    Events::Maturity { .. } => Events::Maturity { record: enriched_record },
+                    _ => unreachable!(),
+                };
+                Ok(Some(normalized))
+            }
+            Events::Reorg { record } => {
+                let enriched_record = self.enrich_record_transaction(record, true).await?;
+                self.mark_messenger_detached(&enriched_record).await;
+                if enriched_record.is_change() {
+                    return Ok(None);
+                }
+
+                self.store().as_transaction_record_store()?.store(&[&enriched_record]).await?;
+                Ok(Some(Events::Reorg { record: enriched_record }))
             }
 
-            _ => {}
+            _ => Ok(Some((*event).clone())),
         }
-
-        Ok(())
     }
 
     async fn start_task(self: &Arc<Self>) -> Result<()> {
         let this = self.clone();
         let task_ctl_receiver = self.inner.task_ctl.request.receiver.clone();
         let task_ctl_sender = self.inner.task_ctl.response.sender.clone();
-        let events = self.multiplexer().channel();
+        let events = self.ingress_multiplexer().channel();
         let wallet_bus_receiver = self.wallet_bus().receiver.clone();
 
         // let this_clone = self.clone();
@@ -1074,7 +1465,13 @@ impl Wallet {
                     msg = events.receiver.recv().fuse() => {
                         match msg {
                             Ok(event) => {
-                                this.handle_event(event).await.unwrap_or_else(|e| log_error!("Wallet::handle_event() error: {}", e));
+                                match this.handle_event(event).await {
+                                    Ok(Some(event)) => {
+                                        this.notify(event).await.unwrap_or_else(|e| log_error!("Wallet::notify() error: {}", e));
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => log_error!("Wallet::handle_event() error: {}", e),
+                                }
                             },
                             Err(err) => {
                                 log_error!("Wallet: error while receiving multiplexer message: {err}");
@@ -1679,7 +2076,7 @@ impl Wallet {
         mnemonic_phrase: Option<&Secret>,
         guard: &WalletGuard<'_>,
     ) -> Result<AccountDescriptor> {
-        if kind != BIP32_ACCOUNT_KIND {
+        if kind != BIP32_ACCOUNT_KIND && kind != LEGACY_ACCOUNT_KIND {
             return Err(Error::custom("Account kind is not supported"));
         }
 
@@ -1701,7 +2098,11 @@ impl Wallet {
             self.store().batch().await?;
             let prv_key_data_id = self.clone().create_prv_key_data(wallet_secret, prv_key_data_args).await?;
 
-            let account_create_args = AccountCreateArgs::new_bip32(prv_key_data_id, payment_secret.cloned(), None, None);
+            let account_create_args = if kind == LEGACY_ACCOUNT_KIND {
+                AccountCreateArgs::new_legacy(prv_key_data_id, None)
+            } else {
+                AccountCreateArgs::new_bip32(prv_key_data_id, payment_secret.cloned(), None, None)
+            };
 
             let account = self.clone().create_account(wallet_secret, account_create_args, false, guard).await?;
 

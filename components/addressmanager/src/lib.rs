@@ -2,7 +2,13 @@ mod port_mapping_extender;
 mod stores;
 extern crate self as address_manager;
 
-use std::{collections::HashSet, iter, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    iter,
+    net::SocketAddr,
+    sync::Arc,
+    time::Duration,
+};
 
 use address_manager::port_mapping_extender::Extender;
 use cryptix_consensus_core::config::Config;
@@ -54,17 +60,26 @@ pub enum UpnpError {
 pub struct AddressManager {
     banned_address_store: DbBannedAddressesStore,
     address_store: address_store_with_cache::Store,
+    observed_services: HashMap<NetAddress, u64>,
     config: Arc<Config>,
     local_net_addresses: Vec<NetAddress>,
+    datacenter_mode: bool,
 }
 
 impl AddressManager {
-    pub fn new(config: Arc<Config>, db: Arc<DB>, tick_service: Arc<TickService>) -> (Arc<Mutex<Self>>, Option<Extender>) {
+    pub fn new(
+        config: Arc<Config>,
+        db: Arc<DB>,
+        tick_service: Arc<TickService>,
+        datacenter_mode: bool,
+    ) -> (Arc<Mutex<Self>>, Option<Extender>) {
         let mut instance = Self {
             banned_address_store: DbBannedAddressesStore::new(db.clone(), CachePolicy::Count(MAX_ADDRESSES)),
             address_store: address_store_with_cache::new(db),
+            observed_services: HashMap::new(),
             local_net_addresses: Vec::new(),
             config,
+            datacenter_mode,
         };
 
         let extender = instance.init_local_addresses(tick_service);
@@ -78,7 +93,7 @@ impl AddressManager {
         let extender = if self.local_net_addresses.is_empty() && !self.config.disable_upnp {
             let (net_address, ExtendHelper { gateway, local_addr, external_port }) = match self.upnp() {
                 Err(err) => {
-                    warn!("[UPnP] Error adding port mapping: {err}");
+                    info!("[UPnP] Port mapping unavailable: {err}; continuing without automatic public port mapping");
                     return None;
                 }
                 Ok(None) => return None,
@@ -200,7 +215,7 @@ impl AddressManager {
                     continue;
                 }
                 Err(GetGenericPortMappingEntryError::RequestError(err)) => {
-                    warn!("[UPnP] request existing port mapping err: {:?}", err);
+                    info!("[UPnP] Requesting existing port mappings failed: {:?}; trying to add a mapping anyway", err);
                     break false;
                 }
                 Err(GetGenericPortMappingEntryError::SpecifiedArrayIndexInvalid) => break false,
@@ -252,17 +267,37 @@ impl AddressManager {
     }
 
     pub fn add_address(&mut self, address: NetAddress) {
+        self.add_address_impl(address, false);
+    }
+
+    pub fn add_verified_address(&mut self, address: NetAddress) {
+        self.add_address_impl(address, true);
+    }
+
+    fn add_address_impl(&mut self, address: NetAddress, verified: bool) {
         if address.ip.is_loopback() || address.ip.is_unspecified() || !address.ip.is_publicly_routable() {
             debug!("[Address manager] skipping local address {}", address.ip);
             return;
         }
-
-        if self.address_store.has(address) {
+        if self.datacenter_mode && !address.ip.is_publicly_routable() {
+            debug!("[Address manager] datacenter mode: skipping private or unroutable address {}", address.ip);
             return;
         }
 
-        // We mark `connection_failed_count` as 0 only after first success
-        self.address_store.set(address, 1);
+        if self.address_store.has(address) {
+            if verified {
+                let entry = self.address_store.get(address);
+                if !entry.verified {
+                    self.address_store.set(address, entry.connection_failed_count, true);
+                }
+            }
+            return;
+        }
+
+        // We mark `connection_failed_count` as 0 only after first success.
+        // Addresses learned from gossip are unverified until a successful handshake.
+        self.address_store.set(address, 1, verified);
+        self.prune_observed_services();
     }
 
     pub fn mark_connection_failure(&mut self, address: NetAddress) {
@@ -273,8 +308,10 @@ impl AddressManager {
         let new_count = self.address_store.get(address).connection_failed_count + 1;
         if new_count > MAX_CONNECTION_FAILED_COUNT {
             self.address_store.remove(address);
+            self.observed_services.remove(&address);
         } else {
-            self.address_store.set(address, new_count);
+            let verified = self.address_store.get(address).verified;
+            self.address_store.set(address, new_count, verified);
         }
     }
 
@@ -283,20 +320,65 @@ impl AddressManager {
             return;
         }
 
-        self.address_store.set(address, 0);
+        self.address_store.set(address, 0, true);
     }
 
     pub fn iterate_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
         self.address_store.iterate_addresses()
     }
 
+    pub fn iterate_verified_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
+        self.address_store.iterate_verified_addresses()
+    }
+
     pub fn iterate_prioritized_random_addresses(&self, exceptions: HashSet<NetAddress>) -> impl ExactSizeIterator<Item = NetAddress> {
         self.address_store.iterate_prioritized_random_addresses(exceptions)
+    }
+
+    pub fn iterate_prioritized_random_addresses_with_service_preference(
+        &self,
+        exceptions: HashSet<NetAddress>,
+        preferred_service_mask: u64,
+    ) -> impl ExactSizeIterator<Item = NetAddress> {
+        let ordered = self.address_store.iterate_prioritized_random_addresses(exceptions).collect::<Vec<_>>();
+        if preferred_service_mask == 0 || ordered.is_empty() {
+            return ordered.into_iter();
+        }
+
+        let mut preferred = Vec::with_capacity(ordered.len());
+        let mut fallback = Vec::with_capacity(ordered.len());
+        for address in ordered {
+            let has_preferred =
+                self.observed_services.get(&address).map(|services| (services & preferred_service_mask) != 0).unwrap_or(false);
+            if has_preferred {
+                preferred.push(address);
+            } else {
+                fallback.push(address);
+            }
+        }
+        preferred.extend(fallback);
+        preferred.into_iter()
+    }
+
+    pub fn set_observed_services(&mut self, address: NetAddress, services: u64) {
+        if self.address_store.has(address) {
+            self.observed_services.insert(address, services);
+            self.prune_observed_services();
+        }
+    }
+
+    pub fn observed_services(&self, address: NetAddress) -> Option<u64> {
+        self.observed_services.get(&address).copied()
     }
 
     pub fn ban(&mut self, ip: IpAddress) {
         self.banned_address_store.set(ip.into(), ConnectionBanTimestamp(unix_now())).unwrap();
         self.address_store.remove_by_ip(ip.into());
+        self.observed_services.retain(|address, _| address.ip != ip);
+    }
+
+    fn prune_observed_services(&mut self) {
+        self.observed_services.retain(|address, _| self.address_store.has(*address));
     }
 
     pub fn unban(&mut self, ip: IpAddress) {
@@ -304,7 +386,7 @@ impl AddressManager {
     }
 
     pub fn is_banned(&mut self, ip: IpAddress) -> bool {
-        const MAX_BANNED_TIME: u64 = 24 * 60 * 60 * 1000;
+        const MAX_BANNED_TIME: u64 = 3 * 60 * 60 * 1000;
         match self.banned_address_store.get(ip.into()).unwrap_option() {
             Some(timestamp) => {
                 if unix_now() - timestamp.0 > MAX_BANNED_TIME {
@@ -336,6 +418,7 @@ mod address_store_with_cache {
         sync::Arc,
     };
 
+    use cryptix_core::warn;
     use cryptix_database::prelude::{CachePolicy, DB};
     use cryptix_utils::networking::PrefixBucket;
     use itertools::Itertools;
@@ -362,8 +445,27 @@ mod address_store_with_cache {
             // We manage the cache ourselves on this level, so we disable the inner builtin cache
             let db_store = DbAddressesStore::new(db, CachePolicy::Empty);
             let mut addresses = HashMap::new();
-            for (key, entry) in db_store.iterator().map(|res| res.unwrap()) {
-                addresses.insert(key, entry);
+            let mut load_error: Option<String> = None;
+            for iter_result in db_store.iterator() {
+                match iter_result {
+                    Ok((key, entry)) => {
+                        addresses.insert(key, entry);
+                    }
+                    Err(err) => {
+                        load_error = Some(err.to_string());
+                        break;
+                    }
+                }
+            }
+
+            if let Some(err) = load_error {
+                warn!(
+                    "[Address manager] failed to read persisted address list ({err}); clearing address store to recover from legacy or corrupted data"
+                );
+                if let Err(clear_err) = db_store.delete_all() {
+                    warn!("[Address manager] failed to clear address store after load failure: {clear_err}");
+                }
+                addresses.clear();
             }
 
             Self { db_store, addresses }
@@ -373,10 +475,10 @@ mod address_store_with_cache {
             self.addresses.contains_key(&address.into())
         }
 
-        pub fn set(&mut self, address: NetAddress, connection_failed_count: u64) {
+        pub fn set(&mut self, address: NetAddress, connection_failed_count: u64, verified: bool) {
             let entry = match self.addresses.get(&address.into()) {
-                Some(entry) => Entry { connection_failed_count, address: entry.address },
-                None => Entry { connection_failed_count, address },
+                Some(entry) => Entry { connection_failed_count, address: entry.address, verified: entry.verified || verified },
+                None => Entry { connection_failed_count, address, verified },
             };
             self.db_store.set(address.into(), entry).unwrap();
             self.addresses.insert(address.into(), entry);
@@ -406,6 +508,10 @@ mod address_store_with_cache {
 
         pub fn iterate_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
             self.addresses.values().map(|entry| entry.address)
+        }
+
+        pub fn iterate_verified_addresses(&self) -> impl Iterator<Item = NetAddress> + '_ {
+            self.addresses.values().filter(|entry| entry.verified).map(|entry| entry.address)
         }
 
         /// This iterator functions as the node's ip routing selection algo.
@@ -549,7 +655,7 @@ mod address_store_with_cache {
 
             let db = create_temp_db!(ConnBuilder::default().with_files_limit(10));
             let config = Config::new(SIMNET_PARAMS);
-            let (am, _) = AddressManager::new(Arc::new(config), db.1, Arc::new(TickService::default()));
+            let (am, _) = AddressManager::new(Arc::new(config), db.1, Arc::new(TickService::default()), false);
 
             let mut am_guard = am.lock();
 

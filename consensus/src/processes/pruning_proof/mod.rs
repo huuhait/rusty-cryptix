@@ -7,10 +7,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    time::{Duration, Instant},
 };
 
-use itertools::Itertools;
 use cryptix_math::int::SignedInteger;
+use itertools::Itertools;
 use parking_lot::{Mutex, RwLock};
 use rocksdb::WriteBatch;
 
@@ -21,12 +22,12 @@ use cryptix_consensus_core::{
         pruning::{PruningImportError, PruningImportResult},
     },
     header::Header,
-    pruning::{PruningPointProof, PruningPointTrustedData},
+    pruning::{PruningPointAtomicState, PruningPointProof, PruningPointTrustedData},
     trusted::{TrustedBlock, TrustedGhostdagData, TrustedHeader},
     BlockHashMap, BlockHashSet, BlockLevel, HashMapCustomHasher, KType,
 };
-use cryptix_core::{debug, info, trace};
-use cryptix_database::prelude::{CachePolicy, ConnBuilder, StoreResultEmptyTuple, StoreResultExtensions};
+use cryptix_core::{debug, info, warn};
+use cryptix_database::prelude::{CachePolicy, ConnBuilder, StoreError, StoreResultEmptyTuple, StoreResultExtensions};
 use cryptix_hashes::Hash;
 use cryptix_pow::calc_block_level;
 use cryptix_utils::{binary_heap::BinaryHeapExtensions, vec::VecExtensions};
@@ -40,6 +41,7 @@ use crate::{
     model::{
         services::reachability::{MTReachabilityService, ReachabilityService},
         stores::{
+            atomic_state::{AtomicConsensusState, DbAtomicStateStore},
             depth::DbDepthStore,
             ghostdag::{DbGhostdagStore, GhostdagData, GhostdagStore, GhostdagStoreReader},
             headers::{DbHeadersStore, HeaderStore, HeaderStoreReader},
@@ -48,7 +50,7 @@ use crate::{
             pruning::{DbPruningStore, PruningStoreReader},
             reachability::{DbReachabilityStore, ReachabilityStoreReader, StagingReachabilityStore},
             relations::{DbRelationsStore, RelationsStoreReader, StagingRelationsStore},
-            selected_chain::{DbSelectedChainStore, SelectedChainStore},
+            selected_chain::{DbSelectedChainStore, SelectedChainStore, SelectedChainStoreReader},
             tips::DbTipsStore,
             virtual_state::{VirtualState, VirtualStateStore, VirtualStateStoreReader, VirtualStores},
             DB,
@@ -64,6 +66,10 @@ use super::{
     ghostdag::{mergeset::unordered_mergeset_without_selected_parent, protocol::GhostdagManager},
     window::WindowManager,
 };
+
+const PRUNING_PROOF_PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+const PRUNING_PROOF_PROGRESS_MIN_HEADERS: usize = 10_000;
+const PRUNING_PROOF_EXIT_CHECK_INTERVAL: usize = 1024;
 
 #[derive(Error, Debug)]
 enum PruningProofManagerInternalError {
@@ -104,6 +110,7 @@ pub struct PruningProofManager {
     headers_selected_tip_store: Arc<RwLock<DbHeadersSelectedTipStore>>,
     depth_store: Arc<DbDepthStore>,
     selected_chain_store: Arc<RwLock<DbSelectedChainStore>>,
+    atomic_state_store: Arc<DbAtomicStateStore>,
 
     ghostdag_managers: Arc<Vec<DbGhostdagManager>>,
     traversal_manager: DbDagTraversalManager,
@@ -153,6 +160,7 @@ impl PruningProofManager {
             body_tips_store: storage.body_tips_store.clone(),
             headers_selected_tip_store: storage.headers_selected_tip_store.clone(),
             selected_chain_store: storage.selected_chain_store.clone(),
+            atomic_state_store: storage.atomic_state_store.clone(),
             depth_store: storage.depth_store.clone(),
 
             ghostdag_managers,
@@ -228,9 +236,12 @@ impl PruningProofManager {
         }
 
         for (level, headers) in proof.iter().enumerate() {
-            trace!("Applying level {} from the pruning point proof", level);
+            let level_total = headers.len();
+            let level_started = Instant::now();
+            let mut last_progress_log = level_started;
+            info!("Applying level {level} from the pruning point proof ({level_total} headers)");
             self.ghostdag_stores[level].insert(ORIGIN, self.ghostdag_managers[level].origin_ghostdag_data()).unwrap();
-            for header in headers.iter() {
+            for (i, header) in headers.iter().enumerate() {
                 let parents = Arc::new(
                     self.parents_manager
                         .parents_at_level(header, level as BlockLevel)
@@ -263,7 +274,26 @@ impl PruningProofManager {
                     self.ghostdag_managers[level].ghostdag(&parents)
                 };
                 self.ghostdag_stores[level].insert(header.hash, Arc::new(gd)).unwrap();
+
+                let processed = i + 1;
+                if should_log_pruning_proof_progress(level_total, processed, last_progress_log) {
+                    log_pruning_proof_progress(
+                        "Pruning point proof apply",
+                        Some(level as BlockLevel),
+                        processed,
+                        level_total,
+                        level_started,
+                    );
+                    last_progress_log = Instant::now();
+                }
             }
+            log_pruning_proof_progress(
+                "Pruning point proof apply completed",
+                Some(level as BlockLevel),
+                level_total,
+                level_total,
+                level_started,
+            );
         }
 
         let virtual_parents = vec![pruning_point];
@@ -284,6 +314,7 @@ impl PruningProofManager {
         self.depth_store.insert_batch(&mut batch, pruning_point, ORIGIN, ORIGIN).unwrap();
         self.db.write(batch).unwrap();
 
+        info!("Applied pruning point proof; staging pruning point is {pruning_point}");
         Ok(())
     }
 
@@ -295,9 +326,16 @@ impl PruningProofManager {
 
     pub fn populate_reachability_and_headers(&self, proof: &PruningPointProof) {
         let capacity_estimate = self.estimate_proof_unique_size(proof);
+        let total_headers = proof.iter().map(|level| level.len()).sum::<usize>();
+        let started = Instant::now();
+        let mut last_progress_log = started;
+        info!(
+            "Populating pruning point proof reachability/header stores ({} proof headers, capacity_estimate={})",
+            total_headers, capacity_estimate
+        );
         let mut dag = BlockHashMap::with_capacity(capacity_estimate);
         let mut up_heap = BinaryHeap::with_capacity(capacity_estimate);
-        for header in proof.iter().flatten().cloned() {
+        for (processed_idx, header) in proof.iter().flatten().cloned().enumerate() {
             if let Vacant(e) = dag.entry(header.hash) {
                 let state = cryptix_pow::State::new(&header);
                 let (_, pow) = state.check_pow(header.nonce); // TODO: Check if pow passes
@@ -324,11 +362,33 @@ impl PruningProofManager {
                 up_heap.push(Reverse(SortableBlock { hash: header.hash, blue_work: header.blue_work }));
                 e.insert(DagEntry { header, parents: Arc::new(parents) });
             }
+            let processed = processed_idx + 1;
+            if should_log_pruning_proof_progress(total_headers, processed, last_progress_log) {
+                log_pruning_proof_progress(
+                    "Pruning point proof reachability/header population",
+                    None,
+                    processed,
+                    total_headers,
+                    started,
+                );
+                last_progress_log = Instant::now();
+            }
         }
+        log_pruning_proof_progress(
+            "Pruning point proof reachability/header population completed",
+            None,
+            total_headers,
+            total_headers,
+            started,
+        );
 
         debug!("Estimated proof size: {}, actual size: {}", capacity_estimate, dag.len());
 
-        for reverse_sortable_block in up_heap.into_sorted_iter() {
+        let reachability_total = dag.len();
+        let reachability_started = Instant::now();
+        let mut last_reachability_progress_log = reachability_started;
+        info!("Applying pruning point proof reachability DAG ({} unique headers)", reachability_total);
+        for (processed_idx, reverse_sortable_block) in up_heap.into_sorted_iter().enumerate() {
             // TODO: Convert to into_iter_sorted once it gets stable
             let hash = reverse_sortable_block.0.hash;
             let dag_entry = dag.get(&hash).unwrap();
@@ -384,7 +444,26 @@ impl PruningProofManager {
             // Drop
             drop(reachability_write);
             drop(reachability_relations_write);
+
+            let processed = processed_idx + 1;
+            if should_log_pruning_proof_progress(reachability_total, processed, last_reachability_progress_log) {
+                log_pruning_proof_progress(
+                    "Pruning point proof reachability DAG apply",
+                    None,
+                    processed,
+                    reachability_total,
+                    reachability_started,
+                );
+                last_reachability_progress_log = Instant::now();
+            }
         }
+        log_pruning_proof_progress(
+            "Pruning point proof reachability DAG apply completed",
+            None,
+            reachability_total,
+            reachability_total,
+            reachability_started,
+        );
     }
 
     pub fn validate_pruning_point_proof(&self, proof: &PruningPointProof) -> PruningImportResult<()> {
@@ -451,10 +530,18 @@ impl PruningProofManager {
                 return Err(PruningImportError::PruningValidationInterrupted);
             }
 
-            info!("Validating level {level} from the pruning point proof ({} headers)", proof[level as usize].len());
             let level_idx = level as usize;
+            let level_headers = &proof[level_idx];
+            let level_total = level_headers.len();
+            info!("Validating level {level} from the pruning point proof ({level_total} headers)");
+            let level_started = Instant::now();
+            let mut last_progress_log = level_started;
             let mut selected_tip = None;
-            for (i, header) in proof[level as usize].iter().enumerate() {
+            for (i, header) in level_headers.iter().enumerate() {
+                if i % PRUNING_PROOF_EXIT_CHECK_INTERVAL == 0 && self.is_consensus_exiting.load(Ordering::Relaxed) {
+                    return Err(PruningImportError::PruningValidationInterrupted);
+                }
+
                 let header_level = calc_block_level(header, self.max_block_level);
                 if header_level < level {
                     return Err(PruningImportError::PruningProofWrongBlockLevel(header.hash, header_level, level));
@@ -509,7 +596,20 @@ impl PruningProofManager {
                     reachability::hint_virtual_selected_parent(reachability_stores[level_idx].write().deref_mut(), header.hash)
                         .unwrap();
                 }
+
+                let processed = i + 1;
+                if should_log_pruning_proof_progress(level_total, processed, last_progress_log) {
+                    log_pruning_proof_progress("Pruning point proof validation", Some(level), processed, level_total, level_started);
+                    last_progress_log = Instant::now();
+                }
             }
+            log_pruning_proof_progress(
+                "Pruning point proof validation completed",
+                Some(level),
+                level_total,
+                level_total,
+                level_started,
+            );
 
             if level < self.max_block_level {
                 let block_at_depth_m_at_next_level = self
@@ -624,6 +724,11 @@ impl PruningProofManager {
             return vec![];
         }
 
+        let build_started = Instant::now();
+        let mut last_progress_log = build_started;
+        let mut built_headers = 0usize;
+        info!("Building pruning point proof for {pp} (max_level={}, pruning_proof_m={})", self.max_block_level, self.pruning_proof_m);
+
         let pp_header = self.headers_store.get_header_with_block_level(pp).unwrap();
         let selected_tip_by_level = (0..=self.max_block_level)
             .map(|level| {
@@ -672,50 +777,111 @@ impl PruningProofManager {
                     block_at_depth_2m
                 };
 
+                let level_started = Instant::now();
+                let mut last_level_progress_log = level_started;
+                let selected_tip_blue_work = self.ghostdag_stores[level].get_blue_work(selected_tip).unwrap();
+                let relations_store = self.relations_stores.read()[level].clone();
+                let mut scanned_children = 0usize;
+                let mut skipped_non_ancestor_children = 0usize;
+                let mut skipped_above_tip_children = 0usize;
+                let mut max_queue_len = 1usize;
                 let mut headers = Vec::with_capacity(2 * self.pruning_proof_m as usize);
                 let mut queue = BinaryHeap::<Reverse<SortableBlock>>::new();
                 let mut visited = BlockHashSet::new();
+                visited.insert(root);
                 queue.push(Reverse(SortableBlock::new(root, self.ghostdag_stores[level].get_blue_work(root).unwrap())));
                 while let Some(current) = queue.pop() {
                     let current = current.0.hash;
-                    if !visited.insert(current) {
-                        continue;
-                    }
-
-                    if !self.reachability_service.is_dag_ancestor_of(current, selected_tip) {
-                        continue;
-                    }
 
                     headers.push(self.headers_store.get_header(current).unwrap());
-                    for child in self.relations_stores.read()[level].get_children(current).unwrap().read().iter().copied() {
-                        queue.push(Reverse(SortableBlock::new(child, self.ghostdag_stores[level].get_blue_work(child).unwrap())));
+                    for child in relations_store.get_children(current).unwrap().read().iter().copied() {
+                        scanned_children += 1;
+                        if !visited.insert(child) {
+                            continue;
+                        }
+
+                        let child_blue_work = self.ghostdag_stores[level].get_blue_work(child).unwrap();
+                        if child_blue_work > selected_tip_blue_work {
+                            skipped_above_tip_children += 1;
+                            continue;
+                        }
+
+                        if self.reachability_service.is_dag_ancestor_of(child, selected_tip) {
+                            queue.push(Reverse(SortableBlock::new(child, child_blue_work)));
+                            max_queue_len = max_queue_len.max(queue.len());
+                        } else {
+                            skipped_non_ancestor_children += 1;
+                        }
+                    }
+
+                    if last_level_progress_log.elapsed() >= PRUNING_PROOF_PROGRESS_LOG_INTERVAL {
+                        info!(
+                            "Pruning point proof build level {}/{} in progress: headers={} visited={} queue={} scanned_children={} skipped_non_ancestor={} skipped_above_tip={} elapsed={}",
+                            level,
+                            self.max_block_level,
+                            headers.len(),
+                            visited.len(),
+                            queue.len(),
+                            scanned_children,
+                            skipped_non_ancestor_children,
+                            skipped_above_tip_children,
+                            format_pruning_proof_duration(level_started.elapsed())
+                        );
+                        last_level_progress_log = Instant::now();
                     }
                 }
 
-                // Temp assertion for verifying a bug fix: assert that the full 2M chain is actually contained in the composed level proof
-                let set = BlockHashSet::from_iter(headers.iter().map(|h| h.hash));
-                let chain_2m = self
-                    .chain_up_to_depth(&*self.ghostdag_stores[level], selected_tip, 2 * self.pruning_proof_m)
-                    .map_err(|err| {
-                        dbg!(level, selected_tip, block_at_depth_2m, root);
-                        format!("Assert 2M chain -- level: {}, err: {}", level, err)
-                    })
-                    .unwrap();
-                let chain_2m_len = chain_2m.len();
-                for (i, chain_hash) in chain_2m.into_iter().enumerate() {
-                    if !set.contains(&chain_hash) {
-                        let next_level_tip = selected_tip_by_level[level + 1];
-                        let next_level_chain_m =
-                            self.chain_up_to_depth(&*self.ghostdag_stores[level + 1], next_level_tip, self.pruning_proof_m).unwrap();
-                        let next_level_block_m = next_level_chain_m.last().copied().unwrap();
-                        dbg!(next_level_chain_m.len());
-                        dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_tip).unwrap().blue_score);
-                        dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_block_m).unwrap().blue_score);
-                        dbg!(self.ghostdag_stores[level].get_compact_data(selected_tip).unwrap().blue_score);
-                        dbg!(self.ghostdag_stores[level].get_compact_data(block_at_depth_2m).unwrap().blue_score);
-                        dbg!(level, selected_tip, block_at_depth_2m, root);
-                        panic!("Assert 2M chain -- missing block {} at index {} out of {} chain blocks", chain_hash, i, chain_2m_len);
+                #[cfg(debug_assertions)]
+                {
+                    // Expensive invariant check for local debugging. Keeping this out of release builds is important
+                    // because pruning proof generation is on the IBD serving path.
+                    let set = BlockHashSet::from_iter(headers.iter().map(|h| h.hash));
+                    let chain_2m = self
+                        .chain_up_to_depth(&*self.ghostdag_stores[level], selected_tip, 2 * self.pruning_proof_m)
+                        .map_err(|err| {
+                            dbg!(level, selected_tip, block_at_depth_2m, root);
+                            format!("Assert 2M chain -- level: {}, err: {}", level, err)
+                        })
+                        .unwrap();
+                    let chain_2m_len = chain_2m.len();
+                    for (i, chain_hash) in chain_2m.into_iter().enumerate() {
+                        if !set.contains(&chain_hash) {
+                            let next_level_tip = selected_tip_by_level[level + 1];
+                            let next_level_chain_m = self
+                                .chain_up_to_depth(&*self.ghostdag_stores[level + 1], next_level_tip, self.pruning_proof_m)
+                                .unwrap();
+                            let next_level_block_m = next_level_chain_m.last().copied().unwrap();
+                            dbg!(next_level_chain_m.len());
+                            dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_tip).unwrap().blue_score);
+                            dbg!(self.ghostdag_stores[level + 1].get_compact_data(next_level_block_m).unwrap().blue_score);
+                            dbg!(self.ghostdag_stores[level].get_compact_data(selected_tip).unwrap().blue_score);
+                            dbg!(self.ghostdag_stores[level].get_compact_data(block_at_depth_2m).unwrap().blue_score);
+                            dbg!(level, selected_tip, block_at_depth_2m, root);
+                            panic!(
+                                "Assert 2M chain -- missing block {} at index {} out of {} chain blocks",
+                                chain_hash, i, chain_2m_len
+                            );
+                        }
                     }
+                }
+
+                built_headers += headers.len();
+                if last_progress_log.elapsed() >= PRUNING_PROOF_PROGRESS_LOG_INTERVAL || level == self.max_block_level as usize {
+                    info!(
+                        "Pruning point proof build: level={}/{} level_headers={} total_headers={} visited={} scanned_children={} skipped_non_ancestor={} skipped_above_tip={} max_queue={} level_elapsed={} total_elapsed={}",
+                        level,
+                        self.max_block_level,
+                        headers.len(),
+                        built_headers,
+                        visited.len(),
+                        scanned_children,
+                        skipped_non_ancestor_children,
+                        skipped_above_tip_children,
+                        max_queue_len,
+                        format_pruning_proof_duration(level_started.elapsed()),
+                        format_pruning_proof_duration(build_started.elapsed())
+                    );
+                    last_progress_log = Instant::now();
                 }
 
                 headers
@@ -905,11 +1071,89 @@ impl PruningProofManager {
             }
         }
 
+        let atomic_state = match self.atomic_state_store.get_root_record(pruning_point) {
+            Ok(root) => {
+                let state_bytes = match self.materialize_selected_chain_atomic_state(pruning_point, root.state_hash) {
+                    Ok(Some(state)) => Some(state.canonical_bytes()),
+                    Ok(None) => None,
+                    Err(err) => {
+                        warn!(
+                            "failed materializing full pruning-point atomic state for `{pruning_point}` while building trusted data: {err}"
+                        );
+                        None
+                    }
+                };
+                Some(PruningPointAtomicState { state_hash: root.state_hash, state_bytes })
+            }
+            Err(StoreError::KeyNotFound(_)) => None,
+            Err(err) => {
+                warn!("failed reading pruning-point atomic root for `{pruning_point}` while building trusted data: {err}");
+                None
+            }
+        };
+
         PruningPointTrustedData {
             anticone,
             daa_window_blocks: daa_window_blocks.into_values().collect_vec(),
             ghostdag_blocks: ghostdag_blocks.into_iter().map(|(hash, ghostdag)| TrustedGhostdagData { hash, ghostdag }).collect_vec(),
+            atomic_state,
         }
+    }
+
+    fn materialize_selected_chain_atomic_state(
+        &self,
+        target_hash: Hash,
+        expected_state_hash: [u8; 32],
+    ) -> Result<Option<AtomicConsensusState>, String> {
+        let empty_state = AtomicConsensusState::default();
+        if expected_state_hash == empty_state.canonical_hash() {
+            return Ok(Some(empty_state));
+        }
+
+        let virtual_read = self.virtual_stores.read();
+        let virtual_state = virtual_read.state.get().map_err(|err| format!("virtual state unavailable: {err}"))?;
+        let mut state = self
+            .atomic_state_store
+            .materialize_current_state(&virtual_state.atomic_state)
+            .map_err(|err| format!("current Atomic state unavailable: {err}"))?;
+        state
+            .apply_delta_rollback(&virtual_state.atomic_diff)
+            .map_err(|err| format!("failed rolling back virtual Atomic diff: {err}"))?;
+
+        let selected_chain_read = self.selected_chain_store.read();
+        let (tip_index, _) = selected_chain_read.get_tip().map_err(|err| format!("selected-chain tip unavailable: {err}"))?;
+        let target_index = match selected_chain_read.get_by_hash(target_hash) {
+            Ok(index) => index,
+            Err(StoreError::KeyNotFound(_)) => return Ok(None),
+            Err(err) => return Err(format!("selected-chain hash `{target_hash}` unavailable: {err}")),
+        };
+        if target_index > tip_index {
+            return Ok(None);
+        }
+
+        for index in ((target_index + 1)..=tip_index).rev() {
+            let block_hash =
+                selected_chain_read.get_by_index(index).map_err(|err| format!("selected-chain index `{index}` unavailable: {err}"))?;
+            let delta = self
+                .atomic_state_store
+                .get_delta(block_hash)
+                .map_err(|err| format!("Atomic delta for selected-chain block `{block_hash}` unavailable: {err}"))?;
+            state
+                .apply_delta_rollback(delta.as_ref())
+                .map_err(|err| format!("failed rolling back Atomic delta for selected-chain block `{block_hash}`: {err}"))?;
+        }
+        drop(selected_chain_read);
+
+        let actual_state_hash = state.canonical_hash();
+        if actual_state_hash != expected_state_hash {
+            return Err(format!(
+                "materialized pruning-point Atomic root mismatch for `{target_hash}`: expected {}, got {}",
+                faster_hex::hex_string(&expected_state_hash),
+                faster_hex::hex_string(&actual_state_hash)
+            ));
+        }
+
+        Ok(Some(state))
     }
 
     pub fn get_pruning_point_proof(&self) -> Arc<PruningPointProof> {
@@ -917,10 +1161,25 @@ impl PruningProofManager {
         let mut cache_lock = self.cached_proof.lock();
         if let Some(cache) = cache_lock.clone() {
             if cache.pruning_point == pp {
+                info!(
+                    "Returning cached pruning point proof for {} with {} levels and {} headers",
+                    pp,
+                    cache.data.len(),
+                    cache.data.iter().map(|level| level.len()).sum::<usize>()
+                );
                 return cache.data;
             }
         }
+        let started = Instant::now();
+        info!("Pruning point proof cache miss for {}; building proof", pp);
         let proof = Arc::new(self.build_pruning_point_proof(pp));
+        info!(
+            "Built pruning point proof for {} with {} levels and {} headers in {}",
+            pp,
+            proof.len(),
+            proof.iter().map(|level| level.len()).sum::<usize>(),
+            format_pruning_proof_duration(started.elapsed())
+        );
         cache_lock.replace(CachedPruningPointData { pruning_point: pp, data: proof.clone() });
         proof
     }
@@ -945,5 +1204,50 @@ impl PruningProofManager {
         } else {
             Err(ConsensusError::PruningPointInsufficientDepth)
         }
+    }
+}
+
+fn should_log_pruning_proof_progress(total: usize, processed: usize, last_progress_log: Instant) -> bool {
+    total >= PRUNING_PROOF_PROGRESS_MIN_HEADERS
+        && processed < total
+        && last_progress_log.elapsed() >= PRUNING_PROOF_PROGRESS_LOG_INTERVAL
+}
+
+fn log_pruning_proof_progress(stage: &str, level: Option<BlockLevel>, processed: usize, total: usize, started: Instant) {
+    let elapsed = started.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+    let rate = processed as f64 / elapsed_secs;
+    let percent = if total > 0 { (processed as f64 / total as f64) * 100.0 } else { 100.0 };
+    let remaining = total.saturating_sub(processed);
+    let eta = format_pruning_proof_eta(remaining, rate);
+    let level_suffix = level.map(|level| format!(" level {level}")).unwrap_or_default();
+    info!(
+        "{stage}{level_suffix}: processed={processed}/{total} ({percent:.2}%) rate={rate:.1} headers/s elapsed={} eta={eta}",
+        format_pruning_proof_duration(elapsed)
+    );
+}
+
+fn format_pruning_proof_eta(remaining: usize, rate: f64) -> String {
+    if remaining == 0 {
+        return "0s".to_string();
+    }
+    if !rate.is_finite() || rate <= 0.0 {
+        return "unknown".to_string();
+    }
+    format_pruning_proof_duration(Duration::from_secs_f64(remaining as f64 / rate))
+}
+
+fn format_pruning_proof_duration(duration: Duration) -> String {
+    let total_seconds = duration.as_secs();
+    if total_seconds < 60 {
+        return format!("{total_seconds}s");
+    }
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
+    let seconds = total_seconds % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else {
+        format!("{minutes}m {seconds}s")
     }
 }

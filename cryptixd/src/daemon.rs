@@ -1,16 +1,28 @@
-use std::{fs, path::PathBuf, process::exit, sync::Arc, time::Duration};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    process::exit,
+    sync::Arc,
+    time::Duration,
+};
 
+use crate::atomic_bootstrap::{
+    AtomicBootstrapService, ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES,
+    ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES, ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES,
+};
 use async_channel::unbounded;
+use cryptix_atomicindex::service::AtomicTokenService;
 use cryptix_consensus_core::{
     config::ConfigBuilder,
     errors::config::{ConfigError, ConfigResult},
 };
 use cryptix_consensus_notify::{root::ConsensusNotificationRoot, service::NotifyService};
-use cryptix_core::{core::Core, debug, info};
+use cryptix_core::{core::Core, debug, info, warn};
 use cryptix_core::{cryptixd_env::version, task::tick::TickService};
 use cryptix_database::prelude::CachePolicy;
 use cryptix_grpc_server::service::GrpcService;
 use cryptix_notify::{address::tracker::Tracker, subscription::context::SubscriptionContext};
+use cryptix_rpc_service::hfa::HfaRuntimeConfig;
 use cryptix_rpc_service::service::RpcCoreService;
 use cryptix_txscript::caches::TxScriptCacheCounters;
 use cryptix_utils::git;
@@ -31,7 +43,7 @@ use cryptix_mining::{
     monitor::MiningMonitor,
     MiningCounters,
 };
-use cryptix_p2p_flows::{flow_context::FlowContext, service::P2pService};
+use cryptix_p2p_flows::{flow_context::FlowContext, node_identity::load_or_create_identity, service::P2pService};
 
 use cryptix_perf_monitor::{builder::Builder as PerfMonitorBuilder, counters::CountersSnapshot};
 use cryptix_utxoindex::{api::UtxoIndexProxy, UtxoIndex};
@@ -51,6 +63,7 @@ use crate::args::Args;
 const DEFAULT_DATA_DIR: &str = "datadir";
 const CONSENSUS_DB: &str = "consensus";
 const UTXOINDEX_DB: &str = "utxoindex";
+const ATOMIC_DB: &str = "atomic";
 const META_DB: &str = "meta";
 const META_DB_FILE_LIMIT: i32 = 5;
 const DEFAULT_LOG_DIR: &str = "logs";
@@ -96,6 +109,24 @@ pub fn validate_args(args: &Args) -> ConfigResult<()> {
     }
     if args.max_tracked_addresses > Tracker::MAX_ADDRESS_UPPER_BOUND {
         return Err(ConfigError::MaxTrackedAddressesTooHigh(Tracker::MAX_ADDRESS_UPPER_BOUND));
+    }
+    if !(args.hfa_cpu > 0.0 && args.hfa_cpu <= 1.0) {
+        return Err(ConfigError::HfaCpuOutOfRange(args.hfa_cpu));
+    }
+    if !(100..=600_000).contains(&args.hfa_drift_ms) {
+        return Err(ConfigError::HfaDriftOutOfRange(args.hfa_drift_ms));
+    }
+    if args.hfa_microblock_interval_ms_normal == 0 {
+        return Err(ConfigError::HfaMicroblockIntervalMsNormalOutOfRange(args.hfa_microblock_interval_ms_normal));
+    }
+    if args.tx_relay_broadcast_interval_ms == 0 {
+        return Err(ConfigError::TxRelayBroadcastIntervalMsOutOfRange(args.tx_relay_broadcast_interval_ms));
+    }
+    if matches!(args.atomic_bootstrap_peer_quorum_min_sources, Some(0)) {
+        return Err(ConfigError::AtomicBootstrapPeerQuorumMinSourcesOutOfRange);
+    }
+    if args.atomic_health_audit_interval_minutes == 0 {
+        return Err(ConfigError::AtomicHealthAuditIntervalMinutesOutOfRange);
     }
     Ok(())
 }
@@ -156,6 +187,30 @@ pub fn get_log_dir(args: &Args) -> Option<String> {
     let log_dir = if log_dir.is_empty() { app_dir.join(network.to_prefixed()).join(DEFAULT_LOG_DIR) } else { PathBuf::from(log_dir) };
     let log_dir = if args.no_log_files { None } else { log_dir.to_str().map(String::from) };
     log_dir
+}
+
+fn database_reset_paths(db_dir: &Path) -> Vec<PathBuf> {
+    vec![db_dir.to_path_buf()]
+}
+
+fn database_reset_paths_exist(db_dir: &Path) -> bool {
+    database_reset_paths(db_dir).iter().any(|path| path.exists())
+}
+
+fn remove_database_reset_state(db_dir: &Path) -> io::Result<()> {
+    for path in database_reset_paths(db_dir) {
+        remove_path_if_exists(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path),
+        Ok(_) => fs::remove_file(path),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 impl Runtime {
@@ -229,6 +284,10 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
             .build(),
     );
 
+    if args.testnet_suffix.is_some() {
+        warn!("Ignoring deprecated testnet suffix setting; using canonical testnet network id");
+    }
+
     // TODO: Validate `config` forms a valid set of properties
 
     let app_dir = get_app_dir_from_args(args);
@@ -236,6 +295,83 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
 
     // Print package name and version
     info!("{} v{}", env!("CARGO_PKG_NAME"), git::with_short_hash(version()));
+    if args.hfa {
+        info!(
+            "Fastchain HWA: ENABLED; cpu low-water ratio: {:.2}, drift window: {} ms, normal microblock interval: {} ms",
+            args.hfa_cpu, args.hfa_drift_ms, args.hfa_microblock_interval_ms_normal
+        );
+    }
+    if args.datacenter {
+        info!("Datacenter mode: ENABLED; private/unroutable peer addresses are filtered by address manager");
+    }
+    info!("Tx relay broadcast interval: {} ms", args.tx_relay_broadcast_interval_ms);
+    info!("Payload HF activation DAA score: {}", config.params.payload_hf_activation_daa_score);
+    info!("Cryptix Atomic Token: ENABLED (storage v2)");
+    info!("Cryptix Atomic bootstrap worker: ENABLED; configured peer overrides: {}", args.atomic_bootstrap_peers.len());
+    if args.disable_atomic_health_audit {
+        info!("Cryptix Atomic periodic P2P health audit: DISABLED");
+    } else {
+        info!(
+            "Cryptix Atomic periodic P2P health audit: ENABLED; interval={} minute(s), DAA rendezvous lag=60 block(s)",
+            args.atomic_health_audit_interval_minutes
+        );
+    }
+    let atomic_bootstrap_seed_confirmed_non_seed_min_sources =
+        args.atomic_bootstrap_peer_quorum_min_sources.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES);
+    let atomic_bootstrap_peer_only_non_seed_min_sources =
+        args.atomic_bootstrap_peer_quorum_min_sources.unwrap_or(ATOMIC_BOOTSTRAP_DEFAULT_PEER_MAJORITY_MIN_SOURCES);
+    info!(
+        "Cryptix Atomic bootstrap quorum: default requires >= {} seed source(s) + >= {} independent peer/non-seed source(s)",
+        ATOMIC_BOOTSTRAP_REQUIRED_SEED_SOURCES, ATOMIC_BOOTSTRAP_DEFAULT_SEED_CONFIRMED_NON_SEED_SOURCES
+    );
+    info!(
+        "Cryptix Atomic seed-confirmed bootstrap quorum: minimum independent peer/non-seed sources = {}{}",
+        atomic_bootstrap_seed_confirmed_non_seed_min_sources,
+        if args.atomic_bootstrap_peer_quorum_min_sources.is_some() { " (operator override)" } else { "" }
+    );
+    info!(
+        "Cryptix Atomic peer-only bootstrap quorum: minimum independent peer/non-seed sources = {}{}",
+        atomic_bootstrap_peer_only_non_seed_min_sources,
+        if args.atomic_bootstrap_peer_quorum_min_sources.is_some() { " (operator override)" } else { "" }
+    );
+    info!("Cryptix Atomic bootstrap attestation policy: seed/peer quorum; manifests are not signer-attested");
+    let atomic_seed_sources_disabled_by_arg = args.disable_dns_seeding || args.disable_atomic_seed_sources;
+    let atomic_seed_disable_reason = if args.disable_dns_seeding && args.disable_atomic_seed_sources {
+        "--nodnsseed and --no-atomic-seed"
+    } else if args.disable_dns_seeding {
+        "--nodnsseed"
+    } else {
+        "--no-atomic-seed"
+    };
+    let bootstrap_source_policy = if config.net.is_mainnet() {
+        if atomic_seed_sources_disabled_by_arg && args.atomic_bootstrap_allow_peer_fallback {
+            format!(
+                "mainnet Atomic seed sources disabled by {}; peer-only Atomic bootstrap fallback enabled by explicit operator flag",
+                atomic_seed_disable_reason
+            )
+        } else if atomic_seed_sources_disabled_by_arg {
+            format!(
+                "mainnet Atomic seed sources disabled by {}; peer-only Atomic bootstrap fallback disabled",
+                atomic_seed_disable_reason
+            )
+        } else if args.atomic_bootstrap_allow_peer_fallback {
+            "mainnet strict seed policy; peer-only fallback enabled by explicit operator flag".to_string()
+        } else {
+            "mainnet strict seed policy; peer-only fallback disabled".to_string()
+        }
+    } else {
+        "non-mainnet policy; peer-majority fallback allowed".to_string()
+    };
+    info!("Cryptix Atomic bootstrap source policy: {}", bootstrap_source_policy);
+    if args.disable_atomic_seed_sources {
+        info!("Cryptix Atomic bootstrap seed sources: DISABLED by --no-atomic-seed; normal P2P DNS seeding is unchanged");
+    } else if args.disable_dns_seeding {
+        info!("Cryptix Atomic bootstrap seed sources: DISABLED by --nodnsseed");
+    }
+    info!("Strong-Node claimant overlay: ENABLED");
+    info!("Auto-ban: {}; default strike threshold: 5, ban duration: 3h", if args.autoban { "ENABLED" } else { "DISABLED" });
+    info!("Banserver sync: {}", if args.banserver { "ENABLED" } else { "DISABLED" });
+    info!("AntiFraud peer fallback: ENABLED (automatic in --no-banserver/--antifraud-no-seed mode and on seed refresh failures)");
 
     assert!(!db_dir.to_str().unwrap().is_empty());
     info!("Application directory: {}", app_dir.display());
@@ -251,17 +387,18 @@ pub fn create_core_with_runtime(runtime: &Runtime, args: &Args, fd_total_budget:
 
     let consensus_db_dir = db_dir.join(CONSENSUS_DB);
     let utxoindex_db_dir = db_dir.join(UTXOINDEX_DB);
+    let atomic_db_dir = db_dir.join(ATOMIC_DB);
     let meta_db_dir = db_dir.join(META_DB);
 
     let mut is_db_reset_needed = args.reset_db;
 
     // Reset Condition: User explicitly requested a reset
-    if is_db_reset_needed && db_dir.exists() {
+    if is_db_reset_needed && database_reset_paths_exist(&db_dir) {
         let msg = "Reset DB was requested -- this means the current databases will be fully deleted,
 do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confirm all interactive questions)";
         get_user_approval_or_exit(msg, args.yes);
-        info!("Deleting databases");
-        fs::remove_dir_all(&db_dir).unwrap();
+        info!("Deleting databases and node runtime state");
+        remove_database_reset_state(&db_dir).unwrap();
     }
 
     fs::create_dir_all(consensus_db_dir.as_path()).unwrap();
@@ -270,6 +407,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         info!("Utxoindex Data directory {}", utxoindex_db_dir.display());
         fs::create_dir_all(utxoindex_db_dir.as_path()).unwrap();
     }
+    info!("Cryptix Atomic Data directory {}", atomic_db_dir.display());
+    fs::create_dir_all(atomic_db_dir.as_path()).unwrap();
 
     // DB used for addresses store and for multi-consensus management
     let mut meta_db = cryptix_database::prelude::ConnBuilder::default()
@@ -298,7 +437,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
                 if headers_store.has(config.genesis.hash).unwrap() {
                     info!("Genesis is found in active consensus DB. No action needed.");
                 } else {
-                    let msg = "Genesis not found in active consensus DB. This happens when Testnet 11 is restarted and your database needs to be fully deleted. Do you confirm the delete? (y/n)";
+                    let msg = "Genesis not found in active consensus DB. Your selected network likely changed and the database needs to be fully deleted. Do you confirm the delete? (y/n)";
                     get_user_approval_or_exit(msg, args.yes);
 
                     is_db_reset_needed = true;
@@ -332,7 +471,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         drop(meta_db);
 
         // Delete
-        fs::remove_dir_all(db_dir.clone()).unwrap();
+        remove_database_reset_state(&db_dir).unwrap();
 
         // Recreate the empty folders
         fs::create_dir_all(consensus_db_dir.as_path()).unwrap();
@@ -341,6 +480,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         if args.utxoindex {
             fs::create_dir_all(utxoindex_db_dir.as_path()).unwrap();
         }
+        fs::create_dir_all(atomic_db_dir.as_path()).unwrap();
 
         // Reopen the DB
         meta_db = cryptix_database::prelude::ConnBuilder::default()
@@ -360,6 +500,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     // connect_peers means no DNS seeding and no outbound peers
     let outbound_target = if connect_peers.is_empty() { args.outbound_target } else { 0 };
     let dns_seeders = if connect_peers.is_empty() && !args.disable_dns_seeding { config.dns_seeders } else { &[] };
+    let atomic_seed_sources_disabled = dns_seeders.is_empty() || args.disable_atomic_seed_sources;
 
     let grpc_server_addr = args.rpclisten.unwrap_or(ContextualNetAddress::loopback()).normalize(config.default_rpc_port());
 
@@ -413,6 +554,23 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     let system_info = SystemInfo::default();
 
     let notify_service = Arc::new(NotifyService::new(notification_root.clone(), notification_recv, subscription_context.clone()));
+    let local_unified_node_identity = load_or_create_identity(&db_dir, &config.network_name()).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        exit(1);
+    });
+    let atomic_token_service = Arc::new(
+        AtomicTokenService::new(
+            &notify_service.notifier(),
+            consensus_manager.clone(),
+            config.clone(),
+            atomic_db_dir.clone(),
+            local_unified_node_identity.node_id,
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            exit(1);
+        }),
+    );
     let index_service: Option<Arc<IndexService>> = if args.utxoindex {
         // Use only a single thread for none-consensus databases
         let utxoindex_db = cryptix_database::prelude::ConnBuilder::default()
@@ -427,27 +585,58 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         None
     };
 
-    let (address_manager, port_mapping_extender_svc) = AddressManager::new(config.clone(), meta_db, tick_service.clone());
+    let (address_manager, port_mapping_extender_svc) =
+        AddressManager::new(config.clone(), meta_db, tick_service.clone(), args.datacenter);
 
-    let mining_manager = MiningManagerProxy::new(Arc::new(MiningManager::new_with_extended_config(
+    let mining_manager = MiningManagerProxy::new(Arc::new(MiningManager::new_with_extended_config_and_payload_policy(
         config.target_time_per_block,
         false,
         config.max_block_mass,
         config.ram_scale,
         config.block_template_cache_lifetime,
         mining_counters.clone(),
+        config.params.payload_max_len_standard,
     )));
     let mining_monitor =
         Arc::new(MiningMonitor::new(mining_manager.clone(), mining_counters, tx_script_cache_counters.clone(), tick_service.clone()));
 
-    let flow_context = Arc::new(FlowContext::new(
-        consensus_manager.clone(),
-        address_manager,
-        config.clone(),
-        mining_manager.clone(),
-        tick_service.clone(),
-        notification_root,
-    ));
+    let flow_context = Arc::new(
+        FlowContext::new(
+            consensus_manager.clone(),
+            address_manager,
+            config.clone(),
+            mining_manager.clone(),
+            tick_service.clone(),
+            notification_root,
+            args.autoban,
+            db_dir.clone(),
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            exit(1);
+        }),
+    );
+    let configured_atomic_bootstrap_peers =
+        args.atomic_bootstrap_peers.iter().map(|peer| peer.normalize(config.default_rpc_port())).collect::<Vec<_>>();
+    let atomic_bootstrap_service = Arc::new(
+        AtomicBootstrapService::new(
+            atomic_token_service.clone(),
+            flow_context.clone(),
+            configured_atomic_bootstrap_peers.clone(),
+            atomic_seed_sources_disabled,
+            10,
+            atomic_db_dir.clone(),
+            args.atomic_bootstrap_allow_peer_fallback,
+            args.atomic_bootstrap_peer_quorum_min_sources,
+            !args.disable_atomic_health_audit,
+            args.atomic_health_audit_interval_minutes,
+        )
+        .unwrap_or_else(|err| {
+            eprintln!("{err}");
+            exit(1);
+        }),
+    );
+    flow_context.set_atomic_state_quorum_verifier(atomic_bootstrap_service.clone());
     let p2p_service = Arc::new(P2pService::new(
         flow_context.clone(),
         connect_peers,
@@ -457,8 +646,14 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         args.inbound_limit,
         dns_seeders,
         config.default_p2p_port(),
+        args.banserver,
+        Some(db_dir.clone()),
         p2p_tower_counters.clone(),
     ));
+
+    let mut hfa_runtime_config = HfaRuntimeConfig::new(args.hfa, args.hfa_cpu);
+    hfa_runtime_config.clock_drift_max_ms = args.hfa_drift_ms;
+    hfa_runtime_config.microblock_interval_ms_normal = args.hfa_microblock_interval_ms_normal;
 
     let rpc_core_service = Arc::new(RpcCoreService::new(
         consensus_manager.clone(),
@@ -468,6 +663,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         flow_context,
         subscription_context,
         index_service.as_ref().map(|x| x.utxoindex().unwrap()),
+        atomic_token_service.clone(),
         config.clone(),
         core.clone(),
         processing_counters,
@@ -477,6 +673,7 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
         p2p_tower_counters.clone(),
         grpc_tower_counters.clone(),
         system_info,
+        hfa_runtime_config,
     ));
     let grpc_service_broadcasters: usize = 3; // TODO: add a command line argument or derive from other arg/config/host-related fields
     let grpc_service = if !args.disable_grpc {
@@ -496,6 +693,8 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     let async_runtime = Arc::new(AsyncRuntime::new(args.async_threads));
     async_runtime.register(tick_service);
     async_runtime.register(notify_service);
+    async_runtime.register(atomic_token_service);
+    async_runtime.register(atomic_bootstrap_service);
     if let Some(index_service) = index_service {
         async_runtime.register(index_service)
     };
@@ -539,4 +738,48 @@ do you confirm? (answer y/n or pass --yes to the Cryptixd command line to confir
     core.bind(async_runtime);
 
     (core, rpc_core_service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_database_reset_state_removes_node_runtime_dirs() {
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("cryptixd-reset-state-test-{}-{unique}", std::process::id()));
+        let network_dir = root.join("cryptix-mainnet");
+        let db_dir = network_dir.join(DEFAULT_DATA_DIR);
+        let log_dir = network_dir.join(DEFAULT_LOG_DIR);
+
+        for path in [
+            db_dir.join(CONSENSUS_DB),
+            db_dir.join(META_DB),
+            db_dir.join(ATOMIC_DB),
+            db_dir.join("strong-nodes"),
+            db_dir.join("strong-node-claims"),
+            db_dir.join("antifraud"),
+        ] {
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("state"), b"state").unwrap();
+        }
+        fs::create_dir_all(&log_dir).unwrap();
+
+        remove_database_reset_state(&db_dir).unwrap();
+
+        assert!(!db_dir.exists(), "expected {} to be removed", db_dir.display());
+        for path in [
+            db_dir.join(CONSENSUS_DB),
+            db_dir.join(META_DB),
+            db_dir.join(ATOMIC_DB),
+            db_dir.join("strong-nodes"),
+            db_dir.join("strong-node-claims"),
+            db_dir.join("antifraud"),
+        ] {
+            assert!(!path.exists(), "expected {} to be removed with datadir", path.display());
+        }
+        assert!(log_dir.exists(), "reset should not remove logs");
+
+        let _ = fs::remove_dir_all(root);
+    }
 }

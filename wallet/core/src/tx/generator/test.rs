@@ -5,7 +5,7 @@ use crate::result::Result;
 use crate::tx::{Fees, MassCalculator, PaymentDestination};
 use crate::utxo::UtxoEntryReference;
 use crate::{tx::PaymentOutputs, utils::cryptix_to_sompi};
-use cryptix_addresses::Address;
+use cryptix_addresses::{Address, Prefix, Version};
 use cryptix_consensus_core::network::{NetworkId, NetworkType};
 use cryptix_consensus_core::tx::Transaction;
 use rand::prelude::*;
@@ -140,7 +140,7 @@ impl GeneratorExtension for Generator {
 
 fn test_network_id() -> NetworkId {
     // TODO make this configurable
-    NetworkId::with_suffix(NetworkType::Testnet, 11)
+    NetworkId::new(NetworkType::Testnet)
 }
 
 #[derive(Default)]
@@ -437,16 +437,16 @@ where
 
 pub(crate) fn change_address(network_type: NetworkType) -> Address {
     match network_type {
-        NetworkType::Mainnet => Address::try_from("cryptix:qpauqsvk7yf9unexwmxsnmg547mhyga37csh0kj53q6xxgl24ydxjsgzthw5j").unwrap(),
-        NetworkType::Testnet => Address::try_from("cryptixtest:qqz22l98sf8jun72rwh5rqe2tm8lhwtdxdmynrz4ypwak427qed5juktjt7ju").unwrap(),
+        NetworkType::Mainnet => Address::new(Prefix::Mainnet, Version::PubKey, &[1u8; 32]),
+        NetworkType::Testnet => Address::new(Prefix::Testnet, Version::PubKey, &[1u8; 32]),
         _ => unreachable!("network type not supported"),
     }
 }
 
 pub(crate) fn output_address(network_type: NetworkType) -> Address {
     match network_type {
-        NetworkType::Mainnet => Address::try_from("cryptix:qrd9efkvg3pg34sgp6ztwyv3r569qlc43wa5w8nfs302532dzj47knu04aftm").unwrap(),
-        NetworkType::Testnet => Address::try_from("cryptixtest:qqrewmx4gpuekvk8grenkvj2hp7xt0c35rxgq383f6gy223c4ud5s58ptm6er").unwrap(),
+        NetworkType::Mainnet => Address::new(Prefix::Mainnet, Version::PubKey, &[2u8; 32]),
+        NetworkType::Testnet => Address::new(Prefix::Testnet, Version::PubKey, &[2u8; 32]),
         _ => unreachable!("network type not supported"),
     }
 }
@@ -512,7 +512,11 @@ fn test_generator_compound_100k_random_transactions() -> Result<()> {
     let inputs: Vec<f64> = (0..100_000).map(|_| rng.gen_range(0.001..10.0)).collect();
     let total = inputs.iter().sum::<f64>();
     let outputs = [(output_address, Cryptix(total - 10.0))];
-    generator(test_network_id(), &inputs, &[], Fees::sender(Cryptix(5.0)), outputs.as_slice()).unwrap().harness().validate().finalize();
+    generator(test_network_id(), &inputs, &[], Fees::sender(Cryptix(5.0)), outputs.as_slice())
+        .unwrap()
+        .harness()
+        .validate()
+        .finalize();
 
     Ok(())
 }
@@ -651,6 +655,30 @@ fn test_generator_inputs_100_outputs_1_fees_include_success() -> Result<()> {
 }
 
 #[test]
+fn test_generator_receiver_pays_exact_balance_single_utxo() -> Result<()> {
+    let generator =
+        generator(test_network_id(), &[10.0], &[], Fees::receiver(Cryptix(0.1)), [(output_address, Cryptix(10.0))].as_slice())?;
+
+    let pending = generator.generate_transaction()?.expect("receiver-pays transaction");
+    let tx = pending.transaction();
+    let aggregate_input_value = pending.utxo_entries().values().map(|o| o.amount()).sum::<u64>();
+    let aggregate_output_value = tx.outputs.iter().map(|o| o.value).sum::<u64>();
+
+    assert!(pending.is_final());
+    assert_eq!(tx.outputs.len(), 1, "exact receiver-pays spend should not need change");
+    assert!(aggregate_output_value < aggregate_input_value, "receiver output should absorb all fees");
+    assert_eq!(
+        aggregate_input_value,
+        aggregate_output_value + pending.fees(),
+        "receiver-pays exact-balance send must spend the full input without reporting insufficient funds"
+    );
+    assert!(pending.fees() > cryptix_to_sompi(0.1), "priority fee should be included in total fees");
+    assert!(generator.generate_transaction()?.is_none());
+
+    Ok(())
+}
+
+#[test]
 fn test_generator_inputs_100_outputs_1_fees_exclude_insufficient_funds() -> Result<()> {
     generator(test_network_id(), &[10.0; 100], &[], Fees::sender(Cryptix(5.0)), [(output_address, Cryptix(1000.0))].as_slice())
         .unwrap()
@@ -721,7 +749,8 @@ fn test_generator_inputs_32k_outputs_2_fees_exclude() -> Result<()> {
 #[test]
 fn test_generator_inputs_250k_outputs_2_sweep() -> Result<()> {
     let f = 130.0;
-    let generator = make_generator(test_network_id(), &[f; 250_000], &[], Fees::None, change_address, PaymentDestination::Change);
+    let inputs = vec![f; 250_000];
+    let generator = make_generator(test_network_id(), &inputs, &[], Fees::None, change_address, PaymentDestination::Change);
     generator.unwrap().harness().accumulate(2875).finalize();
     Ok(())
 }

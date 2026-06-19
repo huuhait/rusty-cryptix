@@ -16,9 +16,9 @@ use workflow_store::fs;
 #[derive(Describe, Debug, Clone, Serialize, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd)]
 #[serde(rename_all = "lowercase")]
 pub enum WalletSettings {
-    #[describe("Network type (mainnet|testnet-10|testnet-11)")]
+    #[describe("Network type (mainnet|testnet|devnet)")]
     Network,
-    #[describe("Server address (default: 127.0.0.1)")]
+    #[describe("Server address (default: public seed 45.145.225.141:19301)")]
     Server,
     #[describe("Wallet storage or file name (default 'cryptix')")]
     Wallet,

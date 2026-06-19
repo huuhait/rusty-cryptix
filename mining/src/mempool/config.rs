@@ -5,6 +5,8 @@ pub(crate) const DEFAULT_MEMPOOL_SIZE_LIMIT: usize = 1_000_000_000;
 pub(crate) const DEFAULT_MAXIMUM_BUILD_BLOCK_TEMPLATE_ATTEMPTS: u64 = 5;
 
 pub(crate) const DEFAULT_TRANSACTION_EXPIRE_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+pub(crate) const DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE: u64 = 1_200;
+pub(crate) const DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE: u64 = 86_400;
 pub(crate) const DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS: u64 = 60;
 pub(crate) const DEFAULT_ACCEPTED_TRANSACTION_EXPIRE_INTERVAL_SECONDS: u64 = 120;
 pub(crate) const DEFAULT_ACCEPTED_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS: u64 = 10;
@@ -17,6 +19,9 @@ pub(crate) const DEFAULT_MAXIMUM_ORPHAN_TRANSACTION_COUNT: u64 = 500;
 /// DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE specifies the minimum transaction fee for a transaction to be accepted to
 /// the mempool and relayed. It is specified in sompi per 1kg (or 1000 grams) of transaction mass.
 pub(crate) const DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE: u64 = 1000;
+pub(crate) const DEFAULT_PAYLOAD_MAX_STANDARD_LEN: usize = 2048;
+pub(crate) const DEFAULT_PAYLOAD_SOFT_CAP_PER_BLOCK_BYTES: u64 = 32_768;
+pub(crate) const DEFAULT_PAYLOAD_OVERCAP_FEERATE_MULTIPLIER: f64 = 2.0;
 
 /// Standard transaction version range might be different from what consensus accepts, therefore
 /// we define separate values in mempool.
@@ -31,6 +36,8 @@ pub struct Config {
     pub mempool_size_limit: usize,
     pub maximum_build_block_template_attempts: u64,
     pub transaction_expire_interval_daa_score: u64,
+    pub atomic_transaction_expire_interval_daa_score: u64,
+    pub atomic_transaction_total_expire_interval_daa_score: u64,
     pub transaction_expire_scan_interval_daa_score: u64,
     pub transaction_expire_scan_interval_milliseconds: u64,
     pub accepted_transaction_expire_interval_daa_score: u64,
@@ -43,6 +50,9 @@ pub struct Config {
     pub accept_non_standard: bool,
     pub maximum_mass_per_block: u64,
     pub minimum_relay_transaction_fee: u64,
+    pub payload_max_len_standard: usize,
+    pub payload_soft_cap_per_block_bytes: u64,
+    pub payload_overcap_feerate_multiplier: f64,
     pub minimum_standard_transaction_version: u16,
     pub maximum_standard_transaction_version: u16,
     pub network_blocks_per_second: u64,
@@ -55,6 +65,8 @@ impl Config {
         mempool_size_limit: usize,
         maximum_build_block_template_attempts: u64,
         transaction_expire_interval_daa_score: u64,
+        atomic_transaction_expire_interval_daa_score: u64,
+        atomic_transaction_total_expire_interval_daa_score: u64,
         transaction_expire_scan_interval_daa_score: u64,
         transaction_expire_scan_interval_milliseconds: u64,
         accepted_transaction_expire_interval_daa_score: u64,
@@ -67,6 +79,9 @@ impl Config {
         accept_non_standard: bool,
         maximum_mass_per_block: u64,
         minimum_relay_transaction_fee: u64,
+        payload_max_len_standard: usize,
+        payload_soft_cap_per_block_bytes: u64,
+        payload_overcap_feerate_multiplier: f64,
         minimum_standard_transaction_version: u16,
         maximum_standard_transaction_version: u16,
         network_blocks_per_second: u64,
@@ -76,6 +91,8 @@ impl Config {
             mempool_size_limit,
             maximum_build_block_template_attempts,
             transaction_expire_interval_daa_score,
+            atomic_transaction_expire_interval_daa_score,
+            atomic_transaction_total_expire_interval_daa_score,
             transaction_expire_scan_interval_daa_score,
             transaction_expire_scan_interval_milliseconds,
             accepted_transaction_expire_interval_daa_score,
@@ -88,6 +105,9 @@ impl Config {
             accept_non_standard,
             maximum_mass_per_block,
             minimum_relay_transaction_fee,
+            payload_max_len_standard,
+            payload_soft_cap_per_block_bytes,
+            payload_overcap_feerate_multiplier,
             minimum_standard_transaction_version,
             maximum_standard_transaction_version,
             network_blocks_per_second,
@@ -102,6 +122,8 @@ impl Config {
             mempool_size_limit: DEFAULT_MEMPOOL_SIZE_LIMIT,
             maximum_build_block_template_attempts: DEFAULT_MAXIMUM_BUILD_BLOCK_TEMPLATE_ATTEMPTS,
             transaction_expire_interval_daa_score: DEFAULT_TRANSACTION_EXPIRE_INTERVAL_SECONDS * 1000 / target_milliseconds_per_block,
+            atomic_transaction_expire_interval_daa_score: DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE,
+            atomic_transaction_total_expire_interval_daa_score: DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE,
             transaction_expire_scan_interval_daa_score: DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS * 1000
                 / target_milliseconds_per_block,
             transaction_expire_scan_interval_milliseconds: DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS * 1000,
@@ -117,6 +139,9 @@ impl Config {
             accept_non_standard: relay_non_std_transactions,
             maximum_mass_per_block: max_block_mass,
             minimum_relay_transaction_fee: DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE,
+            payload_max_len_standard: DEFAULT_PAYLOAD_MAX_STANDARD_LEN,
+            payload_soft_cap_per_block_bytes: DEFAULT_PAYLOAD_SOFT_CAP_PER_BLOCK_BYTES,
+            payload_overcap_feerate_multiplier: DEFAULT_PAYLOAD_OVERCAP_FEERATE_MULTIPLIER,
             minimum_standard_transaction_version: DEFAULT_MINIMUM_STANDARD_TRANSACTION_VERSION,
             maximum_standard_transaction_version: DEFAULT_MAXIMUM_STANDARD_TRANSACTION_VERSION,
             network_blocks_per_second: 1000 / target_milliseconds_per_block,
@@ -134,5 +159,28 @@ impl Config {
     pub(crate) fn minimum_feerate(&self) -> f64 {
         // The parameter minimum_relay_transaction_fee is in sompi/kg units so divide by 1000 to get sompi/gram
         self.minimum_relay_transaction_fee as f64 / 1000.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atomic_expiry_is_fixed_daa_not_wall_time_conversion() {
+        let one_bps = Config::build_default(1000, false, 500_000);
+        let ten_bps = Config::build_default(100, false, 500_000);
+
+        assert_eq!(one_bps.atomic_transaction_expire_interval_daa_score, DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE);
+        assert_eq!(ten_bps.atomic_transaction_expire_interval_daa_score, DEFAULT_ATOMIC_TRANSACTION_EXPIRE_INTERVAL_DAA_SCORE);
+        assert_eq!(
+            one_bps.atomic_transaction_total_expire_interval_daa_score,
+            DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE
+        );
+        assert_eq!(
+            ten_bps.atomic_transaction_total_expire_interval_daa_score,
+            DEFAULT_ATOMIC_TRANSACTION_TOTAL_EXPIRE_INTERVAL_DAA_SCORE
+        );
+        assert_eq!(ten_bps.transaction_expire_scan_interval_daa_score, DEFAULT_TRANSACTION_EXPIRE_SCAN_INTERVAL_SECONDS * 10);
     }
 }

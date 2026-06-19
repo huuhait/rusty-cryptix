@@ -11,14 +11,14 @@ use crate::api::message::*;
 use crate::imports::*;
 use crate::storage::{PrvKeyData, PrvKeyDataId, PrvKeyDataInfo, WalletDescriptor};
 use crate::tx::GeneratorSummary;
-use workflow_core::channel::Receiver;
+use workflow_core::channel::Sender;
 
 ///
 ///  API trait for interfacing with the Cryptix wallet subsystem.
 ///
 #[async_trait]
 pub trait WalletApi: Send + Sync + AnySync {
-    async fn register_notifications(self: Arc<Self>, channel: Receiver<WalletNotification>) -> Result<u64>;
+    async fn register_notifications(self: Arc<Self>, channel: Sender<WalletNotification>) -> Result<u64>;
     async fn unregister_notifications(self: Arc<Self>, channel_id: u64) -> Result<()>;
 
     async fn retain_context(self: Arc<Self>, name: &str, data: Option<Vec<u8>>) -> Result<()> {
@@ -317,6 +317,25 @@ pub trait WalletApi: Send + Sync + AnySync {
     /// considered as viable.
     async fn accounts_discovery_call(self: Arc<Self>, request: AccountsDiscoveryRequest) -> Result<AccountsDiscoveryResponse>;
 
+    /// Scans a derivation-capable account address space up to an explicit depth.
+    ///
+    /// This is useful for recovering accounts where older wallets left gaps in
+    /// the receive/change address sequence. Legacy accounts require
+    /// `wallet_secret` so the legacy private derivation context can be
+    /// initialized for the duration of the scan.
+    async fn accounts_scan_call(self: Arc<Self>, request: AccountsScanRequest) -> Result<AccountsScanResponse>;
+
+    /// Smart account scan variant that keeps the legacy scan behavior available
+    /// under [`accounts_scan_call`](Self::accounts_scan_call) while avoiding
+    /// permanent registration of every scanned empty address.
+    async fn accounts_scan_smart_call(self: Arc<Self>, request: AccountsScanSmartRequest) -> Result<AccountsScanSmartResponse>;
+
+    /// Activate accounts using the smart scan policy.
+    async fn accounts_activate_smart_call(
+        self: Arc<Self>,
+        request: AccountsActivateSmartRequest,
+    ) -> Result<AccountsActivateSmartResponse>;
+
     /// Wrapper around [`accounts_create_call()`](Self::accounts_create_call)
     async fn accounts_create(
         self: Arc<Self>,
@@ -361,13 +380,16 @@ pub trait WalletApi: Send + Sync + AnySync {
     /// Get an [`AccountDescriptor`] for a specific account id.
     async fn accounts_get_call(self: Arc<Self>, request: AccountsGetRequest) -> Result<AccountsGetResponse>;
 
+    /// Get a paged, transaction-grouped view of the current UTXO set for an active account.
+    async fn accounts_utxos_call(self: Arc<Self>, request: AccountsUtxosRequest) -> Result<AccountsUtxosResponse>;
+
     /// Wrapper around [`accounts_create_new_address`](Self::accounts_create_new_address)
     async fn accounts_create_new_address(
         self: Arc<Self>,
         account_id: AccountId,
         kind: NewAddressKind,
     ) -> Result<AccountsCreateNewAddressResponse> {
-        self.accounts_create_new_address_call(AccountsCreateNewAddressRequest { account_id, kind }).await
+        self.accounts_create_new_address_call(AccountsCreateNewAddressRequest { account_id, wallet_secret: None, kind }).await
     }
 
     /// Creates a new address for a specified account id. This call is applicable

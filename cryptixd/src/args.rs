@@ -9,7 +9,7 @@ use cryptix_utils::networking::ContextualNetAddress;
 use cryptix_wrpc_server::address::WrpcNetAddress;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
-use std::{ffi::OsString, fs};
+use std::{ffi::OsString, fs, path::PathBuf};
 use toml::from_str;
 
 #[cfg(feature = "devnet-prealloc")]
@@ -38,6 +38,10 @@ pub struct Args {
     pub rpclisten_json: Option<WrpcNetAddress>,
     #[serde(rename = "unsaferpc")]
     pub unsafe_rpc: bool,
+    pub rpc_diagnostics: bool,
+    pub rpc_block_scan_cache: bool,
+    pub rpc_block_scan_cache_days: f64,
+    pub rpc_block_scan_cache_max_mb: u64,
     pub wrpc_verbose: bool,
     #[serde(rename = "loglevel")]
     pub log_level: String,
@@ -53,6 +57,16 @@ pub struct Args {
     #[serde(rename = "uacomment")]
     pub user_agent_comments: Vec<String>,
     pub utxoindex: bool,
+    pub atomic_unsafe_skip_snapshot_finality_check: bool,
+    #[serde_as(as = "Vec<DisplayFromStr>")]
+    #[serde(rename = "atomic-bootstrap-peer")]
+    pub atomic_bootstrap_peers: Vec<ContextualNetAddress>,
+    #[serde(rename = "no-atomic-seed", alias = "atomic-bootstrap-no-seed", alias = "disable-atomic-seed-sources")]
+    pub disable_atomic_seed_sources: bool,
+    pub atomic_bootstrap_allow_peer_fallback: bool,
+    pub atomic_bootstrap_peer_quorum_min_sources: Option<usize>,
+    pub disable_atomic_health_audit: bool,
+    pub atomic_health_audit_interval_minutes: u64,
     pub reset_db: bool,
     #[serde(rename = "outpeers")]
     pub outbound_target: usize,
@@ -62,10 +76,12 @@ pub struct Args {
     pub rpc_max_clients: usize,
     pub max_tracked_addresses: usize,
     pub enable_unsynced_mining: bool,
+    pub startup_repair_plan: Option<String>,
     pub enable_mainnet_mining: bool,
     pub testnet: bool,
+    // Deprecated and ignored: kept for config-file backwards compatibility.
     #[serde(rename = "netsuffix")]
-    pub testnet_suffix: u32,
+    pub testnet_suffix: Option<u32>,
     pub devnet: bool,
     pub simnet: bool,
     pub archival: bool,
@@ -76,6 +92,16 @@ pub struct Args {
     pub perf_metrics: bool,
     pub perf_metrics_interval_sec: u64,
     pub block_template_cache_lifetime: Option<u64>,
+    pub tx_relay_broadcast_interval_ms: u64,
+    pub datacenter: bool,
+    pub hfa: bool,
+    pub hfa_cpu: f64,
+    pub hfa_drift_ms: u64,
+    pub hfa_microblock_interval_ms_normal: u64,
+    pub autoban: bool,
+    pub banserver: bool,
+    pub coinbase_maturity_override: Option<u64>,
+    pub payload_hf_activation_daa_score: Option<u64>,
 
     #[cfg(feature = "devnet-prealloc")]
     pub num_prealloc_utxos: Option<u64>,
@@ -100,17 +126,29 @@ impl Default for Args {
             rpclisten_borsh: None,
             rpclisten_json: None,
             unsafe_rpc: false,
+            rpc_diagnostics: false,
+            rpc_block_scan_cache: false,
+            rpc_block_scan_cache_days: 1.0,
+            rpc_block_scan_cache_max_mb: 1024,
             async_threads: num_cpus::get(),
-            utxoindex: false,
+            utxoindex: true,
+            atomic_unsafe_skip_snapshot_finality_check: false,
+            atomic_bootstrap_peers: vec![],
+            disable_atomic_seed_sources: false,
+            atomic_bootstrap_allow_peer_fallback: false,
+            atomic_bootstrap_peer_quorum_min_sources: None,
+            disable_atomic_health_audit: false,
+            atomic_health_audit_interval_minutes: 3,
             reset_db: false,
             outbound_target: 8,
             inbound_limit: 128,
             rpc_max_clients: 128,
             max_tracked_addresses: 0,
             enable_unsynced_mining: false,
+            startup_repair_plan: None,
             enable_mainnet_mining: true,
             testnet: false,
-            testnet_suffix: 10,
+            testnet_suffix: None,
             devnet: false,
             simnet: false,
             archival: false,
@@ -128,6 +166,16 @@ impl Default for Args {
             perf_metrics_interval_sec: 10,
             externalip: None,
             block_template_cache_lifetime: None,
+            tx_relay_broadcast_interval_ms: 250,
+            datacenter: false,
+            hfa: false,
+            hfa_cpu: 0.7,
+            hfa_drift_ms: 5_000,
+            hfa_microblock_interval_ms_normal: 50,
+            autoban: false,
+            banserver: true,
+            coinbase_maturity_override: None,
+            payload_hf_activation_daa_score: None,
 
             #[cfg(feature = "devnet-prealloc")]
             num_prealloc_utxos: None,
@@ -147,18 +195,31 @@ impl Default for Args {
 impl Args {
     pub fn apply_to_config(&self, config: &mut Config) {
         config.utxoindex = self.utxoindex;
+        config.atomic_unsafe_skip_snapshot_finality_check = self.atomic_unsafe_skip_snapshot_finality_check;
         config.disable_upnp = self.disable_upnp;
         config.unsafe_rpc = self.unsafe_rpc;
+        config.rpc_diagnostics = self.rpc_diagnostics;
+        config.rpc_block_scan_cache = self.rpc_block_scan_cache;
+        config.rpc_block_scan_cache_days = clamp_rpc_block_scan_cache_days(self.rpc_block_scan_cache_days);
+        config.rpc_block_scan_cache_max_bytes = self.rpc_block_scan_cache_max_mb.saturating_mul(1024 * 1024);
         config.enable_unsynced_mining = self.enable_unsynced_mining;
+        config.startup_repair_plan_path = self.startup_repair_plan.as_ref().map(PathBuf::from);
         config.enable_mainnet_mining = self.enable_mainnet_mining;
         config.is_archival = self.archival;
         // TODO: change to `config.enable_sanity_checks = self.sanity` when we reach stable versions
         config.enable_sanity_checks = true;
         config.user_agent_comments.clone_from(&self.user_agent_comments);
         config.block_template_cache_lifetime = self.block_template_cache_lifetime;
+        config.tx_relay_broadcast_interval_ms = self.tx_relay_broadcast_interval_ms;
         config.p2p_listen_address = self.listen.unwrap_or(ContextualNetAddress::unspecified());
         config.externalip = self.externalip.map(|v| v.normalize(config.default_p2p_port()));
         config.ram_scale = self.ram_scale;
+        if let Some(coinbase_maturity_override) = self.coinbase_maturity_override {
+            config.params.coinbase_maturity = coinbase_maturity_override;
+        }
+        if let Some(payload_hf_activation_daa_score) = self.payload_hf_activation_daa_score {
+            config.params.payload_hf_activation_daa_score = payload_hf_activation_daa_score;
+        }
 
         #[cfg(feature = "devnet-prealloc")]
         if let Some(num_prealloc_utxos) = self.num_prealloc_utxos {
@@ -183,7 +244,7 @@ impl Args {
     pub fn network(&self) -> NetworkId {
         match (self.testnet, self.devnet, self.simnet) {
             (false, false, false) => NetworkId::new(NetworkType::Mainnet),
-            (true, false, false) => NetworkId::with_suffix(NetworkType::Testnet, self.testnet_suffix),
+            (true, false, false) => NetworkId::new(NetworkType::Testnet),
             (false, true, false) => NetworkId::new(NetworkType::Devnet),
             (false, false, true) => NetworkId::new(NetworkType::Simnet),
             _ => panic!("only a single net should be activated"),
@@ -252,6 +313,40 @@ pub fn cli() -> Command {
         )
         .arg(arg!(--unsaferpc "Enable RPC commands which affect the state of the node"))
         .arg(
+            Arg::new("rpc-diagnostics")
+                .long("rpc-diagnostics")
+                .action(ArgAction::SetTrue)
+                .help("Enable opt-in RPC diagnostics logs: request volume summaries every 5s and slow request snapshots at >=500ms."),
+        )
+        .arg(
+            Arg::new("rpc-block-scan-cache")
+                .long("rpc-block-scan-cache")
+                .action(ArgAction::SetTrue)
+                .help("Enable opt-in RAM cache for recent RPC block/header scan responses used by wallet sync/resync."),
+        )
+        .arg(
+            Arg::new("rpc-block-scan-cache-days")
+                .long("rpc-block-scan-cache-days")
+                .value_name("DAYS")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(f64))
+                .help(format!(
+                    "Recent data window for --rpc-block-scan-cache in days (default: {}, allowed: 0.1..7.0).",
+                    defaults.rpc_block_scan_cache_days
+                )),
+        )
+        .arg(
+            Arg::new("rpc-block-scan-cache-max-mb")
+                .long("rpc-block-scan-cache-max-mb")
+                .value_name("MB")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help(format!(
+                    "Approximate RAM cap for --rpc-block-scan-cache in MiB (default: {}).",
+                    defaults.rpc_block_scan_cache_max_mb
+                )),
+        )
+        .arg(
             Arg::new("connect-peers")
                 .long("connect")
                 .value_name("IP[:PORT]")
@@ -304,13 +399,101 @@ pub fn cli() -> Command {
         .arg(arg!(--"reset-db" "Reset database before starting node. It's needed when switching between subnetworks."))
         .arg(arg!(--"enable-unsynced-mining" "Allow the node to accept blocks from RPC while not synced (this flag is mainly used for testing)"))
         .arg(
+            Arg::new("startup-repair-plan")
+                .long("startup-repair-plan")
+                .value_name("JSON")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(String))
+                .help("Apply the given JSON startup database repair plan before networking starts."),
+        )
+        .arg(
             Arg::new("enable-mainnet-mining")
                 .long("enable-mainnet-mining")
                 .action(ArgAction::SetTrue)
                 .hide(true)
                 .help("Allow mainnet mining (currently enabled by default while the flag is kept for backwards compatibility)"),
         )
-        .arg(arg!(--utxoindex "Enable the UTXO index"))
+        .arg(
+            Arg::new("payload-hf-activation-daa-score")
+                .long("payload-hf-activation-daa-score")
+                .value_name("DAA_SCORE")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("Override payload hardfork activation DAA score."),
+        )
+        .arg(
+            Arg::new("atomic-unsafe-skip-snapshot-finality-check")
+                .long("atomic-unsafe-skip-snapshot-finality-check")
+                .action(ArgAction::SetTrue)
+                .hide(true)
+                .help("UNSAFE testing override: skip Atomic snapshot finality sanity checks (forbidden on mainnet)."),
+        )
+        .arg(
+            Arg::new("coinbase-maturity-override")
+                .long("coinbase-maturity-override")
+                .value_name("BLOCKS")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .hide(true)
+                .help("Testing override for consensus coinbase maturity."),
+        )
+        .arg(arg!(--utxoindex "Enable the UTXO index (default)"))
+        .arg(
+            Arg::new("no-utxoindex")
+                .long("no-utxoindex")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("utxoindex")
+                .help("Disable the UTXO index."),
+        )
+        .arg(
+            Arg::new("atomic-bootstrap-peer")
+                .long("atomic-bootstrap-peer")
+                .value_name("IP[:PORT]")
+                .action(ArgAction::Append)
+                .require_equals(true)
+                .value_parser(clap::value_parser!(ContextualNetAddress))
+                .help("Add an optional Cryptix Atomic bootstrap gRPC endpoint for snapshot discovery/fetch. Normal P2P sync and local Atomic replay do not require this."),
+        )
+        .arg(
+            Arg::new("no-atomic-seed")
+                .long("no-atomic-seed")
+                .visible_alias("atomic-bootstrap-no-seed")
+                .action(ArgAction::SetTrue)
+                .help("Disable Atomic seed sources for Atomic sync/bootstrap/health quorum without disabling normal P2P DNS seeding."),
+        )
+        .arg(
+            Arg::new("atomic-bootstrap-allow-peer-fallback")
+                .long("atomic-bootstrap-allow-peer-fallback")
+                .action(ArgAction::SetTrue)
+                .help("Enable peer-only Atomic quorum fallback when no seed source is reachable or seeded P2P discovery is disabled (mainnet safety override; disabled by default)."),
+        )
+        .arg(
+            Arg::new("atomic-bootstrap-peer-quorum-min-sources")
+                .long("atomic-bootstrap-peer-quorum-min-sources")
+                .visible_alias("atomic-bootstrap-peer-quorum")
+                .value_name("N")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(usize))
+                .help("Override the minimum independent non-seed/P2P sources required for Atomic quorum. On mainnet this applies to seed-confirmed quorum as >=1 seed + >=N peers and to peer-only fallback as >=N peers with majority. Values below 3 are intended for private/testing networks."),
+        )
+        .arg(
+            Arg::new("disable-atomic-health-audit")
+                .long("disable-atomic-health-audit")
+                .visible_alias("atomic-health-audit-disable")
+                .action(ArgAction::SetTrue)
+                .help("Disable the periodic Atomic P2P healthy-state/token audit while keeping normal Atomic indexing and P2P sync enabled."),
+        )
+        .arg(
+            Arg::new("atomic-health-audit-interval-minutes")
+                .long("atomic-health-audit-interval-minutes")
+                .value_name("MINUTES")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help(format!(
+                    "Set the periodic Atomic P2P healthy-state/token audit interval in minutes (default: {}).",
+                    defaults.atomic_health_audit_interval_minutes
+                )),
+        )
         .arg(
             Arg::new("max-tracked-addresses")
                 .long("max-tracked-addresses")
@@ -321,14 +504,6 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
 0, Tracker::MAX_ADDRESS_UPPER_BOUND, Tracker::DEFAULT_MAX_ADDRESSES)),
         )
         .arg(arg!(--testnet "Use the test network"))
-        .arg(
-            Arg::new("netsuffix")
-                .long("netsuffix")
-                .value_name("netsuffix")
-                .require_equals(true)
-                .value_parser(clap::value_parser!(u32))
-                .help("Testnet network suffix number"),
-        )
         .arg(arg!(--devnet "Use the development test network"))
         .arg(arg!(--simnet "Use the simulation test network"))
         .arg(arg!(--archival "Run as an archival node: avoids deleting old block data when moving the pruning point (Warning: heavy disk usage)"))
@@ -357,6 +532,83 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
                 .require_equals(true)
                 .value_parser(clap::value_parser!(u64))
                 .help("Interval in seconds for performance metrics collection."),
+        )
+        .arg(
+            Arg::new("tx-relay-broadcast-interval-ms")
+                .long("tx-relay-broadcast-interval-ms")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("Interval in milliseconds for batching mempool transaction inv broadcasts (default: 250)."),
+        )
+        .arg(
+            Arg::new("datacenter")
+                .long("datacenter")
+                .action(ArgAction::SetTrue)
+                .help("Enable datacenter address filtering mode (skip private/unroutable peer addresses)."),
+        )
+        .arg(
+            Arg::new("hfa")
+                .long("hfa")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("no-hfa")
+                .help("Enable HFA fast rail for this process (default: disabled)."),
+        )
+        .arg(
+            Arg::new("hfa-cpu")
+                .long("hfa-cpu")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(f64))
+                .help("HFA CPU low-water ratio used by mode control resume logic (default: 0.7)."),
+        )
+        .arg(
+            Arg::new("hfa-drift-ms")
+                .long("hfa-drift-ms")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("HFA max accepted clock drift window in milliseconds before correction/reject logic applies (default: 5000)."),
+        )
+        .arg(
+            Arg::new("hfa-microblock-interval-ms-normal")
+                .long("hfa-microblock-interval-ms-normal")
+                .require_equals(true)
+                .value_parser(clap::value_parser!(u64))
+                .help("HFA microblock interval in milliseconds while in normal mode (default: 50)."),
+        )
+        .arg(
+            Arg::new("no-hfa")
+                .long("no-hfa")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("hfa")
+                .help("Disable HFA fast rail for this process (overrides config)."),
+        )
+        .arg(
+            Arg::new("autoban")
+                .long("autoban")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("no-autoban")
+                .help("Enable automatic banning of repeatedly misbehaving peers (default: disabled)."),
+        )
+        .arg(
+            Arg::new("no-autoban")
+                .long("no-autoban")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("autoban")
+                .help("Disable automatic banning of repeatedly misbehaving peers (overrides config)."),
+        )
+        .arg(
+            Arg::new("banserver")
+                .long("banserver")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("no-banserver")
+                .help("Enable signed AntiFraud list synchronization from the primary seed endpoint (default: enabled)."),
+        )
+        .arg(
+            Arg::new("no-banserver")
+                .long("no-banserver")
+                .visible_alias("antifraud-no-seed")
+                .action(ArgAction::SetTrue)
+                .conflicts_with("banserver")
+                .help("Disable the AntiFraud seed endpoint and use peer-majority snapshots only (overrides config)."),
         )
         .arg(arg!(--"disable-upnp" "Disable upnp"))
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers"))
@@ -409,6 +661,35 @@ impl Args {
             })?;
         }
 
+        let hfa_enabled = if arg_match_unwrap_or::<bool>(&m, "hfa", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-hfa", false) {
+            false
+        } else {
+            defaults.hfa
+        };
+        let autoban_enabled = if arg_match_unwrap_or::<bool>(&m, "autoban", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-autoban", false) {
+            false
+        } else {
+            defaults.autoban
+        };
+        let banserver_enabled = if arg_match_unwrap_or::<bool>(&m, "banserver", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-banserver", false) {
+            false
+        } else {
+            defaults.banserver
+        };
+        let utxoindex_enabled = if arg_match_unwrap_or::<bool>(&m, "utxoindex", false) {
+            true
+        } else if arg_match_unwrap_or::<bool>(&m, "no-utxoindex", false) {
+            false
+        } else {
+            defaults.utxoindex
+        };
+
         let args = Args {
             appdir: m.get_one::<String>("appdir").cloned().or(defaults.appdir),
             logdir: m.get_one::<String>("logdir").cloned().or(defaults.logdir),
@@ -417,6 +698,18 @@ impl Args {
             rpclisten_borsh: m.get_one::<WrpcNetAddress>("rpclisten-borsh").cloned().or(defaults.rpclisten_borsh),
             rpclisten_json: m.get_one::<WrpcNetAddress>("rpclisten-json").cloned().or(defaults.rpclisten_json),
             unsafe_rpc: arg_match_unwrap_or::<bool>(&m, "unsaferpc", defaults.unsafe_rpc),
+            rpc_diagnostics: arg_match_unwrap_or::<bool>(&m, "rpc-diagnostics", defaults.rpc_diagnostics),
+            rpc_block_scan_cache: arg_match_unwrap_or::<bool>(&m, "rpc-block-scan-cache", defaults.rpc_block_scan_cache),
+            rpc_block_scan_cache_days: clamp_rpc_block_scan_cache_days(arg_match_unwrap_or::<f64>(
+                &m,
+                "rpc-block-scan-cache-days",
+                defaults.rpc_block_scan_cache_days,
+            )),
+            rpc_block_scan_cache_max_mb: arg_match_unwrap_or::<u64>(
+                &m,
+                "rpc-block-scan-cache-max-mb",
+                defaults.rpc_block_scan_cache_max_mb,
+            ),
             wrpc_verbose: false,
             log_level: arg_match_unwrap_or::<String>(&m, "log_level", defaults.log_level),
             async_threads: arg_match_unwrap_or::<usize>(&m, "async_threads", defaults.async_threads),
@@ -429,10 +722,41 @@ impl Args {
             max_tracked_addresses: arg_match_unwrap_or::<usize>(&m, "max-tracked-addresses", defaults.max_tracked_addresses),
             reset_db: arg_match_unwrap_or::<bool>(&m, "reset-db", defaults.reset_db),
             enable_unsynced_mining: arg_match_unwrap_or::<bool>(&m, "enable-unsynced-mining", defaults.enable_unsynced_mining),
+            startup_repair_plan: m.get_one::<String>("startup-repair-plan").cloned().or(defaults.startup_repair_plan),
             enable_mainnet_mining: arg_match_unwrap_or::<bool>(&m, "enable-mainnet-mining", defaults.enable_mainnet_mining),
-            utxoindex: arg_match_unwrap_or::<bool>(&m, "utxoindex", defaults.utxoindex),
+            utxoindex: utxoindex_enabled,
+            atomic_unsafe_skip_snapshot_finality_check: arg_match_unwrap_or::<bool>(
+                &m,
+                "atomic-unsafe-skip-snapshot-finality-check",
+                defaults.atomic_unsafe_skip_snapshot_finality_check,
+            ),
+            atomic_bootstrap_peers: arg_match_many_unwrap_or::<ContextualNetAddress>(
+                &m,
+                "atomic-bootstrap-peer",
+                defaults.atomic_bootstrap_peers,
+            ),
+            disable_atomic_seed_sources: arg_match_unwrap_or::<bool>(&m, "no-atomic-seed", defaults.disable_atomic_seed_sources),
+            atomic_bootstrap_allow_peer_fallback: arg_match_unwrap_or::<bool>(
+                &m,
+                "atomic-bootstrap-allow-peer-fallback",
+                defaults.atomic_bootstrap_allow_peer_fallback,
+            ),
+            atomic_bootstrap_peer_quorum_min_sources: m
+                .get_one::<usize>("atomic-bootstrap-peer-quorum-min-sources")
+                .copied()
+                .or(defaults.atomic_bootstrap_peer_quorum_min_sources),
+            disable_atomic_health_audit: arg_match_unwrap_or::<bool>(
+                &m,
+                "disable-atomic-health-audit",
+                defaults.disable_atomic_health_audit,
+            ),
+            atomic_health_audit_interval_minutes: arg_match_unwrap_or::<u64>(
+                &m,
+                "atomic-health-audit-interval-minutes",
+                defaults.atomic_health_audit_interval_minutes,
+            ),
             testnet: arg_match_unwrap_or::<bool>(&m, "testnet", defaults.testnet),
-            testnet_suffix: arg_match_unwrap_or::<u32>(&m, "netsuffix", defaults.testnet_suffix),
+            testnet_suffix: defaults.testnet_suffix,
             devnet: arg_match_unwrap_or::<bool>(&m, "devnet", defaults.devnet),
             simnet: arg_match_unwrap_or::<bool>(&m, "simnet", defaults.simnet),
             archival: arg_match_unwrap_or::<bool>(&m, "archival", defaults.archival),
@@ -444,6 +768,30 @@ impl Args {
             perf_metrics_interval_sec: arg_match_unwrap_or::<u64>(&m, "perf-metrics-interval-sec", defaults.perf_metrics_interval_sec),
             // Note: currently used programmatically by benchmarks and not exposed to CLI users
             block_template_cache_lifetime: defaults.block_template_cache_lifetime,
+            tx_relay_broadcast_interval_ms: arg_match_unwrap_or::<u64>(
+                &m,
+                "tx-relay-broadcast-interval-ms",
+                defaults.tx_relay_broadcast_interval_ms,
+            ),
+            datacenter: arg_match_unwrap_or::<bool>(&m, "datacenter", defaults.datacenter),
+            hfa: hfa_enabled,
+            hfa_cpu: arg_match_unwrap_or::<f64>(&m, "hfa-cpu", defaults.hfa_cpu),
+            hfa_drift_ms: arg_match_unwrap_or::<u64>(&m, "hfa-drift-ms", defaults.hfa_drift_ms),
+            hfa_microblock_interval_ms_normal: arg_match_unwrap_or::<u64>(
+                &m,
+                "hfa-microblock-interval-ms-normal",
+                defaults.hfa_microblock_interval_ms_normal,
+            ),
+            autoban: autoban_enabled,
+            banserver: banserver_enabled,
+            coinbase_maturity_override: m
+                .get_one::<u64>("coinbase-maturity-override")
+                .copied()
+                .or(defaults.coinbase_maturity_override),
+            payload_hf_activation_daa_score: m
+                .get_one::<u64>("payload-hf-activation-daa-score")
+                .copied()
+                .or(defaults.payload_hf_activation_daa_score),
             disable_upnp: arg_match_unwrap_or::<bool>(&m, "disable-upnp", defaults.disable_upnp),
             disable_dns_seeding: arg_match_unwrap_or::<bool>(&m, "nodnsseed", defaults.disable_dns_seeding),
             disable_grpc: arg_match_unwrap_or::<bool>(&m, "nogrpc", defaults.disable_grpc),
@@ -478,86 +826,129 @@ fn arg_match_many_unwrap_or<T: Clone + Send + Sync + 'static>(m: &clap::ArgMatch
     }
 }
 
-/*
+fn clamp_rpc_block_scan_cache_days(days: f64) -> f64 {
+    if days.is_finite() {
+        days.clamp(0.1, 7.0)
+    } else {
+        1.0
+    }
+}
 
-  -V, --version                             Display version information and exit
-  -C, --configfile=                         Path to configuration file (default: /Users/aspect/Library/Application
-                                            Support/Cryptixd/cryptixd.conf)
-  -b, --appdir=                             Directory to store data (default: /Users/aspect/Library/Application
-                                            Support/Cryptixd)
-      --logdir=                             Directory to log output.
-  -a, --addpeer=                            Add a peer to connect with at startup
-      --connect=                            Connect only to the specified peers at startup
-      --nolisten                            Disable listening for incoming connections -- NOTE: Listening is
-                                            automatically disabled if the --connect or --proxy options are used
-                                            without also specifying listen interfaces via --listen
-      --listen=                             Add an interface/port to listen for connections (default all interfaces
-                                            port: 19101, testnet: 19102)
-      --outpeers=                           Target number of outbound peers (default: 8)
-      --maxinpeers=                         Max number of inbound peers (default: 117)
-      --enablebanning                       Enable banning of misbehaving peers
-      --banduration=                        How long to ban misbehaving peers. Valid time units are {s, m, h}. Minimum
-                                            1 second (default: 24h0m0s)
-      --banthreshold=                       Maximum allowed ban score before disconnecting and banning misbehaving
-                                            peers. (default: 100)
-      --whitelist=                          Add an IP network or IP that will not be banned. (eg. 192.168.1.0/24 or
-                                            ::1)
-      --rpclisten=                          Add an interface/port to listen for RPC connections (default port: 19201,
-                                            testnet: 19202)
-      --rpccert=                            File containing the certificate file (default:
-                                            /Users/aspect/Library/Application Support/Cryptixd/rpc.cert)
-      --rpckey=                             File containing the certificate key (default:
-                                            /Users/aspect/Library/Application Support/Cryptixd/rpc.key)
-      --rpcmaxclients=                      Max number of RPC clients for standard connections (default: 128)
-      --rpcmaxwebsockets=                   Max number of RPC websocket connections (default: 25)
-      --rpcmaxconcurrentreqs=               Max number of concurrent RPC requests that may be processed concurrently
-                                            (default: 20)
-      --norpc                               Disable built-in RPC server
-      --saferpc                             Disable RPC commands which affect the state of the node
-      --nodnsseed                           Disable DNS seeding for peers
-      --dnsseed=                            Override DNS seeds with specified hostname (Only 1 hostname allowed)
-      --grpcseed=                           Hostname of gRPC server for seeding peers
-      --externalip=                         Add an ip to the list of local addresses we claim to listen on to peers
-      --proxy=                              Connect via SOCKS5 proxy (eg. 127.0.0.1:9050)
-      --proxyuser=                          Username for proxy server
-      --proxypass=                          Password for proxy server
-      --dbtype=                             Database backend to use for the Block DAG
-      --profile=                            Enable HTTP profiling on given port -- NOTE port must be between 1024 and
-                                            65536
-  -d, --loglevel=                           Logging level for all subsystems {trace, debug, info, warn, error,
-                                            critical} -- You may also specify
-                                            <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for
-                                            individual subsystems -- Use show to list available subsystems (default:
-                                            info)
-      --upnp                                Use UPnP to map our listening port outside of NAT
-      --minrelaytxfee=                      The minimum transaction fee in CPAY/kB to be considered a non-zero fee.
-                                            (default: 1e-05)
-      --maxorphantx=                        Max number of orphan transactions to keep in memory (default: 100)
-      --blockmaxmass=                       Maximum transaction mass to be used when creating a block (default:
-                                            10000000)
-      --uacomment=                          Comment to add to the user agent -- See BIP 14 for more information.
-      --nopeerbloomfilters                  Disable bloom filtering support
-      --sigcachemaxsize=                    The maximum number of entries in the signature verification cache
-                                            (default: 100000)
-      --blocksonly                          Do not accept transactions from remote peers.
-      --relaynonstd                         Relay non-standard transactions regardless of the default settings for the
-                                            active network.
-      --rejectnonstd                        Reject non-standard transactions regardless of the default settings for
-                                            the active network.
-      --reset-db                            Reset database before starting node. It's needed when switching between
-                                            subnetworks.
-      --maxutxocachesize=                   Max size of loaded UTXO into ram from the disk in bytes (default:
-                                            5000000000)
-      --utxoindex                           Enable the UTXO index
-      --archival                            Run as an archival node: don't delete old block data when moving the
-                                            pruning point (Warning: heavy disk usage)'
-      --protocol-version=                   Use non default p2p protocol version (default: 5)
-      --enable-unsynced-mining              Allow the node to accept blocks from RPC while not synced
-                                            (required when initiating a new network from genesis)
-      --testnet                             Use the test network
-      --simnet                              Use the simulation test network
-      --devnet                              Use the development test network
-      --override-dag-params-file=           Overrides DAG params (allowed only on devnet)
-  -s, --service=                            Service command {install, remove, start, stop}
-      --nogrpc                              Don't initialize the gRPC server
-*/
+#[cfg(test)]
+mod tests {
+    use super::Args;
+
+    #[test]
+    fn banserver_is_enabled_by_default() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(args.banserver);
+    }
+
+    #[test]
+    fn no_banserver_flag_disables_seed_fetch() {
+        let args = Args::parse(["cryptixd", "--no-banserver"]).expect("flag args should parse");
+        assert!(!args.banserver);
+    }
+
+    #[test]
+    fn antifraud_no_seed_alias_disables_seed_fetch() {
+        let args = Args::parse(["cryptixd", "--antifraud-no-seed"]).expect("alias args should parse");
+        assert!(!args.banserver);
+    }
+
+    #[test]
+    fn atomic_bootstrap_peer_quorum_min_sources_parses() {
+        let args =
+            Args::parse(["cryptixd", "--atomic-bootstrap-peer-quorum-min-sources=1"]).expect("quorum override args should parse");
+        assert_eq!(args.atomic_bootstrap_peer_quorum_min_sources, Some(1));
+    }
+
+    #[test]
+    fn no_atomic_seed_disables_only_atomic_seed_sources() {
+        let args = Args::parse(["cryptixd", "--no-atomic-seed"]).expect("atomic seed flag args should parse");
+        assert!(args.disable_atomic_seed_sources);
+        assert!(!args.disable_dns_seeding);
+    }
+
+    #[test]
+    fn atomic_bootstrap_no_seed_alias_parses() {
+        let args = Args::parse(["cryptixd", "--atomic-bootstrap-no-seed"]).expect("atomic seed alias args should parse");
+        assert!(args.disable_atomic_seed_sources);
+        assert!(!args.disable_dns_seeding);
+    }
+
+    #[test]
+    fn utxoindex_is_enabled_by_default() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(args.utxoindex);
+    }
+
+    #[test]
+    fn no_utxoindex_flag_disables_index() {
+        let args = Args::parse(["cryptixd", "--no-utxoindex"]).expect("flag args should parse");
+        assert!(!args.utxoindex);
+    }
+
+    #[test]
+    fn atomic_bootstrap_peer_quorum_alias_parses() {
+        let args = Args::parse(["cryptixd", "--atomic-bootstrap-peer-quorum=2"]).expect("quorum alias args should parse");
+        assert_eq!(args.atomic_bootstrap_peer_quorum_min_sources, Some(2));
+    }
+
+    #[test]
+    fn atomic_health_audit_defaults_to_three_minutes() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(!args.disable_atomic_health_audit);
+        assert_eq!(args.atomic_health_audit_interval_minutes, 3);
+    }
+
+    #[test]
+    fn atomic_health_audit_flags_parse() {
+        let args = Args::parse(["cryptixd", "--disable-atomic-health-audit", "--atomic-health-audit-interval-minutes=7"])
+            .expect("health audit args should parse");
+        assert!(args.disable_atomic_health_audit);
+        assert_eq!(args.atomic_health_audit_interval_minutes, 7);
+    }
+
+    #[test]
+    fn startup_repair_plan_parses() {
+        let args = Args::parse(["cryptixd", "--startup-repair-plan=repair.json"]).expect("repair plan args should parse");
+        assert_eq!(args.startup_repair_plan.as_deref(), Some("repair.json"));
+    }
+
+    #[test]
+    fn rpc_diagnostics_is_opt_in() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(!args.rpc_diagnostics);
+
+        let args = Args::parse(["cryptixd", "--rpc-diagnostics"]).expect("diagnostics args should parse");
+        assert!(args.rpc_diagnostics);
+    }
+
+    #[test]
+    fn rpc_block_scan_cache_is_opt_in_with_defaults() {
+        let args = Args::parse(["cryptixd"]).expect("default args should parse");
+        assert!(!args.rpc_block_scan_cache);
+        assert_eq!(args.rpc_block_scan_cache_days, 1.0);
+        assert_eq!(args.rpc_block_scan_cache_max_mb, 1024);
+
+        let args = Args::parse(["cryptixd", "--rpc-block-scan-cache"]).expect("cache args should parse");
+        assert!(args.rpc_block_scan_cache);
+        assert_eq!(args.rpc_block_scan_cache_days, 1.0);
+        assert_eq!(args.rpc_block_scan_cache_max_mb, 1024);
+    }
+
+    #[test]
+    fn rpc_block_scan_cache_values_parse() {
+        let args = Args::parse([
+            "cryptixd",
+            "--rpc-block-scan-cache",
+            "--rpc-block-scan-cache-days=0.5",
+            "--rpc-block-scan-cache-max-mb=256",
+        ])
+        .expect("cache value args should parse");
+        assert!(args.rpc_block_scan_cache);
+        assert_eq!(args.rpc_block_scan_cache_days, 0.5);
+        assert_eq!(args.rpc_block_scan_cache_max_mb, 256);
+    }
+}

@@ -33,6 +33,12 @@ pub enum RuleError {
     #[error("replace by fee found more than one double spending transaction in the mempool")]
     RejectRbfTooManyDoubleSpendingTransactions,
 
+    #[error("transaction {0} is a CAT transaction or conflicts with a pending CAT transaction, so replace-by-fee is disabled")]
+    RejectAtomicReplaceByFee(TransactionId),
+
+    #[error("transaction {0} conflicts with pending CAT transaction {1} on atomic slot {2}")]
+    RejectAtomicSlotConflict(TransactionId, TransactionId, String),
+
     /// a transaction is rejected if the mempool is full
     #[error("transaction could not be added to the mempool because it's full with transactions with higher priority")]
     RejectMempoolIsFull,
@@ -112,6 +118,9 @@ pub enum NonStandardError {
     #[error("transaction mass in context (including storage mass) of {1} is larger than max allowed size of {2}")]
     RejectContextualMass(TransactionId, u64, u64),
 
+    #[error("transaction payload length of {1} bytes is larger than max allowed size of {2} bytes")]
+    RejectPayloadLength(TransactionId, usize, usize),
+
     #[error("transaction input #{1}: signature script size of {2} bytes is larger than the maximum allowed size of {3} bytes")]
     RejectSignatureScriptSize(TransactionId, usize, u64, u64),
 
@@ -140,6 +149,7 @@ impl NonStandardError {
             NonStandardError::RejectVersion(id, _, _, _) => id,
             NonStandardError::RejectMass(id, _, _) => id,
             NonStandardError::RejectContextualMass(id, _, _) => id,
+            NonStandardError::RejectPayloadLength(id, _, _) => id,
             NonStandardError::RejectSignatureScriptSize(id, _, _, _) => id,
             NonStandardError::RejectScriptPublicKeyVersion(id, _) => id,
             NonStandardError::RejectOutputScriptClass(id, _) => id,

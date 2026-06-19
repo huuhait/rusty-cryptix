@@ -10,7 +10,7 @@ impl PowHash {
     // The initial state of `cSHAKE256("ProofOfWorkHash")`
     // [10] -> 1123092876221303310 ^ 0x04(padding byte) = 1123092876221303306
     // [16] -> 10306167911662716186 ^ 0x8000000000000000(final padding) = 1082795874807940378
-    
+
     #[rustfmt::skip]
     const INITIAL_STATE: [u64; 25] = [
         1242148031264380989, 3008272977830772284, 2188519011337848018, 1992179434288343456, 8876506674959887717,
@@ -33,18 +33,17 @@ impl PowHash {
     // #[inline(always)]
     // pub fn finalize_with_nonce(mut self, nonce: u64) -> Hash {
     //     self.0[9] ^= nonce;
-    
 
     //     keccak256::f1600(&mut self.0);
-    
+
     //     // Hello ASICs - try to eat this.
     //     // Info: Cryptix will never accept or support ASICs. This is just the first step. In the future, multiple iterations may be added, or even other algorithms,
-    //     // up to the potential integration of RandomX. So don't waste your time and money building an ASIC miner, it won't even work for a week, and the algorithm will 
+    //     // up to the potential integration of RandomX. So don't waste your time and money building an ASIC miner, it won't even work for a week, and the algorithm will
     //     //be changed as soon as there is even a suspicion of ASIC involvement.
 
-    //     let mut second_hash = self.0.clone();  
-    //     keccak256::f1600(&mut second_hash);  
-    
+    //     let mut second_hash = self.0.clone();
+    //     keccak256::f1600(&mut second_hash);
+
     //     Hash::from_le_u64(second_hash[..4].try_into().unwrap())
     // }
 
@@ -54,9 +53,7 @@ impl PowHash {
         keccak256::f1600(&mut self.0);
         Hash::from_le_u64(self.0[..4].try_into().unwrap())
     }
-    
 }
-
 
 impl CryptixHashV2 {
     // The initial state of `cSHAKE256("HeavyHash")`

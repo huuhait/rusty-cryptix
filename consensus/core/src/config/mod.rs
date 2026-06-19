@@ -10,7 +10,7 @@ use crate::utxo::utxo_collection::UtxoCollection;
 #[cfg(feature = "devnet-prealloc")]
 use std::sync::Arc;
 
-use std::ops::Deref;
+use std::{ops::Deref, path::PathBuf};
 
 use {
     constants::perf::{PerfParams, PERF_PARAMS},
@@ -41,13 +41,30 @@ pub struct Config {
     // TODO: move non-consensus parameters like utxoindex to a higher scoped Config
     /// Enable the UTXO index
     pub utxoindex: bool,
+    /// Unsafe/testing-only override: allow Atomic snapshot export/import without finality depth sanity check.
+    pub atomic_unsafe_skip_snapshot_finality_check: bool,
 
     /// Enable RPC commands which affect the state of the node
     pub unsafe_rpc: bool,
 
+    /// Enable opt-in RPC diagnostics logging for request volume and slow calls.
+    pub rpc_diagnostics: bool,
+
+    /// Enable opt-in RPC-side block/header response cache for wallet sync scans.
+    pub rpc_block_scan_cache: bool,
+
+    /// Number of recent days to keep eligible in the RPC block/header scan cache.
+    pub rpc_block_scan_cache_days: f64,
+
+    /// Approximate maximum RAM bytes used by the RPC block/header scan cache.
+    pub rpc_block_scan_cache_max_bytes: u64,
+
     /// Allow the node to accept blocks from RPC while not synced
     /// (required when initiating a new network from genesis)
     pub enable_unsynced_mining: bool,
+
+    /// Optional JSON startup database repair plan. Disabled unless explicitly configured.
+    pub startup_repair_plan_path: Option<PathBuf>,
 
     /// Allow mainnet mining. Until a stable Beta version we keep this option off by default
     pub enable_mainnet_mining: bool,
@@ -60,6 +77,9 @@ pub struct Config {
     pub externalip: Option<NetAddress>,
 
     pub block_template_cache_lifetime: Option<u64>,
+
+    /// Interval in milliseconds for batching mempool tx INV broadcasts.
+    pub tx_relay_broadcast_interval_ms: u64,
 
     #[cfg(feature = "devnet-prealloc")]
     pub initial_utxo_set: Arc<UtxoCollection>,
@@ -83,13 +103,20 @@ impl Config {
             is_archival: false,
             enable_sanity_checks: false,
             utxoindex: false,
+            atomic_unsafe_skip_snapshot_finality_check: false,
             unsafe_rpc: false,
+            rpc_diagnostics: false,
+            rpc_block_scan_cache: false,
+            rpc_block_scan_cache_days: 1.0,
+            rpc_block_scan_cache_max_bytes: 1024 * 1024 * 1024,
             enable_unsynced_mining: false,
+            startup_repair_plan_path: None,
             enable_mainnet_mining: false,
             user_agent_comments: Default::default(),
             externalip: None,
             p2p_listen_address: ContextualNetAddress::unspecified(),
             block_template_cache_lifetime: None,
+            tx_relay_broadcast_interval_ms: 250,
 
             #[cfg(feature = "devnet-prealloc")]
             initial_utxo_set: Default::default(),

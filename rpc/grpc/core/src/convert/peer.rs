@@ -17,8 +17,14 @@ from!(item: &cryptix_rpc_core::RpcPeerInfo, protowire::GetConnectedPeerInfoMessa
         time_offset: item.time_offset,
         user_agent: item.user_agent.clone(),
         advertised_protocol_version: item.advertised_protocol_version,
+        advertised_services: item.advertised_services,
+        is_hfa_fastchain: item.is_hfa_fastchain,
+        is_cryptix_atomic: item.is_cryptix_atomic,
+        is_strong_node_claims: item.is_strong_node_claims,
+        is_archival: item.is_archival,
         time_connected: item.time_connected as i64,
         is_ibd_peer: item.is_ibd_peer,
+        unified_node_id: item.unified_node_id.clone().unwrap_or_default(),
     }
 });
 
@@ -38,8 +44,14 @@ try_from!(item: &protowire::GetConnectedPeerInfoMessage, cryptix_rpc_core::RpcPe
         time_offset: item.time_offset,
         user_agent: item.user_agent.clone(),
         advertised_protocol_version: item.advertised_protocol_version,
+        advertised_services: item.advertised_services,
+        is_hfa_fastchain: item.is_hfa_fastchain,
+        is_cryptix_atomic: item.is_cryptix_atomic,
+        is_strong_node_claims: item.is_strong_node_claims,
+        is_archival: item.is_archival,
         time_connected: item.time_connected as u64,
         is_ibd_peer: item.is_ibd_peer,
+        unified_node_id: if item.unified_node_id.is_empty() { None } else { Some(item.unified_node_id.clone()) },
     }
 });
 

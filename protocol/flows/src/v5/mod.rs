@@ -1,18 +1,23 @@
 use self::{
     address::{ReceiveAddressesFlow, SendAddressesFlow},
     blockrelay::{flow::HandleRelayInvsFlow, handle_requests::HandleRelayBlockRequests},
+    hfa::{FastIntentRelayFlow, RequestFastIntentsFlow},
     ibd::IbdFlow,
     ping::{ReceivePingsFlow, SendPingsFlow},
     request_antipast::HandleAntipastRequests,
+    request_atomic_token_state_hash::RequestAtomicTokenStateHashFlow,
     request_block_locator::RequestBlockLocatorFlow,
+    request_consensus_atomic_state_hash::RequestConsensusAtomicStateHashFlow,
     request_headers::RequestHeadersFlow,
     request_ibd_blocks::HandleIbdBlockRequests,
     request_ibd_chain_block_locator::RequestIbdChainBlockLocatorFlow,
     request_pp_proof::RequestPruningPointProofFlow,
     request_pruning_point_and_anticone::PruningPointAndItsAnticoneRequestsFlow,
     request_pruning_point_utxo_set::RequestPruningPointUtxoSetFlow,
+    strong_node_claims::StrongNodeClaimsRelayFlow,
     txrelay::flow::{RelayTransactionsFlow, RequestTransactionsFlow},
 };
+use crate::antifraud::{AntiFraudSnapshotRequestsFlow, AntiFraudSnapshotSyncFlow};
 use crate::{flow_context::FlowContext, flow_trait::Flow};
 
 use cryptix_p2p_lib::{CryptixdMessagePayloadType, Router, SharedIncomingRoute};
@@ -21,23 +26,27 @@ use std::sync::Arc;
 
 pub(crate) mod address;
 pub(crate) mod blockrelay;
+pub(crate) mod hfa;
 pub(crate) mod ibd;
 pub(crate) mod ping;
 pub(crate) mod request_antipast;
+pub(crate) mod request_atomic_token_state_hash;
 pub(crate) mod request_block_locator;
+pub(crate) mod request_consensus_atomic_state_hash;
 pub(crate) mod request_headers;
 pub(crate) mod request_ibd_blocks;
 pub(crate) mod request_ibd_chain_block_locator;
 pub(crate) mod request_pp_proof;
 pub(crate) mod request_pruning_point_and_anticone;
 pub(crate) mod request_pruning_point_utxo_set;
+pub(crate) mod strong_node_claims;
 pub(crate) mod txrelay;
 
-pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
+pub fn register(ctx: FlowContext, router: Arc<Router>, hfa_capable: bool, strong_node_claims_capable: bool) -> Vec<Box<dyn Flow>> {
     // IBD flow <-> invs flow communication uses a job channel in order to always
     // maintain at most a single pending job which can be updated
     let (ibd_sender, relay_receiver) = channel::job();
-    let flows: Vec<Box<dyn Flow>> = vec![
+    let mut flows: Vec<Box<dyn Flow>> = vec![
         Box::new(IbdFlow::new(
             ctx.clone(),
             router.clone(),
@@ -51,6 +60,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
                 CryptixdMessagePayloadType::IbdChainBlockLocator,
                 CryptixdMessagePayloadType::IbdBlock,
                 CryptixdMessagePayloadType::TrustedData,
+                CryptixdMessagePayloadType::TrustedAtomicStateChunk,
                 CryptixdMessagePayloadType::PruningPoints,
                 CryptixdMessagePayloadType::PruningPointProof,
                 CryptixdMessagePayloadType::UnexpectedPruningPoint,
@@ -75,6 +85,16 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
         )),
         Box::new(ReceivePingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Ping]))),
         Box::new(SendPingsFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Pong]))),
+        Box::new(AntiFraudSnapshotRequestsFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestAntiFraudSnapshotV1]),
+        )),
+        Box::new(AntiFraudSnapshotSyncFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe_with_capacity(vec![CryptixdMessagePayloadType::AntiFraudSnapshotV1], 64),
+        )),
         Box::new(RequestHeadersFlow::new(
             ctx.clone(),
             router.clone(),
@@ -84,6 +104,16 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestPruningPointProof]),
+        )),
+        Box::new(RequestConsensusAtomicStateHashFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestConsensusAtomicStateHash]),
+        )),
+        Box::new(RequestAtomicTokenStateHashFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestAtomicTokenStateHash]),
         )),
         Box::new(RequestIbdChainBlockLocatorFlow::new(
             ctx.clone(),
@@ -96,6 +126,7 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             router.subscribe(vec![
                 CryptixdMessagePayloadType::RequestPruningPointAndItsAnticone,
                 CryptixdMessagePayloadType::RequestNextPruningPointAndItsAnticoneBlocks,
+                CryptixdMessagePayloadType::RequestNextPruningPointAtomicStateChunk,
             ]),
         )),
         Box::new(RequestPruningPointUtxoSetFlow::new(
@@ -119,8 +150,10 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
         Box::new(RelayTransactionsFlow::new(
             ctx.clone(),
             router.clone(),
-            router
-                .subscribe_with_capacity(vec![CryptixdMessagePayloadType::InvTransactions], RelayTransactionsFlow::invs_channel_size()),
+            router.subscribe_with_capacity(
+                vec![CryptixdMessagePayloadType::InvTransactions],
+                RelayTransactionsFlow::invs_channel_size(),
+            ),
             router.subscribe_with_capacity(
                 vec![CryptixdMessagePayloadType::Transaction, CryptixdMessagePayloadType::TransactionNotFound],
                 RelayTransactionsFlow::txs_channel_size(),
@@ -131,18 +164,46 @@ pub fn register(ctx: FlowContext, router: Arc<Router>) -> Vec<Box<dyn Flow>> {
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestTransactions]),
         )),
-        Box::new(ReceiveAddressesFlow::new(ctx.clone(), router.clone(), router.subscribe(vec![CryptixdMessagePayloadType::Addresses]))),
+        Box::new(ReceiveAddressesFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::Addresses]),
+        )),
         Box::new(SendAddressesFlow::new(
             ctx.clone(),
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestAddresses]),
         )),
         Box::new(RequestBlockLocatorFlow::new(
-            ctx,
+            ctx.clone(),
             router.clone(),
             router.subscribe(vec![CryptixdMessagePayloadType::RequestBlockLocator]),
         )),
     ];
+
+    if hfa_capable {
+        flows.push(Box::new(FastIntentRelayFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe_with_capacity(
+                vec![CryptixdMessagePayloadType::FastIntent, CryptixdMessagePayloadType::FastMicroblock],
+                1024,
+            ),
+        )));
+        flows.push(Box::new(RequestFastIntentsFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe(vec![CryptixdMessagePayloadType::RequestFastIntents]),
+        )));
+    }
+
+    if strong_node_claims_capable {
+        flows.push(Box::new(StrongNodeClaimsRelayFlow::new(
+            ctx.clone(),
+            router.clone(),
+            router.subscribe_with_capacity(vec![CryptixdMessagePayloadType::BlockProducerClaimV1], 2048),
+        )));
+    }
 
     // The reject message is handled as a special case by the router
     // CryptixdMessagePayloadType::Reject,

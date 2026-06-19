@@ -1,3 +1,5 @@
+pub mod block_scan_cache;
 pub mod collector;
 pub mod converter;
+pub mod hfa;
 pub mod service;

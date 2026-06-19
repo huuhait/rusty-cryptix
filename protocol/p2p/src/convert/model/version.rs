@@ -18,6 +18,11 @@ pub struct Version {
     pub user_agent: String,
     pub disable_relay_tx: bool,
     pub subnetwork_id: Option<SubnetworkId>,
+    pub anti_fraud_hashes: Vec<[u8; 32]>,
+    pub node_pubkey_xonly: Option<[u8; 32]>,
+    pub node_pow_nonce: Option<u64>,
+    pub node_challenge_nonce: Option<u64>,
+    pub pq_ml_kem1024_pubkey: Option<Vec<u8>>,
 }
 
 impl Version {
@@ -38,6 +43,11 @@ impl Version {
             user_agent: format!("/{}:{}/", name(), version()),
             disable_relay_tx: false,
             subnetwork_id,
+            anti_fraud_hashes: Vec::new(),
+            node_pubkey_xonly: None,
+            node_pow_nonce: None,
+            node_challenge_nonce: None,
+            pq_ml_kem1024_pubkey: None,
         }
     }
 

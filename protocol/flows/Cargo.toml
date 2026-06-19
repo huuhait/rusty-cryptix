@@ -10,6 +10,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+cryptix-alloc.workspace = true
 cryptix-core.workspace = true
 cryptix-consensus-core.workspace = true
 cryptix-consensus-notify.workspace = true
@@ -36,3 +37,13 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 tokio-stream = { workspace = true, features = ["net"] }
 uuid = { workspace = true, features = ["v4", "fast-rng"] }
 chrono.workspace = true
+blake3.workspace = true
+borsh.workspace = true
+hex.workspace = true
+secp256k1.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+prost.workspace = true
+sha2.workspace = true
+kem.workspace = true
+ml-kem.workspace = true

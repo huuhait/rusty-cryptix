@@ -2,6 +2,7 @@ pub mod cache_policy_builder;
 pub mod ctl;
 pub mod factory;
 pub mod services;
+mod startup_repair;
 pub mod storage;
 pub mod test_consensus;
 
@@ -24,6 +25,7 @@ use crate::{
             relations::RelationsStoreReader,
             statuses::StatusesStoreReader,
             tips::TipsStoreReader,
+            utxo_diffs::UtxoDiffsStoreReader,
             utxo_set::{UtxoSetStore, UtxoSetStoreReader},
             DB,
         },
@@ -64,9 +66,10 @@ use cryptix_consensus_core::{
     merkle::calc_hash_merkle_root,
     muhash::MuHashExtensions,
     network::NetworkType,
-    pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
+    pruning::{PruningPointAtomicState, PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
+    utxo::utxo_diff::UtxoDiff,
     BlockHashSet, BlueWorkType, ChainPath, HashMapCustomHasher,
 };
 use cryptix_consensus_notify::root::ConsensusNotificationRoot;
@@ -74,8 +77,8 @@ use cryptix_consensus_notify::root::ConsensusNotificationRoot;
 use crossbeam_channel::{
     bounded as bounded_crossbeam, unbounded as unbounded_crossbeam, Receiver as CrossbeamReceiver, Sender as CrossbeamSender,
 };
-use itertools::Itertools;
 use cryptix_consensusmanager::{SessionLock, SessionReadGuard};
+use itertools::Itertools;
 
 use cryptix_database::prelude::StoreResultExtensions;
 use cryptix_hashes::Hash;
@@ -157,6 +160,7 @@ impl Consensus {
         counters: Arc<ProcessingCounters>,
         tx_script_cache_counters: Arc<TxScriptCacheCounters>,
         creation_timestamp: u64,
+        enable_periodic_atomic_consensus_log: bool,
     ) -> Self {
         let params = &config.params;
         let perf_params = &config.perf;
@@ -271,6 +275,7 @@ impl Consensus {
             pruning_lock.clone(),
             notification_root.clone(),
             counters.clone(),
+            enable_periodic_atomic_consensus_log,
         ));
 
         let pruning_processor = Arc::new(PruningProcessor::new(
@@ -293,6 +298,11 @@ impl Consensus {
             header_processor.process_genesis();
             body_processor.process_genesis();
             virtual_processor.process_genesis();
+        }
+
+        if let Some(path) = config.startup_repair_plan_path.as_ref() {
+            startup_repair::apply_startup_repair_plan(&db, &storage, &virtual_processor, path)
+                .unwrap_or_else(|err| panic!("startup database repair failed: {err}"));
         }
 
         Self {
@@ -644,9 +654,7 @@ impl ConsensusApi for Consensus {
 
         // Part 1: Add samples from pruning point headers:
         if self.config.net.network_type == NetworkType::Mainnet {
-            const POINTS: &[DaaScoreTimestamp] = &[
-                DaaScoreTimestamp { daa_score: 0, timestamp: 1735689600000 },
-            ];
+            const POINTS: &[DaaScoreTimestamp] = &[DaaScoreTimestamp { daa_score: 0, timestamp: 1735689600000 }];
             sample_headers = Vec::<DaaScoreTimestamp>::with_capacity(prealloc_len + POINTS.len());
             sample_headers.extend_from_slice(POINTS);
         } else {
@@ -756,6 +764,26 @@ impl ConsensusApi for Consensus {
         for (outpoint, entry) in utxoset_chunk {
             current_multiset.add_utxo(outpoint, entry);
         }
+    }
+
+    fn import_pruning_point_atomic_state(
+        &self,
+        new_pruning_point: Hash,
+        atomic_state: PruningPointAtomicState,
+    ) -> PruningImportResult<()> {
+        self.virtual_processor.import_pruning_point_atomic_state(new_pruning_point, atomic_state)
+    }
+
+    fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        self.virtual_processor.get_atomic_state_hash(block_hash)
+    }
+
+    fn get_atomic_state_bytes(&self, block_hash: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        self.virtual_processor.get_atomic_state_bytes(block_hash)
+    }
+
+    fn get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        self.virtual_processor.get_atomic_p2p_token_audit_hash(block_hash)
     }
 
     fn import_pruning_point_utxo_set(&self, new_pruning_point: Hash, imported_utxo_multiset: MuHash) -> PruningImportResult<()> {
@@ -906,6 +934,10 @@ impl ConsensusApi for Consensus {
 
     fn get_block_acceptance_data(&self, hash: Hash) -> ConsensusResult<Arc<AcceptanceData>> {
         self.acceptance_data_store.get(hash).unwrap_option().ok_or(ConsensusError::MissingData(hash))
+    }
+
+    fn get_block_utxo_diff(&self, hash: Hash) -> ConsensusResult<Arc<UtxoDiff>> {
+        self.utxo_diffs_store.get(hash).unwrap_option().ok_or(ConsensusError::MissingData(hash))
     }
 
     fn get_blocks_acceptance_data(

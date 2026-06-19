@@ -46,6 +46,18 @@ pub enum CryptixdMessagePayloadType {
     IbdChainBlockLocator,
     RequestAntipast,
     RequestNextPruningPointAndItsAnticoneBlocks,
+    RequestFastIntents,
+    FastIntent,
+    FastMicroblock,
+    RequestAntiFraudSnapshotV1,
+    AntiFraudSnapshotV1,
+    BlockProducerClaimV1,
+    TrustedAtomicStateChunk,
+    RequestNextPruningPointAtomicStateChunk,
+    RequestConsensusAtomicStateHash,
+    ConsensusAtomicStateHash,
+    RequestAtomicTokenStateHash,
+    AtomicTokenStateHash,
 }
 
 impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
@@ -81,7 +93,9 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             }
             CryptixdMessagePayload::BlockWithTrustedData(_) => CryptixdMessagePayloadType::BlockWithTrustedData,
             CryptixdMessagePayload::DoneBlocksWithTrustedData(_) => CryptixdMessagePayloadType::DoneBlocksWithTrustedData,
-            CryptixdMessagePayload::RequestPruningPointAndItsAnticone(_) => CryptixdMessagePayloadType::RequestPruningPointAndItsAnticone,
+            CryptixdMessagePayload::RequestPruningPointAndItsAnticone(_) => {
+                CryptixdMessagePayloadType::RequestPruningPointAndItsAnticone
+            }
             CryptixdMessagePayload::BlockHeaders(_) => CryptixdMessagePayloadType::BlockHeaders,
             CryptixdMessagePayload::RequestNextHeaders(_) => CryptixdMessagePayloadType::RequestNextHeaders,
             CryptixdMessagePayload::DoneHeaders(_) => CryptixdMessagePayloadType::DoneHeaders,
@@ -100,6 +114,20 @@ impl From<&CryptixdMessagePayload> for CryptixdMessagePayloadType {
             CryptixdMessagePayload::RequestNextPruningPointAndItsAnticoneBlocks(_) => {
                 CryptixdMessagePayloadType::RequestNextPruningPointAndItsAnticoneBlocks
             }
+            CryptixdMessagePayload::RequestFastIntents(_) => CryptixdMessagePayloadType::RequestFastIntents,
+            CryptixdMessagePayload::FastIntent(_) => CryptixdMessagePayloadType::FastIntent,
+            CryptixdMessagePayload::FastMicroblock(_) => CryptixdMessagePayloadType::FastMicroblock,
+            CryptixdMessagePayload::RequestAntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::RequestAntiFraudSnapshotV1,
+            CryptixdMessagePayload::AntiFraudSnapshotV1(_) => CryptixdMessagePayloadType::AntiFraudSnapshotV1,
+            CryptixdMessagePayload::BlockProducerClaimV1(_) => CryptixdMessagePayloadType::BlockProducerClaimV1,
+            CryptixdMessagePayload::TrustedAtomicStateChunk(_) => CryptixdMessagePayloadType::TrustedAtomicStateChunk,
+            CryptixdMessagePayload::RequestNextPruningPointAtomicStateChunk(_) => {
+                CryptixdMessagePayloadType::RequestNextPruningPointAtomicStateChunk
+            }
+            CryptixdMessagePayload::RequestConsensusAtomicStateHash(_) => CryptixdMessagePayloadType::RequestConsensusAtomicStateHash,
+            CryptixdMessagePayload::ConsensusAtomicStateHash(_) => CryptixdMessagePayloadType::ConsensusAtomicStateHash,
+            CryptixdMessagePayload::RequestAtomicTokenStateHash(_) => CryptixdMessagePayloadType::RequestAtomicTokenStateHash,
+            CryptixdMessagePayload::AtomicTokenStateHash(_) => CryptixdMessagePayloadType::AtomicTokenStateHash,
         }
     }
 }

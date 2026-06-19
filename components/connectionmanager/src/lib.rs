@@ -1,20 +1,27 @@
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
+    fs::{self, File},
+    io::Write,
     net::{IpAddr, SocketAddr, ToSocketAddrs},
+    path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use cryptix_addressmanager::{AddressManager, NetAddress};
+use cryptix_core::{debug, info, warn};
+use cryptix_p2p_lib::{common::ProtocolError, ConnectionError, Peer, PeerKey};
+use cryptix_utils::triggers::SingleTrigger;
 use duration_string::DurationString;
 use futures_util::future::{join_all, try_join_all};
 use itertools::Itertools;
-use cryptix_addressmanager::{AddressManager, NetAddress};
-use cryptix_core::{debug, info, warn};
-use cryptix_p2p_lib::{common::ProtocolError, ConnectionError, Peer};
-use cryptix_utils::triggers::SingleTrigger;
 use parking_lot::Mutex as ParkingLotMutex;
 use rand::{seq::SliceRandom, thread_rng};
+use reqwest::{redirect::Policy as RedirectPolicy, Client as HttpClient, Url as ParsedUrl};
+use secp256k1::{schnorr::Signature as SchnorrSignature, Message as SecpMessage, XOnlyPublicKey};
+use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tokio::{
     select,
     sync::{
@@ -24,16 +31,50 @@ use tokio::{
     time::{interval, MissedTickBehavior},
 };
 
+pub const DEFAULT_BANSERVER_URL: &str = "https://antifraud.cryptix-network.org/api/v1/antifraud/snapshot";
+pub const ANTI_FRAUD_ZERO_HASH: [u8; 32] = [0u8; 32];
+pub const ANTI_FRAUD_HASH_WINDOW_LEN: usize = 3;
+const LOCAL_UNIFIED_NODE_BAN_DURATION: Duration = Duration::from_secs(3 * 60 * 60);
+const BANSERVER_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const BANSERVER_CONSISTENCY_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+const BANSERVER_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const BANSERVER_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const BANSERVER_MAX_IPS: usize = 4096;
+const BANSERVER_MAX_IP_ENTRY_LEN: usize = 64;
+const BANSERVER_MAX_NODE_IDS: usize = 4096;
+const BANSERVER_NODE_ID_HEX_LEN: usize = 64;
+const BANSERVER_SIGNATURE_HEX_LEN: usize = 128;
+const BANSERVER_MAX_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+const BANSERVER_BANNED_CONNECTION_RETRY_DELAY: Duration = Duration::from_secs(60);
+const ANTI_FRAUD_DOMAIN_SEP: &[u8] = b"cryptix-antifraud-snapshot-v1";
+const ANTI_FRAUD_SCHEMA_VERSION: u8 = 1;
+const ANTI_FRAUD_PERSIST_DIR: &str = "antifraud";
+const ANTI_FRAUD_CURRENT_FILE: &str = "current.snapshot";
+const ANTI_FRAUD_PREVIOUS_FILE: &str = "previous.snapshot";
+const ANTI_FRAUD_PUBKEY_CURRENT_HEX: &str = "c93b4ed533a76866a3c3ea1cc0bc3e70c0dbe32a945057b5dff95b88ce9280dd";
+const ANTI_FRAUD_PUBKEY_NEXT_HEX: &str = "fc10777c57060195c83e9885c790c8a26496d305b366b8e5fbf475203c680f79";
+const PEER_CANDIDATE_MAX_AGE: Duration = Duration::from_secs(120);
+const PEER_CANDIDATE_MAX_SIZE: usize = 512;
+
 pub struct ConnectionManager {
     p2p_adaptor: Arc<cryptix_p2p_lib::Adaptor>,
     outbound_target: usize,
     inbound_limit: usize,
+    preferred_service_mask: u64,
     dns_seeders: &'static [&'static str],
     default_port: u16,
     address_manager: Arc<ParkingLotMutex<AddressManager>>,
     connection_requests: TokioMutex<HashMap<SocketAddr, ConnectionRequest>>,
     force_next_iteration: UnboundedSender<()>,
     shutdown_signal: SingleTrigger,
+    banserver_enabled: bool,
+    banserver_primary_url: String,
+    anti_fraud_network: AntiFraudNetwork,
+    anti_fraud_persist_dir: Option<PathBuf>,
+    anti_fraud_state: ParkingLotMutex<AntiFraudState>,
+    banserver_banned_ips: ParkingLotMutex<HashSet<IpAddr>>,
+    banserver_banned_strong_node_ids: ParkingLotMutex<HashSet<[u8; 32]>>,
+    locally_banned_unified_node_ids: ParkingLotMutex<HashMap<[u8; 32], Instant>>,
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +84,142 @@ struct ConnectionRequest {
     attempts: u32,
 }
 
+#[derive(Clone, Debug)]
+struct BanserverPayload {
+    enabled: bool,
+    snapshot: AntiFraudSnapshot,
+}
+
+#[derive(Debug)]
+enum BanserverFetchOutcome {
+    Enabled(BanserverPayload),
+    Unavailable,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum SeedServerFailureAction {
+    RetrySoon,
+    EnablePeerFallback,
+    KeepPeerFallback,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AntiFraudNetwork {
+    Mainnet = 0,
+    Testnet = 1,
+    Devnet = 2,
+    Simnet = 3,
+}
+
+impl AntiFraudNetwork {
+    pub fn from_network_name(name: &str) -> Option<Self> {
+        let lower = name.trim().to_ascii_lowercase();
+        if lower == "mainnet" || lower == "cryptix-mainnet" {
+            return Some(Self::Mainnet);
+        }
+        if lower == "testnet" || lower == "cryptix-testnet" || lower.starts_with("testnet-") || lower.starts_with("cryptix-testnet-") {
+            return Some(Self::Testnet);
+        }
+        if lower == "devnet" || lower == "cryptix-devnet" {
+            return Some(Self::Devnet);
+        }
+        if lower == "simnet" || lower == "cryptix-simnet" {
+            return Some(Self::Simnet);
+        }
+        None
+    }
+
+    fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Mainnet),
+            1 => Some(Self::Testnet),
+            2 => Some(Self::Devnet),
+            3 => Some(Self::Simnet),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AntiFraudSnapshotEnvelope {
+    pub schema_version: u8,
+    pub network: u8,
+    pub snapshot_seq: u64,
+    pub generated_at_ms: u64,
+    pub signing_key_id: u8,
+    pub banned_ips: Vec<Vec<u8>>,
+    pub banned_node_ids: Vec<Vec<u8>>,
+    pub signature: Vec<u8>,
+    pub antifraud_enabled: bool,
+}
+
+#[derive(Clone, Debug)]
+struct AntiFraudSnapshot {
+    schema_version: u8,
+    network: AntiFraudNetwork,
+    snapshot_seq: u64,
+    generated_at_ms: u64,
+    signing_key_id: u8,
+    antifraud_enabled: bool,
+    banned_ip_entries: Vec<Vec<u8>>,
+    banned_node_id_entries: Vec<[u8; 32]>,
+    signature: [u8; 64],
+    root_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedSnapshotV1 {
+    schema_version: u8,
+    network: u8,
+    snapshot_seq: u64,
+    generated_at_ms: u64,
+    signing_key_id: u8,
+    #[serde(default = "default_antifraud_enabled")]
+    antifraud_enabled: bool,
+    banned_ips: Vec<String>,
+    banned_node_ids: Vec<String>,
+    signature: String,
+}
+
+fn default_antifraud_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Debug)]
+struct PeerSnapshotVote {
+    received_at: Instant,
+    snapshot: AntiFraudSnapshot,
+}
+
+#[derive(Clone, Debug)]
+pub struct IngestPeerSnapshotResult {
+    pub applied: bool,
+    pub root_hash: [u8; 32],
+}
+
+#[derive(Debug)]
+struct AntiFraudState {
+    runtime_enabled: bool,
+    current_snapshot: Option<AntiFraudSnapshot>,
+    hash_window: [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN],
+    peer_votes: HashMap<String, PeerSnapshotVote>,
+    peer_fallback_required: bool,
+    seed_server_retry_pending: bool,
+}
+
+impl Default for AntiFraudState {
+    fn default() -> Self {
+        Self {
+            runtime_enabled: false,
+            current_snapshot: None,
+            hash_window: [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN],
+            peer_votes: HashMap::new(),
+            peer_fallback_required: false,
+            seed_server_retry_pending: false,
+        }
+    }
+}
+
 impl ConnectionRequest {
     fn new(is_permanent: bool) -> Self {
         Self { next_attempt: SystemTime::now(), is_permanent, attempts: 0 }
@@ -50,26 +227,47 @@ impl ConnectionRequest {
 }
 
 impl ConnectionManager {
+    fn same_connection_request(lhs: &ConnectionRequest, rhs: &ConnectionRequest) -> bool {
+        lhs.next_attempt == rhs.next_attempt && lhs.is_permanent == rhs.is_permanent && lhs.attempts == rhs.attempts
+    }
+
     pub fn new(
         p2p_adaptor: Arc<cryptix_p2p_lib::Adaptor>,
         outbound_target: usize,
         inbound_limit: usize,
+        preferred_service_mask: u64,
         dns_seeders: &'static [&'static str],
         default_port: u16,
         address_manager: Arc<ParkingLotMutex<AddressManager>>,
+        banserver_enabled: bool,
+        network_name: String,
+        anti_fraud_persist_base_dir: Option<PathBuf>,
     ) -> Arc<Self> {
         let (tx, rx) = unbounded_channel::<()>();
+        let banserver_primary_url = DEFAULT_BANSERVER_URL.to_owned();
+        let anti_fraud_network = AntiFraudNetwork::from_network_name(&network_name).unwrap_or(AntiFraudNetwork::Mainnet);
+        let anti_fraud_persist_dir = anti_fraud_persist_base_dir.map(|path| path.join(ANTI_FRAUD_PERSIST_DIR));
         let manager = Arc::new(Self {
             p2p_adaptor,
             outbound_target,
             inbound_limit,
+            preferred_service_mask,
             address_manager,
             connection_requests: Default::default(),
             force_next_iteration: tx,
             shutdown_signal: SingleTrigger::new(),
             dns_seeders,
             default_port,
+            banserver_enabled,
+            banserver_primary_url,
+            anti_fraud_network,
+            anti_fraud_persist_dir,
+            anti_fraud_state: ParkingLotMutex::new(AntiFraudState::default()),
+            banserver_banned_ips: ParkingLotMutex::new(HashSet::new()),
+            banserver_banned_strong_node_ids: ParkingLotMutex::new(HashSet::new()),
+            locally_banned_unified_node_ids: ParkingLotMutex::new(HashMap::new()),
         });
+        manager.try_load_persisted_snapshot();
         manager.clone().start_event_loop(rx);
         manager.force_next_iteration.send(()).unwrap();
         manager
@@ -77,8 +275,19 @@ impl ConnectionManager {
 
     fn start_event_loop(self: Arc<Self>, mut rx: UnboundedReceiver<()>) {
         let mut ticker = interval(Duration::from_secs(30));
+        let mut banserver_ticker = interval(BANSERVER_REFRESH_INTERVAL);
+        let mut banserver_consistency_retry_ticker = interval(BANSERVER_CONSISTENCY_RETRY_INTERVAL);
+        let mut banserver_retry_ticker = interval(BANSERVER_RETRY_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        banserver_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        banserver_consistency_retry_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        banserver_retry_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         tokio::spawn(async move {
+            self.clone().refresh_banserver_bans().await;
+            // Consume immediate interval ticks so next refresh/retry are full interval away.
+            let _ = banserver_ticker.tick().await;
+            let _ = banserver_consistency_retry_ticker.tick().await;
+            let _ = banserver_retry_ticker.tick().await;
             loop {
                 if self.shutdown_signal.trigger.is_triggered() {
                     break;
@@ -86,6 +295,9 @@ impl ConnectionManager {
                 select! {
                     _ = rx.recv() => self.clone().handle_event().await,
                     _ = ticker.tick() => self.clone().handle_event().await,
+                    _ = banserver_ticker.tick() => self.clone().refresh_banserver_bans().await,
+                    _ = banserver_consistency_retry_ticker.tick(), if self.should_retry_seed_server_snapshot_validation() => self.clone().refresh_banserver_bans().await,
+                    _ = banserver_retry_ticker.tick(), if self.should_request_peer_snapshots() => self.clone().request_peer_snapshots_tick().await,
                     _ = self.shutdown_signal.listener.clone() => break,
                 }
             }
@@ -114,20 +326,44 @@ impl ConnectionManager {
     }
 
     async fn handle_connection_requests(self: &Arc<Self>, peer_by_address: &HashMap<SocketAddr, Peer>) {
-        let mut requests = self.connection_requests.lock().await;
-        let mut new_requests = HashMap::with_capacity(requests.len());
-        for (address, request) in requests.iter() {
+        let requests_snapshot = { self.connection_requests.lock().await.clone() };
+        let mut updated_requests = HashMap::with_capacity(requests_snapshot.len());
+        for (address, request) in requests_snapshot.iter() {
             let address = *address;
             let request = request.clone();
-            let is_connected = peer_by_address.contains_key(&address);
-            if is_connected && !request.is_permanent {
-                // The peer is connected and the request is not permanent - no need to keep the request
+            let is_connected = Self::is_request_satisfied(address, peer_by_address);
+            if is_connected {
+                if request.is_permanent {
+                    // Keep permanent requests, but reset retry backoff because the connection is currently satisfied.
+                    updated_requests.insert(address, ConnectionRequest::new(true));
+                }
+                // For one-shot requests, remove once the request has been satisfied.
                 continue;
             }
 
             if !is_connected && request.next_attempt <= SystemTime::now() {
+                if self.is_banserver_banned_ip(address.ip()) {
+                    debug!("Skipping connection request {} because it is blocked by banserver list", address);
+                    updated_requests.insert(
+                        address,
+                        ConnectionRequest {
+                            next_attempt: SystemTime::now() + BANSERVER_BANNED_CONNECTION_RETRY_DELAY,
+                            is_permanent: request.is_permanent,
+                            attempts: request.attempts,
+                        },
+                    );
+                    continue;
+                }
+
                 debug!("Connecting to peer request {}", address);
                 match self.p2p_adaptor.connect_peer(address.to_string()).await {
+                    Err(ConnectionError::ProtocolError(ProtocolError::PeerAlreadyExists(_))) if request.is_permanent => {
+                        // We are already connected to the same peer identity (possibly through a different socket
+                        // address, e.g. inbound ephemeral source port). Keep the permanent request without
+                        // escalating retry backoff.
+                        debug!("Peer request {} is already satisfied by existing peer identity", address);
+                        updated_requests.insert(address, ConnectionRequest::new(true));
+                    }
                     Err(err) => {
                         debug!("Failed connecting to peer request: {}, {}", address, err);
                         if request.is_permanent {
@@ -135,7 +371,7 @@ impl ConnectionManager {
                             let retry_duration =
                                 Duration::from_secs(30u64 * 2u64.pow(min(request.attempts, MAX_ACCOUNTABLE_ATTEMPTS)));
                             debug!("Will retry peer request {} in {}", address, DurationString::from(retry_duration));
-                            new_requests.insert(
+                            updated_requests.insert(
                                 address,
                                 ConnectionRequest {
                                     next_attempt: SystemTime::now() + retry_duration,
@@ -147,27 +383,59 @@ impl ConnectionManager {
                     }
                     Ok(_) if request.is_permanent => {
                         // Permanent requests are kept forever
-                        new_requests.insert(address, ConnectionRequest::new(true));
+                        updated_requests.insert(address, ConnectionRequest::new(true));
                     }
                     Ok(_) => {}
                 }
             } else {
-                new_requests.insert(address, request);
+                updated_requests.insert(address, request);
             }
         }
 
-        *requests = new_requests;
+        // Do not hold the request lock across async connection attempts.
+        // Also avoid clobbering any concurrent updates that may have happened while processing.
+        let mut requests = self.connection_requests.lock().await;
+        for (address, snapshot_request) in requests_snapshot.iter() {
+            let concurrent_update_detected =
+                requests.get(address).is_some_and(|current| !Self::same_connection_request(current, snapshot_request));
+            if concurrent_update_detected {
+                continue;
+            }
+
+            match updated_requests.remove(address) {
+                Some(next_request) => {
+                    requests.insert(*address, next_request);
+                }
+                None => {
+                    requests.remove(address);
+                }
+            }
+        }
+    }
+
+    fn is_request_satisfied(requested_address: SocketAddr, peer_by_address: &HashMap<SocketAddr, Peer>) -> bool {
+        if peer_by_address.contains_key(&requested_address) {
+            return true;
+        }
+
+        // Treat same-host peers as satisfying the request as well. This avoids reconnect loops when the active
+        // connection to a requested peer arrived inbound from an ephemeral source port.
+        peer_by_address.keys().any(|peer_address| peer_address.ip() == requested_address.ip())
     }
 
     async fn handle_outbound_connections(self: &Arc<Self>, peer_by_address: &HashMap<SocketAddr, Peer>) {
         let active_outbound: HashSet<cryptix_addressmanager::NetAddress> =
             peer_by_address.values().filter(|peer| peer.is_outbound()).map(|peer| peer.net_address().into()).collect();
-        if active_outbound.len() >= self.outbound_target {
+        let desired_outbound_target = self.outbound_target.max(active_outbound.len());
+        if active_outbound.len() >= desired_outbound_target {
             return;
         }
 
-        let mut missing_connections = self.outbound_target - active_outbound.len();
-        let mut addr_iter = self.address_manager.lock().iterate_prioritized_random_addresses(active_outbound);
+        let mut missing_connections = desired_outbound_target - active_outbound.len();
+        let mut addr_iter = self
+            .address_manager
+            .lock()
+            .iterate_prioritized_random_addresses_with_service_preference(active_outbound, self.preferred_service_mask);
 
         let mut progressing = true;
         let mut connecting = true;
@@ -182,6 +450,10 @@ impl ConnectionManager {
                     connecting = false;
                     break;
                 };
+                if self.is_banserver_banned_ip(net_addr.ip.into()) {
+                    debug!("Skipping outbound candidate {} due to banserver list", net_addr);
+                    continue;
+                }
                 let socket_addr = SocketAddr::new(net_addr.ip.into(), net_addr.port).to_string();
                 debug!("Connecting to {}", &socket_addr);
                 addrs_to_connect.push(net_addr);
@@ -192,16 +464,16 @@ impl ConnectionManager {
                 // Log only if progress was made
                 info!(
                     "Connection manager: has {}/{} outgoing P2P connections, trying to obtain {} additional connection(s)...",
-                    self.outbound_target - missing_connections,
-                    self.outbound_target,
+                    desired_outbound_target - missing_connections,
+                    desired_outbound_target,
                     jobs.len(),
                 );
                 progressing = false;
             } else {
                 debug!(
                     "Connection manager: outgoing: {}/{} , connecting: {}, iterator: {}",
-                    self.outbound_target - missing_connections,
-                    self.outbound_target,
+                    desired_outbound_target - missing_connections,
+                    desired_outbound_target,
                     jobs.len(),
                     addr_iter.len(),
                 );
@@ -227,7 +499,7 @@ impl ConnectionManager {
         }
 
         if missing_connections > 0 && !self.dns_seeders.is_empty() {
-            if missing_connections > self.outbound_target / 2 {
+            if missing_connections > desired_outbound_target / 2 {
                 // If we are missing more than half of our target, query all in parallel.
                 // This will always be the case on new node start-up and is the most resilient strategy in such a case.
                 self.dns_seed_many(self.dns_seeders.len()).await;
@@ -323,18 +595,1313 @@ impl ConnectionManager {
         self.address_manager.lock().ban(ip.into());
     }
 
+    /// Bans the given unified node ID and disconnects all active peers advertising this identity.
+    ///
+    /// Returns `true` if the ban was applied. Returns `false` if a matching active peer is configured as permanent.
+    pub async fn ban_unified_node_id(&self, node_id: [u8; 32]) -> bool {
+        let matching_peers = self
+            .p2p_adaptor
+            .active_peers()
+            .into_iter()
+            .filter(|peer| peer.properties().unified_node_id == Some(node_id))
+            .collect_vec();
+
+        for peer in &matching_peers {
+            if self.is_permanent(&peer.net_address()).await {
+                warn!(
+                    "Refusing to ban unified node ID {} because {} is a permanent connection",
+                    Self::encode_node_id_hex(&node_id),
+                    peer.net_address()
+                );
+                return false;
+            }
+        }
+
+        let now = Instant::now();
+        let expires_at = now + LOCAL_UNIFIED_NODE_BAN_DURATION;
+        {
+            let mut local_bans = self.locally_banned_unified_node_ids.lock();
+            local_bans.retain(|_, entry_expires_at| *entry_expires_at > now);
+            local_bans.insert(node_id, expires_at);
+        }
+        self.disconnect_peers_by_node_id_list(vec![node_id]).await;
+        true
+    }
+
     /// Returns whether the given address is banned.
     pub async fn is_banned(&self, address: &SocketAddr) -> bool {
-        !self.is_permanent(address).await && self.address_manager.lock().is_banned(address.ip().into())
+        self.is_banserver_banned_ip(address.ip())
+            || (!self.is_permanent(address).await && self.address_manager.lock().is_banned(address.ip().into()))
     }
 
     /// Returns whether the given address is a permanent request.
     pub async fn is_permanent(&self, address: &SocketAddr) -> bool {
-        self.connection_requests.lock().await.contains_key(address)
+        self.connection_requests.lock().await.get(address).map(|request| request.is_permanent).unwrap_or(false)
     }
 
     /// Returns whether the given IP has some permanent request.
     pub async fn ip_has_permanent_connection(&self, ip: IpAddr) -> bool {
         self.connection_requests.lock().await.iter().any(|(address, request)| request.is_permanent && address.ip() == ip)
+    }
+
+    pub fn is_antifraud_runtime_enabled(&self) -> bool {
+        self.anti_fraud_state.lock().runtime_enabled
+    }
+
+    fn is_banserver_banned_ip(&self, ip: IpAddr) -> bool {
+        if !self.is_antifraud_runtime_enabled() {
+            return false;
+        }
+        self.banserver_banned_ips.lock().contains(&ip)
+    }
+
+    pub fn is_banserver_banned_node_id(&self, node_id_raw: &[u8; 32]) -> bool {
+        if !self.is_antifraud_runtime_enabled() {
+            return false;
+        }
+        self.banserver_banned_strong_node_ids.lock().contains(node_id_raw)
+    }
+
+    pub fn is_unified_node_id_banned(&self, node_id_raw: &[u8; 32]) -> bool {
+        let now = Instant::now();
+        let mut local_bans = self.locally_banned_unified_node_ids.lock();
+        local_bans.retain(|_, entry_expires_at| *entry_expires_at > now);
+        if local_bans.contains_key(node_id_raw) {
+            return true;
+        }
+        self.is_banserver_banned_node_id(node_id_raw)
+    }
+
+    pub fn is_banserver_banned_strong_node_id(&self, static_id_raw: &[u8; 32]) -> bool {
+        self.is_banserver_banned_node_id(static_id_raw)
+    }
+
+    pub fn anti_fraud_hash_window(&self) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
+        let state = self.anti_fraud_state.lock();
+        if !state.runtime_enabled {
+            return [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN];
+        }
+        state.hash_window
+    }
+
+    pub fn anti_fraud_snapshot_envelope(&self) -> Option<AntiFraudSnapshotEnvelope> {
+        let state = self.anti_fraud_state.lock();
+        state.current_snapshot.clone().map(Into::into)
+    }
+
+    pub fn should_request_peer_snapshots(&self) -> bool {
+        let state = self.anti_fraud_state.lock();
+        if !state.runtime_enabled {
+            return false;
+        }
+        !self.banserver_enabled || state.peer_fallback_required
+    }
+
+    pub fn should_retry_seed_server_snapshot_validation(&self) -> bool {
+        let state = self.anti_fraud_state.lock();
+        state.runtime_enabled && state.seed_server_retry_pending
+    }
+
+    pub fn ingest_peer_snapshot(
+        &self,
+        peer_key: PeerKey,
+        envelope: AntiFraudSnapshotEnvelope,
+    ) -> Result<IngestPeerSnapshotResult, String> {
+        if !self.should_request_peer_snapshots() {
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: ANTI_FRAUD_ZERO_HASH });
+        }
+
+        let snapshot = self.normalize_snapshot_envelope(envelope)?;
+        let peer_root_hash = snapshot.root_hash;
+        let peer_label = peer_key.to_string();
+        let now = Instant::now();
+
+        let mut state = self.anti_fraud_state.lock();
+        state.peer_votes.insert(peer_label, PeerSnapshotVote { received_at: now, snapshot });
+        state.peer_votes.retain(|_, vote| vote.received_at.elapsed() <= PEER_CANDIDATE_MAX_AGE);
+        if state.peer_votes.len() > PEER_CANDIDATE_MAX_SIZE {
+            let overflow = state.peer_votes.len() - PEER_CANDIDATE_MAX_SIZE;
+            let mut by_age = state.peer_votes.iter().map(|(peer_id, vote)| (peer_id.clone(), vote.received_at)).collect_vec();
+            by_age.sort_by_key(|(_, received_at)| *received_at);
+            for (peer_id, _) in by_age.into_iter().take(overflow) {
+                state.peer_votes.remove(&peer_id);
+            }
+        }
+
+        let Some(max_seq) = state.peer_votes.values().map(|vote| vote.snapshot.snapshot_seq).max() else {
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
+        };
+        let candidates = state
+            .peer_votes
+            .values()
+            .filter(|vote| vote.snapshot.snapshot_seq == max_seq)
+            .map(|vote| vote.snapshot.clone())
+            .collect_vec();
+        if candidates.is_empty() {
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
+        }
+
+        let mut counts = HashMap::<[u8; 32], usize>::new();
+        for candidate in candidates.iter() {
+            *counts.entry(candidate.root_hash).or_insert(0) += 1;
+        }
+        let (winner_hash, winner_votes) = counts.into_iter().max_by_key(|(_, count)| *count).expect("counts is non-empty");
+        let strict_majority = winner_votes > (candidates.len() / 2);
+        if !strict_majority {
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
+        }
+
+        let winner = candidates.into_iter().find(|candidate| candidate.root_hash == winner_hash).expect("winner hash exists");
+        if !winner.antifraud_enabled {
+            warn!(
+                "Ignoring peer-majority anti-fraud snapshot with antifraud_enabled=false at seq={} (keeping previous active list)",
+                winner.snapshot_seq
+            );
+            return Ok(IngestPeerSnapshotResult { applied: false, root_hash: peer_root_hash });
+        }
+        drop(state);
+        let applied = self.try_apply_snapshot(winner, "peer-majority")?;
+        Ok(IngestPeerSnapshotResult { applied, root_hash: peer_root_hash })
+    }
+
+    async fn request_peer_snapshots_tick(self: Arc<Self>) {
+        // P2P request/response is handled by antifraud flows.
+        // The retry tick keeps the event loop reactive while peer fallback is needed.
+        let _ = self.force_next_iteration.send(());
+    }
+
+    fn log_antifraud_runtime_transition(was_enabled: bool, enabled: bool, reason: &str) {
+        if was_enabled == enabled {
+            return;
+        }
+        if enabled {
+            info!("AntiFraud runtime switched: OFF -> ON; reason: {}", reason);
+        } else {
+            warn!("AntiFraud runtime switched: ON -> OFF; reason: {}", reason);
+        }
+    }
+
+    fn log_antifraud_runtime_state(&self, reason: &str) {
+        let state = self.anti_fraud_state.lock();
+        let snapshot_seq = state.current_snapshot.as_ref().map(|snapshot| snapshot.snapshot_seq).unwrap_or(0);
+        info!(
+            "AntiFraud runtime state: enabled={}, peer_fallback_required={}, seed_server_retry_pending={}, snapshot_seq={}, reason={}",
+            state.runtime_enabled, state.peer_fallback_required, state.seed_server_retry_pending, snapshot_seq, reason
+        );
+    }
+
+    fn set_antifraud_runtime_enabled_with_reason(&self, enabled: bool, reason: &str) {
+        let was_enabled = {
+            let mut state = self.anti_fraud_state.lock();
+            let was_enabled = state.runtime_enabled;
+            state.runtime_enabled = enabled;
+            was_enabled
+        };
+        Self::log_antifraud_runtime_transition(was_enabled, enabled, reason);
+        self.log_antifraud_runtime_state(reason);
+    }
+
+    fn ensure_peer_only_antifraud_runtime(&self, reason: &str) {
+        let was_enabled = {
+            let mut state = self.anti_fraud_state.lock();
+            let was_enabled = state.runtime_enabled;
+            let already_peer_only = state.runtime_enabled && state.peer_fallback_required && !state.seed_server_retry_pending;
+            if already_peer_only {
+                return;
+            }
+            state.runtime_enabled = true;
+            state.peer_fallback_required = true;
+            state.seed_server_retry_pending = false;
+            was_enabled
+        };
+        Self::log_antifraud_runtime_transition(was_enabled, true, reason);
+        self.log_antifraud_runtime_state(reason);
+    }
+
+    fn apply_seed_server_failure_state(state: &mut AntiFraudState) -> SeedServerFailureAction {
+        if !state.runtime_enabled {
+            state.runtime_enabled = true;
+        }
+
+        if state.peer_fallback_required {
+            state.seed_server_retry_pending = false;
+            return SeedServerFailureAction::KeepPeerFallback;
+        }
+
+        if state.seed_server_retry_pending {
+            state.seed_server_retry_pending = false;
+            state.peer_fallback_required = true;
+            return SeedServerFailureAction::EnablePeerFallback;
+        }
+
+        state.seed_server_retry_pending = true;
+        SeedServerFailureAction::RetrySoon
+    }
+
+    fn handle_seed_server_refresh_failure(&self, reason: &str) {
+        let (action, was_enabled, enabled) = {
+            let mut state = self.anti_fraud_state.lock();
+            let was_enabled = state.runtime_enabled;
+            let action = Self::apply_seed_server_failure_state(&mut state);
+            (action, was_enabled, state.runtime_enabled)
+        };
+        Self::log_antifraud_runtime_transition(was_enabled, enabled, "seed-server refresh failure fallback logic");
+
+        match action {
+            SeedServerFailureAction::KeepPeerFallback => {
+                warn!("Banserver refresh failed while peer fallback is active: {}. Keeping peer snapshot fallback enabled.", reason)
+            }
+            SeedServerFailureAction::EnablePeerFallback => {
+                warn!("Banserver refresh failed again: {}. Enabling peer snapshot fallback mode.", reason)
+            }
+            SeedServerFailureAction::RetrySoon => warn!(
+                "Banserver refresh failed: {}. Retrying in {}s before enabling peer fallback.",
+                reason,
+                BANSERVER_CONSISTENCY_RETRY_INTERVAL.as_secs()
+            ),
+        }
+        self.log_antifraud_runtime_state(reason);
+    }
+
+    async fn refresh_banserver_bans(self: Arc<Self>) {
+        if !self.banserver_enabled {
+            self.ensure_peer_only_antifraud_runtime("banserver disabled by configuration; automatic peer snapshot mode active");
+            return;
+        }
+
+        let fetched = match self.fetch_banserver_payload().await {
+            BanserverFetchOutcome::Enabled(payload) => payload,
+            BanserverFetchOutcome::Unavailable => {
+                self.handle_seed_server_refresh_failure("no endpoint provided a usable antifraud snapshot");
+                return;
+            }
+        };
+        if !fetched.enabled {
+            self.handle_seed_server_refresh_failure("snapshot endpoint antifraud_enabled flag is false");
+            return;
+        }
+        self.set_antifraud_runtime_enabled_with_reason(true, "signed snapshot mode enabled");
+
+        match self.try_apply_snapshot(fetched.snapshot, "seed-server") {
+            Ok(applied) => {
+                {
+                    let mut state = self.anti_fraud_state.lock();
+                    state.peer_fallback_required = false;
+                    state.seed_server_retry_pending = false;
+                }
+                if applied {
+                    let banned = self.banserver_banned_ips.lock().iter().copied().collect_vec();
+                    if !banned.is_empty() {
+                        self.disconnect_peers_by_ip_list(banned).await;
+                    }
+                    let banned_node_ids = self.banserver_banned_strong_node_ids.lock().iter().copied().collect_vec();
+                    if !banned_node_ids.is_empty() {
+                        self.disconnect_peers_by_node_id_list(banned_node_ids).await;
+                    }
+                }
+            }
+            Err(err) => {
+                self.handle_seed_server_refresh_failure(&format!("snapshot rejected: {err}"));
+                return;
+            }
+        }
+
+        // Ensure the connection loop reacts quickly to newly updated server bans.
+        let _ = self.force_next_iteration.send(());
+    }
+
+    async fn fetch_banserver_payload(&self) -> BanserverFetchOutcome {
+        match self.fetch_banserver_payload_from_endpoint("primary", self.banserver_primary_url.trim()).await {
+            Ok(payload) if payload.enabled => BanserverFetchOutcome::Enabled(payload),
+            Ok(payload) => {
+                warn!(
+                    "AntiFraud primary seed reported antifraud_enabled=false at seq={}; keeping current list and using peer fallback",
+                    payload.snapshot.snapshot_seq
+                );
+                BanserverFetchOutcome::Unavailable
+            }
+            Err(err) => {
+                warn!("AntiFraud primary seed unavailable: {err}; keeping current list and using peer fallback");
+                BanserverFetchOutcome::Unavailable
+            }
+        }
+    }
+
+    async fn fetch_banserver_payload_from_endpoint(
+        &self,
+        endpoint_name: &'static str,
+        endpoint_url: &str,
+    ) -> Result<BanserverPayload, String> {
+        let endpoint_url = endpoint_url.trim();
+        let payload = match self.fetch_banserver_json(endpoint_url).await {
+            Ok(payload) => payload,
+            Err(primary_err) => {
+                if let Some(fallback_url) = Self::http_fallback_url(endpoint_url) {
+                    match self.fetch_banserver_json(&fallback_url).await {
+                        Ok(payload) => {
+                            warn!(
+                                "Banserver {} HTTPS fetch failed for {} ({}), HTTP fallback {} succeeded",
+                                endpoint_name, endpoint_url, primary_err, fallback_url
+                            );
+                            return self.parse_endpoint_payload(endpoint_name, &fallback_url, payload);
+                        }
+                        Err(fallback_err) => {
+                            return Err(format!(
+                                "{} endpoint fetch failed: primary {} error {}; http fallback error {}",
+                                endpoint_name, endpoint_url, primary_err, fallback_err
+                            ));
+                        }
+                    }
+                }
+                return Err(format!("{} endpoint fetch failed for {}: {}", endpoint_name, endpoint_url, primary_err));
+            }
+        };
+
+        self.parse_endpoint_payload(endpoint_name, endpoint_url, payload)
+    }
+
+    fn parse_endpoint_payload(
+        &self,
+        endpoint_name: &'static str,
+        endpoint_url: &str,
+        payload: JsonValue,
+    ) -> Result<BanserverPayload, String> {
+        Self::parse_banserver_payload_for_network(payload, self.anti_fraud_network)
+            .map_err(|err| format!("{} endpoint payload parse failed for {}: {}", endpoint_name, endpoint_url, err))
+    }
+
+    async fn fetch_banserver_json(&self, url: &str) -> Result<JsonValue, String> {
+        let parsed_url = ParsedUrl::parse(url).map_err(|err| format!("invalid URL `{url}`: {err}"))?;
+        match parsed_url.scheme() {
+            "https" | "http" => {}
+            scheme => return Err(format!("unsupported URL scheme `{scheme}` (only http/https allowed)")),
+        }
+
+        let client = HttpClient::builder()
+            // Explicitly allow self-signed/invalid TLS chains to maximize compatibility.
+            .danger_accept_invalid_certs(true)
+            // Explicitly disable hostname verification as requested for legacy endpoint compatibility.
+            .danger_accept_invalid_hostnames(true)
+            .redirect(RedirectPolicy::limited(2))
+            .timeout(BANSERVER_FETCH_TIMEOUT)
+            .build()
+            .map_err(|err| format!("failed building HTTP client: {err}"))?;
+
+        let response = client.get(parsed_url).send().await.map_err(|err| format!("request error: {err}"))?;
+
+        if !response.status().is_success() {
+            return Err(format!("http status {}", response.status()));
+        }
+
+        if let Some(content_length) = response.content_length() {
+            if content_length > BANSERVER_MAX_PAYLOAD_BYTES as u64 {
+                return Err(format!(
+                    "payload too large by content-length: {} bytes (max {})",
+                    content_length, BANSERVER_MAX_PAYLOAD_BYTES
+                ));
+            }
+        }
+
+        let body = response.bytes().await.map_err(|err| format!("failed reading response body: {err}"))?;
+        if body.len() > BANSERVER_MAX_PAYLOAD_BYTES {
+            return Err(format!("payload too large after download: {} bytes (max {})", body.len(), BANSERVER_MAX_PAYLOAD_BYTES));
+        }
+
+        serde_json::from_slice::<JsonValue>(&body).map_err(|err| format!("invalid json payload: {err}"))
+    }
+
+    fn http_fallback_url(url: &str) -> Option<String> {
+        let mut parsed = ParsedUrl::parse(url).ok()?;
+        if parsed.scheme() != "https" {
+            return None;
+        }
+
+        if parsed.port() == Some(443) {
+            let _ = parsed.set_port(Some(80));
+        }
+        parsed.set_scheme("http").ok()?;
+        Some(parsed.to_string())
+    }
+
+    fn parse_banserver_payload_for_network(
+        payload: JsonValue,
+        expected_network: AntiFraudNetwork,
+    ) -> Result<BanserverPayload, String> {
+        let root = payload.get("data").unwrap_or(&payload);
+        let antifraud_enabled = Self::read_antifraud_enabled(&payload)?;
+        let schema_version = Self::read_u64(root, &["schema_version", "schemaVersion"]).ok_or("missing schema_version")? as u8;
+        let network = Self::read_network(root).ok_or("missing network")?;
+        let snapshot_seq = Self::read_u64(root, &["snapshot_seq", "snapshotSeq"]).ok_or("missing snapshot_seq")?;
+        let generated_at_ms = Self::read_u64(root, &["generated_at_ms", "generatedAtMs"]).ok_or("missing generated_at_ms")?;
+        let signing_key_id = Self::read_u64(root, &["signing_key_id", "signingKeyId"]).ok_or("missing signing_key_id")? as u8;
+        let signature_hex = Self::read_str(root, &["signature"]).ok_or("missing signature")?;
+        if signature_hex.len() != BANSERVER_SIGNATURE_HEX_LEN {
+            return Err("signature must be 64-byte hex".to_string());
+        }
+        let signature = Self::decode_hex(signature_hex).ok_or("invalid signature hex")?;
+
+        let ip_values = root.get("banned_ips").and_then(JsonValue::as_array).ok_or("missing banned_ips array")?;
+        let node_id_values = root.get("banned_node_ids").and_then(JsonValue::as_array).ok_or("missing banned_node_ids array")?;
+        let ip_count = Self::read_u64(root, &["banned_ips_count"]).ok_or("missing banned_ips_count")?;
+        if ip_count > BANSERVER_MAX_IPS as u64 {
+            return Err(format!("banned_ips_count exceeds max {}", BANSERVER_MAX_IPS));
+        }
+        if ip_count != ip_values.len() as u64 {
+            return Err("banned_ips_count mismatch".to_string());
+        }
+        let node_count = Self::read_u64(root, &["banned_node_ids_count"]).ok_or("missing banned_node_ids_count")?;
+        if node_count > BANSERVER_MAX_NODE_IDS as u64 {
+            return Err(format!("banned_node_ids_count exceeds max {}", BANSERVER_MAX_NODE_IDS));
+        }
+        if node_count != node_id_values.len() as u64 {
+            return Err("banned_node_ids_count mismatch".to_string());
+        }
+        if ip_values.len() > BANSERVER_MAX_IPS {
+            return Err(format!("banned_ips_count exceeds max {}", BANSERVER_MAX_IPS));
+        }
+        if node_id_values.len() > BANSERVER_MAX_NODE_IDS {
+            return Err(format!("banned_node_ids_count exceeds max {}", BANSERVER_MAX_NODE_IDS));
+        }
+
+        let mut banned_ips = Vec::with_capacity(ip_values.len());
+        for value in ip_values {
+            let Some(raw_ip) = value.as_str() else { continue };
+            if let Some(entry) = Self::parse_ip_string_to_entry(raw_ip) {
+                banned_ips.push(entry);
+            }
+        }
+        let mut banned_node_ids = Vec::with_capacity(node_id_values.len());
+        for value in node_id_values {
+            let Some(raw_node_id) = value.as_str() else { continue };
+            if let Some(node_id) = Self::parse_node_id_hex(raw_node_id) {
+                banned_node_ids.push(node_id.to_vec());
+            }
+        }
+
+        let envelope = AntiFraudSnapshotEnvelope {
+            schema_version,
+            network,
+            snapshot_seq,
+            generated_at_ms,
+            signing_key_id,
+            banned_ips,
+            banned_node_ids,
+            signature,
+            antifraud_enabled,
+        };
+
+        let snapshot = Self::normalize_snapshot_static(envelope, expected_network)?;
+        Ok(BanserverPayload { enabled: antifraud_enabled, snapshot })
+    }
+
+    #[cfg(test)]
+    fn parse_banserver_payload(payload: JsonValue) -> Result<BanserverPayload, String> {
+        let root = payload.get("data").unwrap_or(&payload);
+        let network = Self::read_network(root).ok_or("missing network")?;
+        let expected_network = AntiFraudNetwork::from_u8(network).ok_or("invalid network enum")?;
+        Self::parse_banserver_payload_for_network(payload, expected_network)
+    }
+
+    fn read_antifraud_enabled(payload: &JsonValue) -> Result<bool, String> {
+        let root = payload.get("data").unwrap_or(payload);
+        let value = root
+            .get("antifraud_enabled")
+            .or_else(|| root.get("antifraudEnabled"))
+            .or_else(|| payload.get("antifraud_enabled"))
+            .or_else(|| payload.get("antifraudEnabled"))
+            .ok_or("missing antifraud_enabled")?;
+        value.as_bool().ok_or("antifraud_enabled must be strict boolean true/false".to_string())
+    }
+
+    fn read_str<'a>(value: &'a JsonValue, keys: &[&str]) -> Option<&'a str> {
+        keys.iter().find_map(|key| value.get(*key).and_then(JsonValue::as_str)).map(str::trim).filter(|s| !s.is_empty())
+    }
+
+    fn read_u64(value: &JsonValue, keys: &[&str]) -> Option<u64> {
+        keys.iter()
+            .find_map(|key| value.get(*key))
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|raw| raw.trim().parse::<u64>().ok())))
+    }
+
+    fn read_network(value: &JsonValue) -> Option<u8> {
+        let network_value = value.get("network")?;
+        if let Some(raw) = network_value.as_u64() {
+            return u8::try_from(raw).ok();
+        }
+        let raw = network_value.as_str()?.trim().to_ascii_lowercase();
+        if raw == "mainnet" || raw == "cryptix-mainnet" {
+            return Some(AntiFraudNetwork::Mainnet as u8);
+        }
+        if raw == "testnet" || raw == "cryptix-testnet" || raw.starts_with("testnet-") || raw.starts_with("cryptix-testnet-") {
+            return Some(AntiFraudNetwork::Testnet as u8);
+        }
+        if raw == "devnet" || raw == "cryptix-devnet" {
+            return Some(AntiFraudNetwork::Devnet as u8);
+        }
+        if raw == "simnet" || raw == "cryptix-simnet" {
+            return Some(AntiFraudNetwork::Simnet as u8);
+        }
+        None
+    }
+
+    fn normalize_snapshot_envelope(&self, envelope: AntiFraudSnapshotEnvelope) -> Result<AntiFraudSnapshot, String> {
+        Self::normalize_snapshot_static(envelope, self.anti_fraud_network)
+    }
+
+    fn normalize_snapshot_static(
+        envelope: AntiFraudSnapshotEnvelope,
+        expected_network: AntiFraudNetwork,
+    ) -> Result<AntiFraudSnapshot, String> {
+        if envelope.schema_version != ANTI_FRAUD_SCHEMA_VERSION {
+            return Err(format!("unsupported schema_version {} (expected {})", envelope.schema_version, ANTI_FRAUD_SCHEMA_VERSION));
+        }
+        if envelope.banned_ips.len() > BANSERVER_MAX_IPS {
+            return Err(format!("banned_ips_count exceeds max {}", BANSERVER_MAX_IPS));
+        }
+        if envelope.banned_node_ids.len() > BANSERVER_MAX_NODE_IDS {
+            return Err(format!("banned_node_ids_count exceeds max {}", BANSERVER_MAX_NODE_IDS));
+        }
+
+        let network = AntiFraudNetwork::from_u8(envelope.network).ok_or("invalid network enum")?;
+        if network != expected_network {
+            return Err("snapshot network mismatch".to_string());
+        }
+
+        if envelope.signature.len() != 64 {
+            return Err("signature must be exactly 64 bytes".to_string());
+        }
+        let signature: [u8; 64] = envelope.signature.as_slice().try_into().map_err(|_| "invalid signature length".to_string())?;
+
+        let mut ip_entries = envelope
+            .banned_ips
+            .into_iter()
+            .filter_map(|entry| Self::normalize_ip_entry(&entry))
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect_vec();
+        ip_entries.sort();
+
+        let mut node_entries = envelope
+            .banned_node_ids
+            .into_iter()
+            .filter_map(|entry| entry.as_slice().try_into().ok())
+            .collect::<HashSet<[u8; 32]>>()
+            .into_iter()
+            .collect_vec();
+        node_entries.sort();
+
+        let canonical_payload = Self::build_canonical_payload(
+            envelope.schema_version,
+            network as u8,
+            envelope.snapshot_seq,
+            envelope.generated_at_ms,
+            envelope.signing_key_id,
+            envelope.antifraud_enabled,
+            &ip_entries,
+            &node_entries,
+        )?;
+        let root_hash = *blake3::hash(&canonical_payload).as_bytes();
+        if !Self::verify_snapshot_signature(network, envelope.signing_key_id, &root_hash, &signature) {
+            return Err("invalid snapshot signature".to_string());
+        }
+
+        Ok(AntiFraudSnapshot {
+            schema_version: envelope.schema_version,
+            network,
+            snapshot_seq: envelope.snapshot_seq,
+            generated_at_ms: envelope.generated_at_ms,
+            signing_key_id: envelope.signing_key_id,
+            antifraud_enabled: envelope.antifraud_enabled,
+            banned_ip_entries: ip_entries,
+            banned_node_id_entries: node_entries,
+            signature,
+            root_hash,
+        })
+    }
+
+    fn verify_snapshot_signature(network: AntiFraudNetwork, signing_key_id: u8, root_hash: &[u8; 32], signature: &[u8; 64]) -> bool {
+        let Some(pubkey_bytes) = Self::pinned_pubkey_for(network, signing_key_id) else {
+            return false;
+        };
+        let Ok(pubkey) = XOnlyPublicKey::from_slice(&pubkey_bytes) else {
+            return false;
+        };
+        let Ok(sig) = SchnorrSignature::from_slice(signature) else {
+            return false;
+        };
+        let Ok(msg) = SecpMessage::from_digest_slice(root_hash) else {
+            return false;
+        };
+        sig.verify(&msg, &pubkey).is_ok()
+    }
+
+    fn pinned_pubkey_for(_network: AntiFraudNetwork, signing_key_id: u8) -> Option<[u8; 32]> {
+        match signing_key_id {
+            0 => Self::decode_hex_32(ANTI_FRAUD_PUBKEY_CURRENT_HEX),
+            1 => Self::decode_hex_32(ANTI_FRAUD_PUBKEY_NEXT_HEX),
+            _ => None,
+        }
+    }
+
+    fn build_canonical_payload(
+        schema_version: u8,
+        network: u8,
+        snapshot_seq: u64,
+        generated_at_ms: u64,
+        signing_key_id: u8,
+        antifraud_enabled: bool,
+        banned_ip_entries: &[Vec<u8>],
+        banned_node_id_entries: &[[u8; 32]],
+    ) -> Result<Vec<u8>, String> {
+        if banned_ip_entries.len() > BANSERVER_MAX_IPS || banned_node_id_entries.len() > BANSERVER_MAX_NODE_IDS {
+            return Err("entry count exceeds configured maxima".to_string());
+        }
+
+        let mut payload = Vec::with_capacity(ANTI_FRAUD_DOMAIN_SEP.len() + 64);
+        payload.extend_from_slice(ANTI_FRAUD_DOMAIN_SEP);
+        payload.push(schema_version);
+        payload.push(network);
+        payload.extend_from_slice(&snapshot_seq.to_be_bytes());
+        payload.extend_from_slice(&generated_at_ms.to_be_bytes());
+        payload.push(signing_key_id);
+        payload.push(if antifraud_enabled { 1 } else { 0 });
+        payload.extend_from_slice(&(banned_ip_entries.len() as u32).to_be_bytes());
+        for entry in banned_ip_entries {
+            payload.extend_from_slice(entry);
+        }
+        payload.extend_from_slice(&(banned_node_id_entries.len() as u32).to_be_bytes());
+        for entry in banned_node_id_entries {
+            payload.extend_from_slice(entry);
+        }
+        Ok(payload)
+    }
+
+    fn normalize_ip_entry(entry: &[u8]) -> Option<Vec<u8>> {
+        if entry.is_empty() {
+            return None;
+        }
+        match entry[0] {
+            4 if entry.len() == 5 => {
+                let ip = std::net::Ipv4Addr::new(entry[1], entry[2], entry[3], entry[4]);
+                let mut out = Vec::with_capacity(5);
+                out.push(4);
+                out.extend_from_slice(&ip.octets());
+                Some(out)
+            }
+            6 if entry.len() == 17 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&entry[1..17]);
+                let ip = std::net::Ipv6Addr::from(octets);
+                let mut out = Vec::with_capacity(17);
+                out.push(6);
+                out.extend_from_slice(&ip.octets());
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_ip_string_to_entry(raw: &str) -> Option<Vec<u8>> {
+        let candidate = raw.trim();
+        if candidate.is_empty() || candidate.len() > BANSERVER_MAX_IP_ENTRY_LEN {
+            return None;
+        }
+        let ip = candidate.parse::<IpAddr>().ok()?;
+        Some(match ip {
+            IpAddr::V4(v4) => {
+                let mut out = Vec::with_capacity(5);
+                out.push(4);
+                out.extend_from_slice(&v4.octets());
+                out
+            }
+            IpAddr::V6(v6) => {
+                let mut out = Vec::with_capacity(17);
+                out.push(6);
+                out.extend_from_slice(&v6.octets());
+                out
+            }
+        })
+    }
+
+    fn parse_persisted_ip_entry(raw: &str) -> Option<Vec<u8>> {
+        Self::parse_ip_string_to_entry(raw).or_else(|| Self::decode_hex(raw).and_then(|entry| Self::normalize_ip_entry(&entry)))
+    }
+
+    fn ip_entry_to_string(entry: &[u8]) -> Option<String> {
+        let normalized = Self::normalize_ip_entry(entry)?;
+        match normalized.first().copied()? {
+            4 if normalized.len() == 5 => {
+                let ip = std::net::Ipv4Addr::new(normalized[1], normalized[2], normalized[3], normalized[4]);
+                Some(ip.to_string())
+            }
+            6 if normalized.len() == 17 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&normalized[1..17]);
+                Some(std::net::Ipv6Addr::from(octets).to_string())
+            }
+            _ => None,
+        }
+    }
+
+    fn parse_node_id_hex(raw: &str) -> Option<[u8; 32]> {
+        let candidate = raw.trim();
+        if candidate.len() != BANSERVER_NODE_ID_HEX_LEN {
+            return None;
+        }
+
+        let bytes = candidate.as_bytes();
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            let high = Self::hex_nibble(bytes[i * 2])?;
+            let low = Self::hex_nibble(bytes[i * 2 + 1])?;
+            out[i] = (high << 4) | low;
+        }
+        Some(out)
+    }
+
+    fn decode_hex(raw: &str) -> Option<Vec<u8>> {
+        let trimmed = raw.trim();
+        if trimmed.len() % 2 != 0 {
+            return None;
+        }
+        let bytes = trimmed.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len() / 2);
+        for i in 0..(bytes.len() / 2) {
+            let high = Self::hex_nibble(bytes[i * 2])?;
+            let low = Self::hex_nibble(bytes[i * 2 + 1])?;
+            out.push((high << 4) | low);
+        }
+        Some(out)
+    }
+
+    fn decode_hex_32(raw: &str) -> Option<[u8; 32]> {
+        let bytes = Self::decode_hex(raw)?;
+        bytes.as_slice().try_into().ok()
+    }
+
+    fn encode_hex(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
+    }
+
+    pub fn encode_node_id_hex(node_id: &[u8; 32]) -> String {
+        Self::encode_hex(node_id)
+    }
+
+    fn hex_nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn try_apply_snapshot(&self, snapshot: AntiFraudSnapshot, source: &str) -> Result<bool, String> {
+        let mut state = self.anti_fraud_state.lock();
+        if let Some(current) = state.current_snapshot.as_ref() {
+            if snapshot.snapshot_seq < current.snapshot_seq {
+                return Err("received older snapshot_seq".to_string());
+            }
+            if snapshot.snapshot_seq == current.snapshot_seq {
+                if snapshot.root_hash != current.root_hash {
+                    return Err("same snapshot_seq with different root_hash".to_string());
+                }
+                return Ok(false);
+            }
+        }
+
+        let previous_snapshot = state.current_snapshot.clone();
+        let old_ips = self.banserver_banned_ips.lock().clone();
+        let old_nodes = self.banserver_banned_strong_node_ids.lock().clone();
+        let new_ips = snapshot
+            .banned_ip_entries
+            .iter()
+            .filter_map(|entry| match entry.first().copied() {
+                Some(4) if entry.len() == 5 => Some(IpAddr::V4(std::net::Ipv4Addr::new(entry[1], entry[2], entry[3], entry[4]))),
+                Some(6) if entry.len() == 17 => {
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&entry[1..17]);
+                    Some(IpAddr::V6(std::net::Ipv6Addr::from(octets)))
+                }
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let new_nodes = snapshot.banned_node_id_entries.iter().copied().collect::<HashSet<_>>();
+        *self.banserver_banned_ips.lock() = new_ips.clone();
+        *self.banserver_banned_strong_node_ids.lock() = new_nodes.clone();
+        state.hash_window = Self::advance_hash_window(state.hash_window, snapshot.root_hash);
+        state.current_snapshot = Some(snapshot.clone());
+        drop(state);
+
+        let _ = self.persist_snapshots(previous_snapshot.as_ref(), Some(&snapshot));
+        let added_ips = new_ips.difference(&old_ips).count();
+        let removed_ips = old_ips.difference(&new_ips).count();
+        let added_nodes = new_nodes.difference(&old_nodes).count();
+        let removed_nodes = old_nodes.difference(&new_nodes).count();
+        info!(
+            "AntiFraud snapshot applied from {}: seq={}, +{} IPs, -{} IPs, +{} node IDs, -{} node IDs (totals: {} IPs, {} node IDs)",
+            source,
+            snapshot.snapshot_seq,
+            added_ips,
+            removed_ips,
+            added_nodes,
+            removed_nodes,
+            new_ips.len(),
+            new_nodes.len()
+        );
+        Ok(true)
+    }
+
+    fn advance_hash_window(
+        current: [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN],
+        new_hash: [u8; 32],
+    ) -> [[u8; 32]; ANTI_FRAUD_HASH_WINDOW_LEN] {
+        if new_hash == ANTI_FRAUD_ZERO_HASH || current[0] == new_hash {
+            return current;
+        }
+        let mut ordered = vec![new_hash];
+        for hash in current {
+            if hash == ANTI_FRAUD_ZERO_HASH || ordered.iter().any(|existing| *existing == hash) {
+                continue;
+            }
+            ordered.push(hash);
+            if ordered.len() == ANTI_FRAUD_HASH_WINDOW_LEN {
+                break;
+            }
+        }
+        while ordered.len() < ANTI_FRAUD_HASH_WINDOW_LEN {
+            ordered.push(ANTI_FRAUD_ZERO_HASH);
+        }
+        [ordered[0], ordered[1], ordered[2]]
+    }
+
+    fn anti_fraud_current_path(&self) -> Option<PathBuf> {
+        self.anti_fraud_persist_dir.as_ref().map(|dir| dir.join(ANTI_FRAUD_CURRENT_FILE))
+    }
+
+    fn anti_fraud_previous_path(&self) -> Option<PathBuf> {
+        self.anti_fraud_persist_dir.as_ref().map(|dir| dir.join(ANTI_FRAUD_PREVIOUS_FILE))
+    }
+
+    fn try_load_persisted_snapshot(&self) {
+        let Some(current_path) = self.anti_fraud_current_path() else { return };
+        let previous_path = self.anti_fraud_previous_path();
+        let mut loaded = None;
+        if let Some(snapshot) = self.load_snapshot_from_disk(&current_path) {
+            loaded = Some(snapshot);
+        } else if let Some(previous_path) = previous_path.as_ref() {
+            loaded = self.load_snapshot_from_disk(previous_path);
+        }
+        if let Some(snapshot) = loaded {
+            if !snapshot.antifraud_enabled {
+                warn!(
+                    "persisted anti-fraud snapshot has antifraud_enabled=false at seq={}; ignoring and keeping existing state",
+                    snapshot.snapshot_seq
+                );
+                return;
+            }
+            match self.try_apply_snapshot(snapshot, "persisted") {
+                Ok(_) => {
+                    self.set_antifraud_runtime_enabled_with_reason(true, "persisted signed snapshot loaded");
+                }
+                Err(err) => warn!("failed applying persisted anti-fraud snapshot: {}", err),
+            }
+        }
+    }
+
+    fn load_snapshot_from_disk(&self, path: &Path) -> Option<AntiFraudSnapshot> {
+        let bytes = fs::read(path).ok()?;
+        let parsed = match serde_json::from_slice::<PersistedSnapshotV1>(&bytes) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                warn!("anti-fraud snapshot {} is corrupted: {}", path.display(), err);
+                self.quarantine_file(path);
+                return None;
+            }
+        };
+
+        let banned_ips = match parsed
+            .banned_ips
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| Self::parse_persisted_ip_entry(raw).ok_or_else(|| format!("invalid banned_ips[{index}] entry")))
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!("anti-fraud snapshot {} is invalid: {}", path.display(), err);
+                self.quarantine_file(path);
+                return None;
+            }
+        };
+        let banned_node_ids = match parsed
+            .banned_node_ids
+            .iter()
+            .enumerate()
+            .map(|(index, raw)| Self::decode_hex(raw).ok_or_else(|| format!("invalid banned_node_ids[{index}] hex entry")))
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(entries) => entries,
+            Err(err) => {
+                warn!("anti-fraud snapshot {} is invalid: {}", path.display(), err);
+                self.quarantine_file(path);
+                return None;
+            }
+        };
+        let signature = match Self::decode_hex(&parsed.signature) {
+            Some(signature) => signature,
+            None => {
+                warn!("anti-fraud snapshot {} is invalid: invalid signature hex entry", path.display());
+                self.quarantine_file(path);
+                return None;
+            }
+        };
+        let envelope = AntiFraudSnapshotEnvelope {
+            schema_version: parsed.schema_version,
+            network: parsed.network,
+            snapshot_seq: parsed.snapshot_seq,
+            generated_at_ms: parsed.generated_at_ms,
+            signing_key_id: parsed.signing_key_id,
+            antifraud_enabled: parsed.antifraud_enabled,
+            banned_ips,
+            banned_node_ids,
+            signature,
+        };
+        match self.normalize_snapshot_envelope(envelope) {
+            Ok(snapshot) => Some(snapshot),
+            Err(err) => {
+                warn!("anti-fraud snapshot {} is invalid: {}", path.display(), err);
+                self.quarantine_file(path);
+                None
+            }
+        }
+    }
+
+    fn persist_snapshots(&self, previous: Option<&AntiFraudSnapshot>, current: Option<&AntiFraudSnapshot>) -> Result<(), String> {
+        let Some(current_path) = self.anti_fraud_current_path() else { return Ok(()) };
+        let Some(previous_path) = self.anti_fraud_previous_path() else { return Ok(()) };
+        if let Some(parent) = current_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| format!("failed creating anti-fraud dir: {err}"))?;
+        }
+        if let Some(previous_snapshot) = previous {
+            let bytes = serde_json::to_vec_pretty(&PersistedSnapshotV1::from(previous_snapshot))
+                .map_err(|err| format!("failed serializing previous snapshot: {err}"))?;
+            Self::write_atomic(&previous_path, &bytes)?;
+        }
+        if let Some(current_snapshot) = current {
+            let bytes = serde_json::to_vec_pretty(&PersistedSnapshotV1::from(current_snapshot))
+                .map_err(|err| format!("failed serializing current snapshot: {err}"))?;
+            Self::write_atomic(&current_path, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let tmp_path = path.with_extension(format!("tmp.{ts}.json"));
+        let mut file = File::create(&tmp_path).map_err(|err| format!("failed creating {}: {err}", tmp_path.display()))?;
+        file.write_all(data).map_err(|err| format!("failed writing {}: {err}", tmp_path.display()))?;
+        file.sync_all().map_err(|err| format!("failed fsync {}: {err}", tmp_path.display()))?;
+        if path.exists() {
+            let _ = fs::remove_file(path);
+        }
+        fs::rename(&tmp_path, path).map_err(|err| format!("failed rename {} -> {}: {err}", tmp_path.display(), path.display()))?;
+        Ok(())
+    }
+
+    fn quarantine_file(&self, path: &Path) {
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut quarantined = path.to_path_buf();
+        quarantined.set_extension(format!("quarantine.{ts}.json"));
+        let _ = fs::rename(path, quarantined);
+    }
+
+    async fn disconnect_peers_by_ip_list(&self, ips: Vec<IpAddr>) {
+        let ip_set = ips.into_iter().collect::<HashSet<_>>();
+        if ip_set.is_empty() {
+            return;
+        }
+
+        let peers_to_disconnect =
+            self.p2p_adaptor.active_peers().into_iter().filter(|peer| ip_set.contains(&peer.net_address().ip())).collect_vec();
+        if peers_to_disconnect.is_empty() {
+            return;
+        }
+
+        info!("Banserver enforcement: disconnecting {} active peer(s) due to newly banned IP entries", peers_to_disconnect.len());
+        let disconnect_jobs = peers_to_disconnect.iter().map(|peer| self.p2p_adaptor.terminate(peer.key())).collect_vec();
+        join_all(disconnect_jobs).await;
+    }
+
+    async fn disconnect_peers_by_node_id_list(&self, node_ids: Vec<[u8; 32]>) {
+        let banned_set = node_ids.into_iter().collect::<HashSet<_>>();
+        let peers_to_disconnect = self
+            .p2p_adaptor
+            .active_peers()
+            .into_iter()
+            .filter(|peer| peer.properties().unified_node_id.map(|node_id| banned_set.contains(&node_id)).unwrap_or(false))
+            .collect_vec();
+        if peers_to_disconnect.is_empty() {
+            return;
+        }
+
+        info!(
+            "Banserver enforcement: disconnecting {} active peer(s) due to newly banned unified node ID entries",
+            peers_to_disconnect.len()
+        );
+        let disconnect_jobs = peers_to_disconnect.iter().map(|peer| self.p2p_adaptor.terminate(peer.key())).collect_vec();
+        join_all(disconnect_jobs).await;
+    }
+}
+
+impl From<AntiFraudSnapshot> for AntiFraudSnapshotEnvelope {
+    fn from(value: AntiFraudSnapshot) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            network: value.network as u8,
+            snapshot_seq: value.snapshot_seq,
+            generated_at_ms: value.generated_at_ms,
+            signing_key_id: value.signing_key_id,
+            antifraud_enabled: value.antifraud_enabled,
+            banned_ips: value.banned_ip_entries,
+            banned_node_ids: value.banned_node_id_entries.into_iter().map(|entry| entry.to_vec()).collect(),
+            signature: value.signature.to_vec(),
+        }
+    }
+}
+
+impl From<&AntiFraudSnapshot> for PersistedSnapshotV1 {
+    fn from(value: &AntiFraudSnapshot) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            network: value.network as u8,
+            snapshot_seq: value.snapshot_seq,
+            generated_at_ms: value.generated_at_ms,
+            signing_key_id: value.signing_key_id,
+            antifraud_enabled: value.antifraud_enabled,
+            banned_ips: value
+                .banned_ip_entries
+                .iter()
+                .map(|entry| ConnectionManager::ip_entry_to_string(entry).unwrap_or_else(|| ConnectionManager::encode_hex(entry)))
+                .collect(),
+            banned_node_ids: value.banned_node_id_entries.iter().map(|entry| ConnectionManager::encode_hex(entry)).collect(),
+            signature: ConnectionManager::encode_hex(&value.signature),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_banserver_payload_accepts_signed_snapshot() {
+        let payload = build_seed_payload();
+        let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse");
+        assert!(parsed.enabled);
+        assert_eq!(parsed.snapshot.snapshot_seq, 2);
+        assert_eq!(parsed.snapshot.banned_ip_entries.len(), 1);
+        assert_eq!(parsed.snapshot.banned_node_id_entries.len(), 1);
+    }
+
+    #[test]
+    fn parse_banserver_payload_rejects_wrong_expected_network() {
+        let payload = build_seed_payload();
+        let err = ConnectionManager::parse_banserver_payload_for_network(payload, AntiFraudNetwork::Testnet)
+            .expect_err("mainnet snapshot must not be accepted on testnet");
+        assert!(err.contains("network mismatch"));
+    }
+
+    #[test]
+    fn parse_banserver_payload_accepts_signed_runtime_disable() {
+        let mut payload = build_seed_payload();
+        payload["antifraud_enabled"] = json!(false);
+        payload["signature"] = json!("5f94c8ec397d696d8c9c95f3c18865cd48a9e4f2b1d31b3c83dec516ed0f0f029812cf87c7abc82c43c4c8ac34fd828bc98e84b8f37459c8458a787398d85076");
+        payload["root_hash"] = json!("35debec6b2f2ad6def2f701bb97ad5c1c055a4c35135c1f13e4818727ea9bdb0");
+
+        let parsed = ConnectionManager::parse_banserver_payload(payload).expect("payload should parse");
+        assert!(!parsed.enabled);
+        assert_eq!(parsed.snapshot.snapshot_seq, 2);
+    }
+
+    #[test]
+    fn docs_antifraud_vectors_match_parser() {
+        let vectors_doc = include_str!("../../../docs/antifraud_hf_v1_test_vectors.json");
+        let vectors: JsonValue = serde_json::from_str(vectors_doc).expect("vectors json should parse");
+        let Some(entries) = vectors.get("vectors").and_then(JsonValue::as_array) else {
+            panic!("vectors array missing");
+        };
+
+        for entry in entries {
+            let network = entry["network"].as_u64().expect("network should be u64") as u8;
+            let expected_network = AntiFraudNetwork::from_u8(network).expect("known network enum");
+            let banned_ips = entry["canonical_banned_ips"].as_array().expect("canonical_banned_ips should be array").clone();
+            let banned_node_ids =
+                entry["canonical_banned_node_ids"].as_array().expect("canonical_banned_node_ids should be array").clone();
+            let banned_ips_count = banned_ips.len();
+            let banned_node_ids_count = banned_node_ids.len();
+            let payload = json!({
+                "antifraud_enabled": entry["antifraud_enabled"].as_bool().expect("antifraud_enabled should be bool"),
+                "schema_version": entry["schema_version"].as_u64().expect("schema_version should be u64"),
+                "network": network,
+                "snapshot_seq": entry["snapshot_seq"].as_u64().expect("snapshot_seq should be u64"),
+                "generated_at_ms": entry["generated_at_ms"].as_u64().expect("generated_at_ms should be u64"),
+                "signing_key_id": entry["signing_key_id"].as_u64().expect("signing_key_id should be u64"),
+                "banned_ips": banned_ips,
+                "banned_ips_count": banned_ips_count,
+                "banned_node_ids": banned_node_ids,
+                "banned_node_ids_count": banned_node_ids_count,
+                "signature": entry["signature_hex"].as_str().expect("signature_hex should be string"),
+            });
+
+            let parsed = ConnectionManager::parse_banserver_payload_for_network(payload, expected_network)
+                .unwrap_or_else(|err| panic!("{} should parse: {err}", entry["id"]));
+            assert_eq!(ConnectionManager::encode_hex(&parsed.snapshot.root_hash), entry["root_hash_hex"].as_str().unwrap());
+        }
+    }
+
+    #[test]
+    fn parse_banserver_payload_rejects_bad_signature() {
+        let mut payload = build_seed_payload();
+        payload["signature"] = json!("00");
+        let err = ConnectionManager::parse_banserver_payload(payload).expect_err("payload must fail");
+        assert!(err.contains("signature"));
+    }
+
+    #[test]
+    fn parse_banserver_payload_rejects_oversized_count() {
+        let mut ips = Vec::with_capacity(BANSERVER_MAX_IPS + 10);
+        for i in 0..(BANSERVER_MAX_IPS + 10) {
+            let octet = (i % 250) as u8;
+            ips.push(format!("10.0.{}.{}", octet, (octet + 1) % 250));
+        }
+        let mut payload = build_seed_payload();
+        payload["banned_ips"] = json!(ips);
+        let err = ConnectionManager::parse_banserver_payload(payload).expect_err("payload must fail");
+        assert!(err.contains("banned_ips_count"));
+    }
+
+    #[test]
+    fn read_antifraud_enabled_requires_strict_boolean() {
+        let enabled_true = json!({"antifraud_enabled": true});
+        assert_eq!(ConnectionManager::read_antifraud_enabled(&enabled_true).unwrap(), true);
+
+        let enabled_false = json!({"data": {"antifraud_enabled": false}});
+        assert_eq!(ConnectionManager::read_antifraud_enabled(&enabled_false).unwrap(), false);
+
+        let invalid = json!({"antifraud_enabled": "true"});
+        let err = ConnectionManager::read_antifraud_enabled(&invalid).expect_err("string flag must be rejected");
+        assert!(err.contains("strict boolean"));
+    }
+
+    #[test]
+    fn persisted_ip_entries_accept_readable_and_legacy_hex() {
+        let expected = vec![4, 51, 79, 215, 200];
+
+        assert_eq!(ConnectionManager::parse_persisted_ip_entry("51.79.215.200").unwrap(), expected);
+        assert_eq!(ConnectionManager::parse_persisted_ip_entry("04334fd7c8").unwrap(), expected);
+        assert_eq!(ConnectionManager::ip_entry_to_string(&expected).unwrap(), "51.79.215.200");
+    }
+
+    #[test]
+    fn persisted_snapshot_writes_readable_ip_strings() {
+        let parsed = ConnectionManager::parse_banserver_payload(build_seed_payload()).expect("payload should parse");
+        let persisted = PersistedSnapshotV1::from(&parsed.snapshot);
+
+        assert_eq!(persisted.banned_ips, vec!["127.0.0.1".to_string()]);
+        assert_eq!(persisted.banned_node_ids, vec!["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()]);
+    }
+
+    #[test]
+    fn advance_hash_window_is_newest_first_and_zero_padded() {
+        let h1 = [1u8; 32];
+        let h2 = [2u8; 32];
+        let h3 = [3u8; 32];
+        let w1 = ConnectionManager::advance_hash_window([ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN], h1);
+        assert_eq!(w1, [h1, ANTI_FRAUD_ZERO_HASH, ANTI_FRAUD_ZERO_HASH]);
+        let w2 = ConnectionManager::advance_hash_window(w1, h2);
+        assert_eq!(w2, [h2, h1, ANTI_FRAUD_ZERO_HASH]);
+        let w3 = ConnectionManager::advance_hash_window(w2, h3);
+        assert_eq!(w3, [h3, h2, h1]);
+        let w4 = ConnectionManager::advance_hash_window(w3, h3);
+        assert_eq!(w4, w3);
+    }
+
+    #[test]
+    fn http_fallback_url_converts_https_to_http() {
+        let fallback = ConnectionManager::http_fallback_url("https://example.org/api/confirmed-cases/iplist").unwrap();
+        assert_eq!(fallback, "http://example.org/api/confirmed-cases/iplist");
+    }
+
+    #[test]
+    fn seed_server_failure_state_transitions_retry_then_peer_fallback() {
+        let mut state = AntiFraudState::default();
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::RetrySoon);
+        assert!(state.runtime_enabled);
+        assert!(state.seed_server_retry_pending);
+        assert!(!state.peer_fallback_required);
+
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::EnablePeerFallback);
+        assert!(state.runtime_enabled);
+        assert!(!state.seed_server_retry_pending);
+        assert!(state.peer_fallback_required);
+    }
+
+    #[test]
+    fn seed_server_failure_state_retries_then_stays_in_peer_fallback() {
+        let mut state = AntiFraudState::default();
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::RetrySoon);
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::EnablePeerFallback);
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::KeepPeerFallback);
+        assert!(state.runtime_enabled);
+        assert!(state.peer_fallback_required);
+        assert!(!state.seed_server_retry_pending);
+    }
+
+    #[test]
+    fn seed_server_failure_state_keeps_existing_peer_fallback() {
+        let mut state = AntiFraudState {
+            runtime_enabled: true,
+            current_snapshot: None,
+            hash_window: [ANTI_FRAUD_ZERO_HASH; ANTI_FRAUD_HASH_WINDOW_LEN],
+            peer_votes: HashMap::new(),
+            peer_fallback_required: true,
+            seed_server_retry_pending: true,
+        };
+
+        assert_eq!(ConnectionManager::apply_seed_server_failure_state(&mut state), SeedServerFailureAction::KeepPeerFallback);
+        assert!(state.runtime_enabled);
+        assert!(state.peer_fallback_required);
+        assert!(!state.seed_server_retry_pending);
+    }
+
+    fn build_seed_payload() -> JsonValue {
+        json!({
+            "antifraud_enabled": true,
+            "schema_version": 1,
+            "network": 0,
+            "snapshot_seq": 2,
+            "generated_at_ms": 1_700_000_000_100u64,
+            "signing_key_id": 0,
+            "banned_ips": ["127.0.0.1"],
+            "banned_ips_count": 1,
+            "banned_node_ids": ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"],
+            "banned_node_ids_count": 1,
+            "root_hash": "d121e2a127f06866c23799b48883e00e8c844f62a96e2e207457f52e11c7ab2f",
+            "signature": "e78caa63a9121ecf7f845ca4bce4b62ca01bb9277af000a5ffd030dc3855c7707d870f6e85a589a1d2b630eddc643a25d93665c7c663d55741fe5e7293bc539f",
+        })
+    }
+
+    #[test]
+    fn http_fallback_url_converts_https_443_to_http_80() {
+        let fallback = ConnectionManager::http_fallback_url("https://example.org:443/path").unwrap();
+        assert_eq!(fallback, "http://example.org/path");
     }
 }

@@ -11,7 +11,58 @@ use crate::utxo::{UtxoContext, UtxoEntryId, UtxoEntryReference};
 use cryptix_consensus_core::hashing::sighash_type::SigHashType;
 use cryptix_consensus_core::sign::{sign_input, sign_with_multiple_v2, Signed};
 use cryptix_consensus_core::tx::{SignableTransaction, Transaction, TransactionId};
-use cryptix_rpc_core::{RpcTransaction, RpcTransactionId};
+use cryptix_rpc_core::{RpcFastIntentStatus, RpcTransaction, RpcTransactionId};
+use workflow_core::time::unixtime_as_millis_u64;
+
+pub const DEFAULT_FAST_MAX_FEE_HEADROOM_BPS: u64 = 1000; // 10%
+pub const DEFAULT_FAST_MAX_FEE_HEADROOM_MIN_SOMPI: u64 = 1_000;
+
+#[derive(Clone, Debug, Default)]
+pub struct FastSubmitOptions {
+    pub enabled: bool,
+    pub intent_nonce: Option<u64>,
+    pub client_created_at_ms: Option<u64>,
+    pub max_fee_sompi: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FastSubmitResult {
+    pub requested: bool,
+    pub used: bool,
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    pub basechain_submitted: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SubmitResult {
+    pub tx_id: RpcTransactionId,
+    pub fast: FastSubmitResult,
+}
+
+fn fast_status_name(status: RpcFastIntentStatus) -> &'static str {
+    match status {
+        RpcFastIntentStatus::Received => "received",
+        RpcFastIntentStatus::Validated => "validated",
+        RpcFastIntentStatus::Locked => "locked",
+        RpcFastIntentStatus::FastConfirmed => "fast_confirmed",
+        RpcFastIntentStatus::Expired => "expired",
+        RpcFastIntentStatus::Dropped => "dropped",
+        RpcFastIntentStatus::Rejected => "rejected",
+        RpcFastIntentStatus::Cancelled => "cancelled",
+        RpcFastIntentStatus::UnknownIntent => "unknown_intent",
+    }
+}
+
+fn unix_now_ms_u64() -> u64 {
+    unixtime_as_millis_u64()
+}
+
+/// Applies a conservative headroom to avoid fast-rail rejection due to minor fee/mass drift.
+pub fn default_fast_max_fee_cap(base_fee_sompi: u64) -> u64 {
+    let ratio_headroom = base_fee_sompi.saturating_mul(DEFAULT_FAST_MAX_FEE_HEADROOM_BPS) / 10_000;
+    base_fee_sompi.saturating_add(ratio_headroom).saturating_add(DEFAULT_FAST_MAX_FEE_HEADROOM_MIN_SOMPI)
+}
 
 pub(crate) struct PendingTransactionInner {
     /// Generator that produced the transaction
@@ -199,12 +250,60 @@ impl PendingTransaction {
         self.inner.signable_tx.lock().unwrap().tx.as_ref().into()
     }
 
-    /// Submit the transaction on the supplied rpc
-    pub async fn try_submit(&self, rpc: &Arc<DynRpcApi>) -> Result<RpcTransactionId> {
+    async fn submit_with_optional_fast(
+        &self,
+        rpc: &Arc<DynRpcApi>,
+        rpc_transaction: RpcTransaction,
+        fast_options: Option<&FastSubmitOptions>,
+    ) -> Result<SubmitResult> {
+        if let Some(options) = fast_options.filter(|options| options.enabled) {
+            let now_ms = unix_now_ms_u64();
+            let intent_nonce = options.intent_nonce.unwrap_or_else(|| now_ms ^ (self.id().as_bytes()[0] as u64));
+            let client_created_at_ms = options.client_created_at_ms.unwrap_or(now_ms);
+            let max_fee = options.max_fee_sompi.unwrap_or_else(|| default_fast_max_fee_cap(self.fees()));
+
+            match rpc.submit_fast_intent(rpc_transaction.clone(), intent_nonce, client_created_at_ms, max_fee).await {
+                Ok(response) => {
+                    let tx_id = response.base_tx_id.unwrap_or(self.id());
+                    let fast = FastSubmitResult {
+                        requested: true,
+                        used: matches!(response.status, RpcFastIntentStatus::Locked | RpcFastIntentStatus::FastConfirmed),
+                        status: Some(fast_status_name(response.status).to_string()),
+                        reason: response.reason.clone(),
+                        basechain_submitted: response.basechain_submitted,
+                    };
+                    return Ok(SubmitResult { tx_id, fast });
+                }
+                Err(err) => {
+                    let tx_id = rpc.submit_transaction(rpc_transaction, false).await?;
+                    let fast = FastSubmitResult {
+                        requested: true,
+                        used: false,
+                        status: Some("fallback_normal_submit".to_string()),
+                        reason: Some(format!("fast_rpc_fallback: {err}")),
+                        basechain_submitted: true,
+                    };
+                    return Ok(SubmitResult { tx_id, fast });
+                }
+            }
+        }
+
+        let tx_id = rpc.submit_transaction(rpc_transaction, false).await?;
+        Ok(SubmitResult {
+            tx_id,
+            fast: FastSubmitResult { requested: false, used: false, status: None, reason: None, basechain_submitted: true },
+        })
+    }
+
+    pub async fn try_submit_with_fast_options(
+        &self,
+        rpc: &Arc<DynRpcApi>,
+        fast_options: Option<&FastSubmitOptions>,
+    ) -> Result<SubmitResult> {
         // sanity check to prevent multiple invocations (for API use)
-        self.inner.is_submitted.load(Ordering::SeqCst).then(|| {
-            panic!("PendingTransaction::try_submit() called multiple times");
-        });
+        if self.inner.is_submitted.load(Ordering::SeqCst) {
+            return Err(Error::Custom("PendingTransaction::try_submit() called multiple times".to_string()));
+        }
         self.inner.is_submitted.store(true, Ordering::SeqCst);
 
         let rpc_transaction: RpcTransaction = self.rpc_transaction();
@@ -218,11 +317,11 @@ impl PendingTransaction {
             utxo_context.register_outgoing_transaction(self).await?;
 
             // try to submit transaction
-            match rpc.submit_transaction(rpc_transaction, false).await {
-                Ok(id) => {
+            match self.submit_with_optional_fast(rpc, rpc_transaction, fast_options).await {
+                Ok(result) => {
                     // on successful submit, create a notification
                     utxo_context.notify_outgoing_transaction(self).await?;
-                    Ok(id)
+                    Ok(result)
                 }
                 Err(error) => {
                     // in case of failure, remove transaction UTXOs from the consumed list
@@ -232,8 +331,13 @@ impl PendingTransaction {
             }
         } else {
             // No UtxoProcessor present (API etc)
-            Ok(rpc.submit_transaction(rpc_transaction, false).await?)
+            self.submit_with_optional_fast(rpc, rpc_transaction, fast_options).await
         }
+    }
+
+    /// Submit the transaction on the supplied rpc
+    pub async fn try_submit(&self, rpc: &Arc<DynRpcApi>) -> Result<RpcTransactionId> {
+        Ok(self.try_submit_with_fast_options(rpc, None).await?.tx_id)
     }
 
     pub async fn log(&self) -> Result<()> {
@@ -258,6 +362,14 @@ impl PendingTransaction {
     pub fn fill_input(&self, input_index: usize, signature_script: Vec<u8>) -> Result<()> {
         let mut mutable_tx = self.inner.signable_tx.lock()?.clone();
         mutable_tx.tx.inputs[input_index].signature_script = signature_script;
+        *self.inner.signable_tx.lock().unwrap() = mutable_tx;
+
+        Ok(())
+    }
+
+    pub fn set_input_sig_op_count(&self, input_index: usize, sig_op_count: u8) -> Result<()> {
+        let mut mutable_tx = self.inner.signable_tx.lock()?.clone();
+        mutable_tx.tx.inputs[input_index].sig_op_count = sig_op_count;
         *self.inner.signable_tx.lock().unwrap() = mutable_tx;
 
         Ok(())

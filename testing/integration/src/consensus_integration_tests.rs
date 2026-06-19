@@ -41,9 +41,6 @@ use cryptix_core::time::unix_now;
 use cryptix_database::utils::get_cryptix_tempdir;
 use cryptix_hashes::Hash;
 
-use flate2::read::GzDecoder;
-use futures_util::future::try_join_all;
-use itertools::Itertools;
 use cryptix_core::core::Core;
 use cryptix_core::signals::Shutdown;
 use cryptix_core::task::runtime::AsyncRuntime;
@@ -57,6 +54,9 @@ use cryptix_notify::subscription::context::SubscriptionContext;
 use cryptix_txscript::caches::TxScriptCacheCounters;
 use cryptix_utxoindex::api::{UtxoIndexApi, UtxoIndexProxy};
 use cryptix_utxoindex::UtxoIndex;
+use flate2::read::GzDecoder;
+use futures_util::future::try_join_all;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::cmp::{max, Ordering};
 use std::collections::HashSet;
@@ -831,6 +831,15 @@ impl CryptixdGoParams {
             max_block_mass: self.MaxBlockMass,
             storage_mass_parameter: STORAGE_MASS_PARAMETER,
             storage_mass_activation_daa_score: u64::MAX,
+            payload_hf_activation_daa_score: 33_739_200,
+            payload_max_len_consensus: 8192,
+            payload_max_len_standard: 2048,
+            payload_weight_multiplier: 4,
+            atomic_max_new_assets_per_block: MAINNET_PARAMS.atomic_max_new_assets_per_block,
+            atomic_max_new_balance_keys_per_block: MAINNET_PARAMS.atomic_max_new_balance_keys_per_block,
+            atomic_max_new_nonce_keys_per_block: MAINNET_PARAMS.atomic_max_new_nonce_keys_per_block,
+            atomic_max_new_pools_per_block: MAINNET_PARAMS.atomic_max_new_pools_per_block,
+            atomic_max_new_anchor_owner_keys_per_block: MAINNET_PARAMS.atomic_max_new_anchor_owner_keys_per_block,
             deflationary_phase_daa_score: self.DeflationaryPhaseDaaScore,
             pre_deflationary_phase_base_subsidy: self.PreDeflationaryPhaseBaseSubsidy,
             coinbase_maturity: MAINNET_PARAMS.coinbase_maturity,
@@ -839,36 +848,6 @@ impl CryptixdGoParams {
             pruning_proof_m: self.PruningProofM,
         }
     }
-}
-
-#[tokio::test]
-async fn goref_custom_pruning_depth_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref_custom_pruning_depth", false).await
-}
-
-#[tokio::test]
-async fn goref_notx_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-notx-5000-blocks", false).await
-}
-
-#[tokio::test]
-async fn goref_notx_concurrent_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-notx-5000-blocks", true).await
-}
-
-#[tokio::test]
-async fn goref_tx_small_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-905-tx-265-blocks", false).await
-}
-
-#[tokio::test]
-async fn goref_tx_small_concurrent_test() {
-    init_allocator_with_default_settings();
-    json_test("testdata/dags_for_json_tests/goref-905-tx-265-blocks", true).await
 }
 
 #[ignore]

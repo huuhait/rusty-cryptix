@@ -147,6 +147,26 @@ message VersionMessage{
   bool disableRelayTx = 8;
   SubnetworkId subnetworkId = 9;
   string network = 10;
+  repeated bytes antiFraudHashes = 11;
+  bytes nodePubkeyXonly = 12;
+  optional uint64 nodePowNonce = 13;
+  optional uint64 nodeChallengeNonce = 14;
+  bytes pqMlKem1024Pubkey = 15;
+}
+
+message RequestAntiFraudSnapshotV1Message{
+}
+
+message AntiFraudSnapshotV1Message{
+  uint32 schemaVersion = 1;
+  uint32 network = 2;
+  uint64 snapshotSeq = 3;
+  uint64 generatedAtMs = 4;
+  uint32 signingKeyId = 5;
+  repeated bytes bannedIps = 6;
+  repeated bytes bannedNodeIds = 7;
+  bytes signature = 8;
+  bool antifraudEnabled = 9;
 }
 
 message RejectMessage{
@@ -282,6 +302,9 @@ message PruningPointProofHeaderArray {
 }
 
 message ReadyMessage {
+  bytes nodeAuthSignature = 1;
+  bytes pqMlKem1024Ciphertext = 2;
+  bytes pqHandshakeProof = 3;
 }
 
 message BlockWithTrustedDataV4Message {
@@ -293,4 +316,69 @@ message BlockWithTrustedDataV4Message {
 message TrustedDataMessage {
   repeated DaaBlockV4 daaWindow = 1; // TODO: rename to `trustedSubDag` once v5 is obsolete
   repeated BlockGhostdagDataHashPair ghostdagData = 2; // TODO: remove once v5 is obsolete
+  bytes atomicConsensusState = 3;
+  bytes atomicConsensusStateHash = 4;
+  uint64 atomicConsensusStateByteLength = 5;
+  uint64 atomicConsensusStateChunkCount = 6;
+}
+
+message TrustedAtomicStateChunkMessage {
+  bytes stateHash = 1;
+  uint64 chunkIndex = 2;
+  uint64 totalChunks = 3;
+  uint64 totalBytes = 4;
+  bytes chunk = 5;
+}
+
+message RequestNextPruningPointAtomicStateChunkMessage {
+}
+
+message RequestConsensusAtomicStateHashMessage {
+  Hash blockHash = 1;
+  uint64 anchorDaaScore = 2;
+}
+
+message ConsensusAtomicStateHashMessage {
+  Hash blockHash = 1;
+  bytes stateHash = 2;
+  bool hasState = 3;
+  uint64 anchorDaaScore = 4;
+}
+
+message RequestAtomicTokenStateHashMessage {
+  Hash blockHash = 1;
+  uint64 anchorDaaScore = 2;
+}
+
+message AtomicTokenStateHashMessage {
+  Hash blockHash = 1;
+  bytes stateHash = 2;
+  bool hasState = 3;
+  uint64 anchorDaaScore = 4;
+}
+
+message RequestFastIntentsMessage {
+  repeated Hash intentIds = 1;
+}
+
+message FastIntentMessage {
+  Hash intentId = 1;
+  TransactionMessage baseTransaction = 2;
+  uint64 intentNonce = 3;
+  uint64 clientCreatedAtMs = 4;
+  uint64 maxFee = 5;
+}
+
+message FastMicroblockMessage {
+  uint64 microblockTimeMs = 1;
+  repeated Hash intentIds = 2;
+}
+
+message BlockProducerClaimV1Message {
+  uint32 schemaVersion = 1;
+  uint32 network = 2;
+  bytes blockHash = 3;
+  bytes nodePubkeyXonly = 4;
+  bytes signature = 5;
+  optional uint64 nodePowNonce = 6;
 }

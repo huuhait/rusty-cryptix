@@ -3,7 +3,6 @@
 use crate::imports::*;
 use crate::Resolver;
 use crate::{RpcEventCallback, RpcEventType, RpcEventTypeOrCallback};
-use js_sys::{Function, Object};
 use cryptix_addresses::{Address, AddressOrStringArrayT};
 use cryptix_consensus_client::UtxoEntryReference;
 use cryptix_consensus_core::network::{NetworkType, NetworkTypeT};
@@ -17,6 +16,7 @@ pub use cryptix_rpc_macros::{
     build_wrpc_wasm_bindgen_interface, build_wrpc_wasm_bindgen_subscriptions, declare_typescript_wasm_interface as declare,
 };
 use cryptix_wasm_core::events::{get_event_targets, Sink};
+use js_sys::{Function, Object};
 pub use serde_wasm_bindgen::from_value;
 use workflow_rpc::client::Ctl;
 pub use workflow_rpc::client::IConnectOptions;
@@ -48,7 +48,7 @@ declare! {
          */
         encoding?: Encoding;
         /**
-         * Network identifier: `mainnet`, `testnet-10` etc.
+         * Network identifier: `mainnet`, `testnet`, `devnet`, etc.
          * `networkId` is required when using a resolver.
          */
         networkId?: NetworkId | string;
@@ -900,6 +900,9 @@ build_wrpc_wasm_bindgen_subscriptions!([
     /// New block template notification event is produced when a new block
     /// template is generated for mining in the Cryptix BlockDAG.
     NewBlockTemplate,
+    /// Manage subscription for token events changed notifications.
+    /// Token events changed notification indicates that new token events are available via GetTokenEvents.
+    TokenEventsChanged,
 ]);
 
 // Build RPC method invocation functions. This macro
@@ -969,6 +972,14 @@ build_wrpc_wasm_bindgen_interface!(
         /// Obtains basic information about the synchronization status of the Cryptix node.
         /// Returned information: Syncing status.
         GetSyncStatus,
+        /// Returns Cryptix Atomic Token state hash and RPC context.
+        GetTokenStateHash,
+        /// Returns Cryptix Atomic Token service health.
+        GetTokenHealth,
+        /// Returns available Cryptix Atomic snapshot bootstrap sources.
+        GetScBootstrapSources,
+        /// Returns the latest Cryptix Atomic snapshot bootstrap head.
+        GetScSnapshotHead,
     ],
     [
         // functions with `request` argument
@@ -993,6 +1004,9 @@ build_wrpc_wasm_bindgen_interface!(
         /// Retrieves multiple blocks from the Cryptix BlockDAG.
         /// Returned information: List of block information.
         GetBlocks,
+        /// Resolves transactions by id in one batched request.
+        /// Returned information: Transactions found in mempool or recent chain data.
+        GetTransactionsByIds,
         /// Generates a new block template for mining.
         /// Returned information: Block template information.
         GetBlockTemplate,
@@ -1025,6 +1039,52 @@ build_wrpc_wasm_bindgen_interface!(
         /// Retrieves information about a subnetwork in the Cryptix BlockDAG.
         /// Returned information: Subnetwork information.
         GetSubnetwork,
+        /// Simulates a Cryptix Atomic token operation without mutating state.
+        SimulateTokenOp,
+        /// Returns Cryptix Atomic token balance for owner and asset.
+        GetTokenBalance,
+        /// Returns Cryptix Atomic next nonce for owner-scope or owner/asset-scope.
+        GetTokenNonce,
+        /// Returns Cryptix Atomic next owner-scope nonce for create operations.
+        GetOwnerNonce,
+        /// Returns Cryptix Atomic asset metadata.
+        GetTokenAsset,
+        /// Returns Cryptix Atomic operation status by txid.
+        GetTokenOpStatus,
+        /// Returns wallet-policy spendability signal for a token owner/asset pair.
+        GetTokenSpendability,
+        /// Returns Cryptix Atomic token events since a sequence.
+        GetTokenEvents,
+        /// Returns a paginated list of Cryptix Atomic token assets, optionally filtered by query.
+        GetTokenAssets,
+        /// Returns a paginated list of token balances for a specific owner id.
+        GetTokenBalancesByOwner,
+        /// Returns a paginated list of holders for a specific asset id.
+        GetTokenHolders,
+        /// Returns owner id derivation result for an address if the script class is supported.
+        GetTokenOwnerIdByAddress,
+        /// Returns liquidity pool state for a liquidity asset.
+        GetLiquidityPoolState,
+        /// Returns exact-in quote for liquidity buy/sell.
+        GetLiquidityQuote,
+        /// Returns liquidity fee accrual state.
+        GetLiquidityFeeState,
+        /// Returns liquidity fee claim preview for a recipient address.
+        GetLiquidityClaimPreview,
+        /// Returns paginated liquidity holders for a liquidity asset.
+        GetLiquidityHolders,
+        /// Exports Cryptix Atomic snapshot to a file path.
+        ExportTokenSnapshot,
+        /// Imports Cryptix Atomic snapshot from a file path.
+        ImportTokenSnapshot,
+        /// Returns a specific snapshot manifest by snapshot id.
+        GetScSnapshotManifest,
+        /// Returns a chunk of a snapshot package.
+        GetScSnapshotChunk,
+        /// Returns a chunk of a replay-window package.
+        GetScReplayWindowChunk,
+        /// Returns the consensus Atomic state hash for an exact block hash.
+        GetConsensusAtomicStateHash,
         /// Retrieves unspent transaction outputs (UTXOs) associated with
         /// specific addresses.
         /// Returned information: List of UTXOs.

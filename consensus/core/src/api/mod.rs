@@ -1,5 +1,5 @@
-use futures_util::future::BoxFuture;
 use cryptix_muhash::MuHash;
+use futures_util::future::BoxFuture;
 use std::sync::Arc;
 
 use crate::{
@@ -17,9 +17,10 @@ use crate::{
         tx::TxResult,
     },
     header::Header,
-    pruning::{PruningPointProof, PruningPointTrustedData, PruningPointsList},
+    pruning::{PruningPointAtomicState, PruningPointProof, PruningPointTrustedData, PruningPointsList},
     trusted::{ExternalGhostdagData, TrustedBlock},
     tx::{MutableTransaction, Transaction, TransactionOutpoint, UtxoEntry},
+    utxo::utxo_diff::UtxoDiff,
     BlockHashSet, BlueWorkType, ChainPath,
 };
 use cryptix_hashes::Hash;
@@ -219,6 +220,26 @@ pub trait ConsensusApi: Send + Sync {
         unimplemented!()
     }
 
+    fn import_pruning_point_atomic_state(
+        &self,
+        new_pruning_point: Hash,
+        atomic_state: PruningPointAtomicState,
+    ) -> PruningImportResult<()> {
+        unimplemented!()
+    }
+
+    fn get_atomic_state_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        unimplemented!()
+    }
+
+    fn get_atomic_state_bytes(&self, block_hash: Hash) -> ConsensusResult<Option<Vec<u8>>> {
+        unimplemented!()
+    }
+
+    fn get_atomic_p2p_token_audit_hash(&self, block_hash: Hash) -> ConsensusResult<Option<[u8; 32]>> {
+        unimplemented!()
+    }
+
     fn import_pruning_point_utxo_set(&self, new_pruning_point: Hash, imported_utxo_multiset: MuHash) -> PruningImportResult<()> {
         unimplemented!()
     }
@@ -296,6 +317,10 @@ pub trait ConsensusApi: Send + Sync {
     }
 
     fn get_block_acceptance_data(&self, hash: Hash) -> ConsensusResult<Arc<AcceptanceData>> {
+        unimplemented!()
+    }
+
+    fn get_block_utxo_diff(&self, hash: Hash) -> ConsensusResult<Arc<UtxoDiff>> {
         unimplemented!()
     }
 

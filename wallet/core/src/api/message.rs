@@ -368,6 +368,40 @@ pub struct AccountsDiscoveryResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccountsScanRequest {
+    pub account_id: AccountId,
+    pub wallet_secret: Option<Secret>,
+    pub depth: Option<u32>,
+    pub window_size: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsScanResponse {
+    pub account_descriptor: AccountDescriptor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsScanSmartRequest {
+    pub account_id: AccountId,
+    pub wallet_secret: Option<Secret>,
+    pub depth: Option<u32>,
+    pub window_size: Option<u32>,
+    pub monitor_window_size: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsScanSmartResponse {
+    pub account_descriptor: AccountDescriptor,
+    pub scanned_address_count: u32,
+    pub discovered_address_count: u32,
+    pub registered_address_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountsCreateRequest {
     pub wallet_secret: Secret,
     pub account_create_args: AccountCreateArgs,
@@ -426,6 +460,28 @@ pub struct AccountsActivateResponse {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccountsActivateSmartRequest {
+    pub account_ids: Option<Vec<AccountId>>,
+    pub wallet_secret: Option<Secret>,
+    pub depth: Option<u32>,
+    pub window_size: Option<u32>,
+    pub monitor_window_size: Option<u32>,
+    pub start_index: Option<u32>,
+    pub relative_to_current_index: Option<bool>,
+    pub known_addresses: Option<Vec<Address>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsActivateSmartResponse {
+    pub account_descriptors: Vec<AccountDescriptor>,
+    pub scanned_address_count: u32,
+    pub discovered_address_count: u32,
+    pub registered_address_count: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountsDeactivateRequest {
     pub account_ids: Option<Vec<AccountId>>,
 }
@@ -446,13 +502,85 @@ pub struct AccountsGetResponse {
     pub account_descriptor: AccountDescriptor,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUtxoEntry {
+    pub address: Option<Address>,
+    pub index: TransactionIndexType,
+    pub amount: u64,
+    pub script_public_key: ScriptPublicKey,
+    pub block_daa_score: u64,
+    pub is_coinbase: bool,
+    pub status: String,
+}
+
+impl AccountUtxoEntry {
+    pub fn from_reference(utxo: &UtxoEntryReference, status: &str) -> Self {
+        let entry = utxo.as_ref();
+        Self {
+            address: entry.address.clone(),
+            index: entry.outpoint.get_index(),
+            amount: entry.amount,
+            script_public_key: entry.script_public_key.clone(),
+            block_daa_score: entry.block_daa_score,
+            is_coinbase: entry.is_coinbase,
+            status: status.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUtxoTransaction {
+    pub transaction_id: TransactionId,
+    pub entries: Vec<AccountUtxoEntry>,
+    pub value: u64,
+    pub block_daa_score: u64,
+    pub status: String,
+    pub is_coinbase: bool,
+}
+
+impl AccountUtxoTransaction {
+    pub fn new(transaction_id: TransactionId, status: &str) -> Self {
+        Self { transaction_id, entries: Vec::new(), value: 0, block_daa_score: 0, status: status.to_string(), is_coinbase: false }
+    }
+
+    pub fn push(&mut self, entry: AccountUtxoEntry) {
+        self.value = self.value.saturating_add(entry.amount);
+        self.block_daa_score = self.block_daa_score.max(entry.block_daa_score);
+        self.is_coinbase |= entry.is_coinbase;
+        if self.status == "mature" && entry.status != "mature" {
+            self.status = entry.status.clone();
+        }
+        self.entries.push(entry);
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsUtxosRequest {
+    pub account_id: AccountId,
+    pub start: u64,
+    pub end: u64,
+    pub include_pending: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsUtxosResponse {
+    pub account_id: AccountId,
+    pub transactions: Vec<AccountUtxoTransaction>,
+    pub start: u64,
+    pub total: u64,
+}
+
 /// Specifies the type of an account address to create.
 /// The address can bea receive address or a change address.
 ///
 /// @category Wallet API
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize, CastFromJs)]
 #[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "wasm32-sdk", wasm_bindgen)]
+#[wasm_bindgen]
 pub enum NewAddressKind {
     Receive,
     Change,
@@ -473,6 +601,7 @@ impl FromStr for NewAddressKind {
 #[serde(rename_all = "camelCase")]
 pub struct AccountsCreateNewAddressRequest {
     pub account_id: AccountId,
+    pub wallet_secret: Option<Secret>,
     #[serde(rename = "type")]
     pub kind: NewAddressKind,
 }
@@ -485,13 +614,24 @@ pub struct AccountsCreateNewAddressResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AccountsSendFastPathOptions {
+    pub enabled: bool,
+    pub intent_nonce: Option<u64>,
+    pub client_created_at_ms: Option<u64>,
+    pub max_fee_sompi: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountsSendRequest {
     pub account_id: AccountId,
     pub wallet_secret: Secret,
     pub payment_secret: Option<Secret>,
+    pub sender_address: Option<Address>,
     pub destination: PaymentDestination,
     pub priority_fee_sompi: Fees,
     pub payload: Option<Vec<u8>>,
+    pub fast_path: Option<AccountsSendFastPathOptions>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -499,6 +639,11 @@ pub struct AccountsSendRequest {
 pub struct AccountsSendResponse {
     pub generator_summary: GeneratorSummary,
     pub transaction_ids: Vec<TransactionId>,
+    pub fast_path_requested: bool,
+    pub fast_path_used: bool,
+    pub fast_path_status: Option<String>,
+    pub fast_path_reason: Option<String>,
+    pub basechain_submitted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
@@ -526,6 +671,7 @@ pub struct AccountsTransferResponse {
 #[serde(rename_all = "camelCase")]
 pub struct AccountsEstimateRequest {
     pub account_id: AccountId,
+    pub sender_address: Option<Address>,
     pub destination: PaymentDestination,
     pub priority_fee_sompi: Fees,
     pub payload: Option<Vec<u8>>,
@@ -606,4 +752,7 @@ pub struct AddressBookEnumerateResponse {}
 
 #[derive(Clone, Debug, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalletNotification {}
+pub struct WalletNotification {
+    pub kind: String,
+    pub event_json: String,
+}

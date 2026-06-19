@@ -20,7 +20,7 @@ impl AsRef<CryptixdResponse> for CryptixdResponse {
 
 pub mod cryptixd_request_convert {
     use crate::protowire::*;
-    use cryptix_rpc_core::{RpcError, RpcResult};
+    use cryptix_rpc_core::{RpcError as CoreRpcError, RpcResult};
 
     impl_into_cryptixd_request!(Shutdown);
     impl_into_cryptixd_request!(SubmitBlock);
@@ -63,6 +63,36 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(GetFeeEstimate);
     impl_into_cryptixd_request!(GetFeeEstimateExperimental);
     impl_into_cryptixd_request!(GetCurrentBlockColor);
+    impl_into_cryptixd_request!(SubmitFastIntent);
+    impl_into_cryptixd_request!(GetFastIntentStatus);
+    impl_into_cryptixd_request!(CancelFastIntent);
+    impl_into_cryptixd_request!(GetStrongNodes);
+    impl_into_cryptixd_request!(SimulateTokenOp);
+    impl_into_cryptixd_request!(GetTokenBalance);
+    impl_into_cryptixd_request!(GetTokenNonce);
+    impl_into_cryptixd_request!(GetTokenAsset);
+    impl_into_cryptixd_request!(GetTokenOpStatus);
+    impl_into_cryptixd_request!(GetTokenStateHash);
+    impl_into_cryptixd_request!(GetTokenSpendability);
+    impl_into_cryptixd_request!(GetTokenEvents);
+    impl_into_cryptixd_request!(GetTokenAssets);
+    impl_into_cryptixd_request!(GetTokenBalancesByOwner);
+    impl_into_cryptixd_request!(GetTokenHolders);
+    impl_into_cryptixd_request!(GetTokenOwnerIdByAddress);
+    impl_into_cryptixd_request!(GetLiquidityPoolState);
+    impl_into_cryptixd_request!(GetLiquidityQuote);
+    impl_into_cryptixd_request!(GetLiquidityFeeState);
+    impl_into_cryptixd_request!(GetLiquidityClaimPreview);
+    impl_into_cryptixd_request!(GetLiquidityHolders);
+    impl_into_cryptixd_request!(ExportTokenSnapshot);
+    impl_into_cryptixd_request!(ImportTokenSnapshot);
+    impl_into_cryptixd_request!(GetTokenHealth);
+    impl_into_cryptixd_request!(GetScBootstrapSources);
+    impl_into_cryptixd_request!(GetScSnapshotManifest);
+    impl_into_cryptixd_request!(GetScSnapshotChunk);
+    impl_into_cryptixd_request!(GetScReplayWindowChunk);
+    impl_into_cryptixd_request!(GetScSnapshotHead);
+    impl_into_cryptixd_request!(GetConsensusAtomicStateHash);
 
     impl_into_cryptixd_request!(NotifyBlockAdded);
     impl_into_cryptixd_request!(NotifyNewBlockTemplate);
@@ -72,6 +102,7 @@ pub mod cryptixd_request_convert {
     impl_into_cryptixd_request!(NotifyVirtualDaaScoreChanged);
     impl_into_cryptixd_request!(NotifyVirtualChainChanged);
     impl_into_cryptixd_request!(NotifySinkBlueScoreChanged);
+    impl_into_cryptixd_request!(NotifyTokenEvents);
 
     macro_rules! impl_into_cryptixd_request {
         ($name:tt) => {
@@ -119,22 +150,22 @@ pub mod cryptixd_request_convert {
             // ----------------------------------------------------------------------------
 
             impl TryFrom<&cryptixd_request::Payload> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &cryptixd_request::Payload) -> RpcResult<Self> {
                     if let cryptixd_request::Payload::$variant(request) = item {
                         request.try_into()
                     } else {
-                        Err(RpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
+                        Err(CoreRpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
                     }
                 }
             }
 
             impl TryFrom<&CryptixdRequest> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &CryptixdRequest) -> RpcResult<Self> {
                     item.payload
                         .as_ref()
-                        .ok_or(RpcError::MissingRpcFieldError("CryptixRequest".to_string(), "Payload".to_string()))?
+                        .ok_or(CoreRpcError::MissingRpcFieldError("CryptixRequest".to_string(), "Payload".to_string()))?
                         .try_into()
                 }
             }
@@ -157,7 +188,7 @@ pub mod cryptixd_request_convert {
 
 pub mod cryptixd_response_convert {
     use crate::protowire::*;
-    use cryptix_rpc_core::{RpcError, RpcResult};
+    use cryptix_rpc_core::{RpcError as CoreRpcError, RpcResult};
 
     impl_into_cryptixd_response!(Shutdown);
     impl_into_cryptixd_response!(SubmitBlock);
@@ -200,6 +231,36 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_response!(GetFeeEstimate);
     impl_into_cryptixd_response!(GetFeeEstimateExperimental);
     impl_into_cryptixd_response!(GetCurrentBlockColor);
+    impl_into_cryptixd_response!(SubmitFastIntent);
+    impl_into_cryptixd_response!(GetFastIntentStatus);
+    impl_into_cryptixd_response!(CancelFastIntent);
+    impl_into_cryptixd_response!(GetStrongNodes);
+    impl_into_cryptixd_response!(SimulateTokenOp);
+    impl_into_cryptixd_response!(GetTokenBalance);
+    impl_into_cryptixd_response!(GetTokenNonce);
+    impl_into_cryptixd_response!(GetTokenAsset);
+    impl_into_cryptixd_response!(GetTokenOpStatus);
+    impl_into_cryptixd_response!(GetTokenStateHash);
+    impl_into_cryptixd_response!(GetTokenSpendability);
+    impl_into_cryptixd_response!(GetTokenEvents);
+    impl_into_cryptixd_response!(GetTokenAssets);
+    impl_into_cryptixd_response!(GetTokenBalancesByOwner);
+    impl_into_cryptixd_response!(GetTokenHolders);
+    impl_into_cryptixd_response!(GetTokenOwnerIdByAddress);
+    impl_into_cryptixd_response!(GetLiquidityPoolState);
+    impl_into_cryptixd_response!(GetLiquidityQuote);
+    impl_into_cryptixd_response!(GetLiquidityFeeState);
+    impl_into_cryptixd_response!(GetLiquidityClaimPreview);
+    impl_into_cryptixd_response!(GetLiquidityHolders);
+    impl_into_cryptixd_response!(ExportTokenSnapshot);
+    impl_into_cryptixd_response!(ImportTokenSnapshot);
+    impl_into_cryptixd_response!(GetTokenHealth);
+    impl_into_cryptixd_response!(GetScBootstrapSources);
+    impl_into_cryptixd_response!(GetScSnapshotManifest);
+    impl_into_cryptixd_response!(GetScSnapshotChunk);
+    impl_into_cryptixd_response!(GetScReplayWindowChunk);
+    impl_into_cryptixd_response!(GetScSnapshotHead);
+    impl_into_cryptixd_response!(GetConsensusAtomicStateHash);
 
     impl_into_cryptixd_notify_response!(NotifyBlockAdded);
     impl_into_cryptixd_notify_response!(NotifyNewBlockTemplate);
@@ -209,6 +270,7 @@ pub mod cryptixd_response_convert {
     impl_into_cryptixd_notify_response!(NotifyVirtualDaaScoreChanged);
     impl_into_cryptixd_notify_response!(NotifyVirtualChainChanged);
     impl_into_cryptixd_notify_response!(NotifySinkBlueScoreChanged);
+    impl_into_cryptixd_notify_response!(NotifyTokenEvents);
 
     impl_into_cryptixd_notify_response!(NotifyUtxosChanged, StopNotifyingUtxosChanged);
     impl_into_cryptixd_notify_response!(NotifyPruningPointUtxoSetOverride, StopNotifyingPruningPointUtxoSetOverride);
@@ -239,8 +301,8 @@ pub mod cryptixd_response_convert {
                 }
             }
 
-            impl From<RpcError> for $protowire_struct {
-                fn from(item: RpcError) -> Self {
+            impl From<CoreRpcError> for $protowire_struct {
+                fn from(item: CoreRpcError) -> Self {
                     let x: RpcResult<&$core_struct> = Err(item);
                     x.into()
                 }
@@ -298,22 +360,22 @@ pub mod cryptixd_response_convert {
             // ----------------------------------------------------------------------------
 
             impl TryFrom<&cryptixd_response::Payload> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &cryptixd_response::Payload) -> RpcResult<Self> {
                     if let cryptixd_response::Payload::$variant(response) = item {
                         response.try_into()
                     } else {
-                        Err(RpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
+                        Err(CoreRpcError::MissingRpcFieldError("Payload".to_string(), stringify!($variant).to_string()))
                     }
                 }
             }
 
             impl TryFrom<&CryptixdResponse> for $core_struct {
-                type Error = RpcError;
+                type Error = CoreRpcError;
                 fn try_from(item: &CryptixdResponse) -> RpcResult<Self> {
                     item.payload
                         .as_ref()
-                        .ok_or(RpcError::MissingRpcFieldError("CryptixResponse".to_string(), "Payload".to_string()))?
+                        .ok_or(CoreRpcError::MissingRpcFieldError("CryptixResponse".to_string(), "Payload".to_string()))?
                         .try_into()
                 }
             }
@@ -347,7 +409,7 @@ pub mod cryptixd_response_convert {
 
             impl<T> From<Result<(), T>> for $protowire_struct
             where
-                T: Into<RpcError>,
+                T: Into<CoreRpcError>,
             {
                 fn from(item: Result<(), T>) -> Self {
                     item

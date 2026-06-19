@@ -6,12 +6,11 @@ use async_channel::{Receiver, Sender};
 use async_trait::async_trait;
 pub use client_pool::ClientPool;
 use connection_event::ConnectionEvent;
-use futures::{future::FutureExt, pin_mut, select};
 use cryptix_core::{debug, error, trace};
 use cryptix_grpc_core::{
     channel::NotificationChannel,
     ops::CryptixdPayloadOps,
-    protowire::{cryptixd_request, rpc_client::RpcClient, GetInfoRequestMessage, CryptixdRequest, CryptixdResponse},
+    protowire::{cryptixd_request, rpc_client::RpcClient, CryptixdRequest, CryptixdResponse, GetInfoRequestMessage},
     RPC_MAX_MESSAGE_SIZE,
 };
 use cryptix_notify::{
@@ -40,6 +39,7 @@ use cryptix_utils_tower::{
     counters::TowerConnectionCounters,
     middleware::{measure_request_body_size_layer, CountBytesBody, MapResponseBodyLayer, ServiceBuilder},
 };
+use futures::{future::FutureExt, pin_mut, select};
 use regex::Regex;
 use std::{
     sync::{
@@ -277,6 +277,36 @@ impl RpcApi for GrpcClient {
     route!(get_fee_estimate_call, GetFeeEstimate);
     route!(get_fee_estimate_experimental_call, GetFeeEstimateExperimental);
     route!(get_current_block_color_call, GetCurrentBlockColor);
+    route!(submit_fast_intent_call, SubmitFastIntent);
+    route!(get_fast_intent_status_call, GetFastIntentStatus);
+    route!(cancel_fast_intent_call, CancelFastIntent);
+    route!(get_strong_nodes_call, GetStrongNodes);
+    route!(simulate_token_op_call, SimulateTokenOp);
+    route!(get_token_balance_call, GetTokenBalance);
+    route!(get_token_nonce_call, GetTokenNonce);
+    route!(get_token_asset_call, GetTokenAsset);
+    route!(get_token_op_status_call, GetTokenOpStatus);
+    route!(get_token_state_hash_call, GetTokenStateHash);
+    route!(get_token_spendability_call, GetTokenSpendability);
+    route!(get_token_events_call, GetTokenEvents);
+    route!(get_token_assets_call, GetTokenAssets);
+    route!(get_token_balances_by_owner_call, GetTokenBalancesByOwner);
+    route!(get_token_holders_call, GetTokenHolders);
+    route!(get_token_owner_id_by_address_call, GetTokenOwnerIdByAddress);
+    route!(get_liquidity_pool_state_call, GetLiquidityPoolState);
+    route!(get_liquidity_quote_call, GetLiquidityQuote);
+    route!(get_liquidity_fee_state_call, GetLiquidityFeeState);
+    route!(get_liquidity_claim_preview_call, GetLiquidityClaimPreview);
+    route!(get_liquidity_holders_call, GetLiquidityHolders);
+    route!(export_token_snapshot_call, ExportTokenSnapshot);
+    route!(import_token_snapshot_call, ImportTokenSnapshot);
+    route!(get_token_health_call, GetTokenHealth);
+    route!(get_sc_bootstrap_sources_call, GetScBootstrapSources);
+    route!(get_sc_snapshot_manifest_call, GetScSnapshotManifest);
+    route!(get_sc_snapshot_chunk_call, GetScSnapshotChunk);
+    route!(get_sc_replay_window_chunk_call, GetScReplayWindowChunk);
+    route!(get_sc_snapshot_head_call, GetScSnapshotHead);
+    route!(get_consensus_atomic_state_hash_call, GetConsensusAtomicStateHash);
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Notification API
